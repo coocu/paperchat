@@ -21,7 +21,7 @@ function browser({version,search='',fetchReply}){
     return nodes.get(k);
   }
   const storage=map=>({getItem:k=>map.get(k)||null,setItem:(k,v)=>map.set(k,v),clear:()=>map.clear()});
-  const location={pathname:'/app',search,replace(url){this.redirect=url;}};
+  const location={pathname:'/',search,replace(url){this.redirect=url;}};
   const ctx=createContext({document:{querySelector:element,querySelectorAll:()=>[],hidden:false,addEventListener(){}},
     location,window:{addEventListener(){},scrollTo(){}},setInterval:()=>42,clearInterval(){},setTimeout:()=>7,clearTimeout,AbortController,
     policyVersion,reasons,rules,sessionStorage:storage(session),localStorage:storage(local),
@@ -34,7 +34,7 @@ test('열린 앱에서 초기화를 감지하면 현재 화면과 가입 초안�
   b.element('#app').innerHTML='이전 회원의 대화';b.session.set('draft','이전 정보');
   b.run("stage='member';me={nick:'이전 회원'};draft.memo='입력중';selectedArea='경기도 이천시'");
   await b.run('pulse(true)');
-  assert.equal(b.location.redirect,'/app?reset=1');assert.equal(b.element('#app').innerHTML,'');assert.equal(b.session.size,0);
+  assert.equal(b.location.redirect,'/?reset=1');assert.equal(b.element('#app').innerHTML,'');assert.equal(b.session.size,0);
   assert.equal(b.run('me'),null);assert.equal(b.run('draft.memo'),'');assert.equal(b.local.get('paperchat.reset'),'fresh');
   const reloaded=browser({version:'fresh',search:'?reset=1',fetchReply:()=>({version:'fresh',stage:'gate'})});
   await reloaded.run('boot()');assert.match(reloaded.element('#error').textContent,/등록된 사용자 정보가 없습니다/);

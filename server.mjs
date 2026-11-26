@@ -16,7 +16,7 @@ import { policyVersion } from './public/rules.js';
 const regions=JSON.parse(readFileSync(new URL('./regions.json',import.meta.url)));
 const areas=new Set(Object.entries(regions).flatMap(([p,ds])=>ds.map(d=>p+' '+d)));
 const profileCols='id,nick,year,gender,area,memo';
-const assets=new Map(Object.entries({'/app':'index.html','/admin':'index.html','/identity-return':'index.html','/app.js':'app.js','/theme.css':'theme.css','/icon.svg':'icon.svg','/headings.woff':'headings.woff','/rules.js':'rules.js'}));
+const assets=new Map(Object.entries({'/':'index.html','/admin':'index.html','/identity-return':'index.html','/app.js':'app.js','/theme.css':'theme.css','/icon.svg':'icon.svg','/headings.woff':'headings.woff','/rules.js':'rules.js'}));
 const type={html:'text/html',js:'text/javascript',css:'text/css',svg:'image/svg+xml',woff:'font/woff'};
 const token=()=>randomBytes(32).toString('hex');
 const digest=s=>createHash('sha256').update(s).digest();
@@ -163,22 +163,6 @@ export function makeServer(config, upstream=providers) {
     const ip=(process.env.RENDER==='true'?String(req.headers['x-forwarded-for']||'').split(',').at(-1).trim():'')||req.socket.remoteAddress;
     if(!post && req.method!=='GET') reject(405,'허용되지 않은 요청이에요.');
     const ok=(data={})=>finish(res,200,data);
-    // Select the UI only. Each data API checks its own session and permissions.
-    const ua=req.headers['user-agent'] || '';
-    const native=/\bPaperChat(?:Android|IOS)\/\d+\b/.test(ua);
-    // Support previously installed iOS shells until they adopt the app marker.
-    const oldWebView=/AppleWebKit\//.test(ua) && /Mobile\//.test(ua) && !/Safari\//.test(ua);
-    const mobile=native || oldWebView;
-    if(!post && (p==='/' || p==='/admin/' || p==='/app/' || (p==='/app' && !mobile)
-       || (p==='/identity-return' && !mobile && sessions(req)?.kind!=='gate_ok'))) {
-      const destination=mobile && p!=='/admin/' ? '/app'+u.search : '/admin';
-      res.writeHead(302,{Location:destination,Vary:'User-Agent'});return res.end();
-    }
-    if(!post && p==='/api/push/availability') {
-      const available=platform=>Boolean(delivery.enabled(platform));
-      return ok({android:Boolean(delivery.androidClient) && available('android'),
-        'ios-dev':available('ios-dev'),'ios-prod':available('ios-prod')});
-    }
     if(!post && assets.has(p)) {
       const file=assets.get(p);
       return finish(res,200,readFileSync(new URL('./public/'+file,import.meta.url)),type[file.split('.').at(-1)]+'; charset=utf-8');
@@ -189,10 +173,7 @@ export function makeServer(config, upstream=providers) {
     if(!post && p==='/health') return ok({ok:true});
     if(!post && p==='/apply') {
       const link=configURL();
-      if(!link) {
-        if(!mobile)return finish(res,200,'아직 등록된 인증키 발급 주소가 없습니다. 앱으로 돌아가 주세요.','text/plain; charset=utf-8');
-        res.writeHead(303,{Location:'/app?form=unavailable'});return res.end();
-      }
+      if(!link) {res.writeHead(303,{Location:'/?form=unavailable'});return res.end();}
       res.writeHead(303,{Location:link});return res.end();
     }
     const revision=resetVersion();
@@ -235,6 +216,7 @@ export function makeServer(config, upstream=providers) {
     if(post && p==='/api/key') {
       throttle('key:'+ip,20,hour/4);
       const code=string(b.code,1,256,'인증키');
+      if(config.keyMarker && !code.toLowerCase().includes(config.keyMarker.toLowerCase())) reject(403,'이 앱에 발급된 인증키를 입력해 주세요.');
       const v=await upstream.check(code);
       if(v?.status==='pending') reject(403,'승인 대기 중이에요.');
       if(!registryApproved(v)) reject(403,'승인된 인증키를 확인해 주세요.');
@@ -475,6 +457,6 @@ if(process.argv[1] && pathToFileURL(resolve(process.argv[1])).href===import.meta
   const env=process.env,port=Number(env.PORT||3000);
   const origin=env.PUBLIC_BASE_URL||env.RENDER_EXTERNAL_URL||('http://localhost:'+port);
   const server=makeServer({origin,dir:env.DATA_DIR||fileURLToPath(new URL('./data',import.meta.url)),
-    secret:env.SECRET,store:env.PORTONE_STORE_ID,channel:env.PORTONE_CHANNEL_KEY,liveOnly:env.NODE_ENV==='production'});
+    secret:env.SECRET,store:env.PORTONE_STORE_ID,channel:env.PORTONE_CHANNEL_KEY,liveOnly:env.NODE_ENV==='production',keyMarker:env.APP_KEY_MARKER});
   server.listen(port,'0.0.0.0',()=>console.log('채팅 서버 시작 ('+port+')'));
 }

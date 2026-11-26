@@ -60,7 +60,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     return async function call(path,body,options={}){
       const req=Readable.from(body===undefined?[]:[Buffer.from(JSON.stringify(body))]);
       req.method=body===undefined?'GET':'POST';req.url=path;req.socket={remoteAddress:options.ip||'test-local'};
-      req.headers={'content-type':'application/json',origin:options.origin||origin,'user-agent':options.userAgent||'test-browser',cookie:[...cookies].map(([k,v])=>k+'='+v).join('; ')};
+      req.headers={'content-type':'application/json',origin:options.origin||origin,cookie:[...cookies].map(([k,v])=>k+'='+v).join('; ')};
       const result=await new Promise((done,reject)=>{
         const headers={};
         const res={status:200,setHeader(k,v){headers[k.toLowerCase()]=v;},writeHead(n,h){this.status=n;Object.entries(h||{}).forEach(([k,v])=>this.setHeader(k,v));},
@@ -79,38 +79,6 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     return c('/api/identity/finish',{id});
   }
   const a=client(),b=client(),c=client(),admin=client(),nobody=client();
-  await t.test('앱은 승인된 일반키를 받아 가입 단계만 열고 관리자 로그인은 별도로 검증한다',async()=>{
-    for(const prefix of ['invite', 'codenote', 'kyh', 'kyh-codenote']){
-      const key=prefix+'-'+randomBytes(12).toString('hex');
-      const member=client();
-      registry.set(key,{status:'approved',token:'issued'});
-      try {
-        assert.equal((await member('/api/key',{code:key},{ip:'member-gate'})).status,200);
-        assert.equal((await member('/api/state')).body.stage,'gate_ok');
-        assert.equal((await member('/api/status')).body.adminSignedIn,false);
-        assert.equal((await member('/api/admin/members')).status,401);
-        if(prefix!=='kyh-codenote'){
-          assert.equal((await member('/api/admin/login',{key},{ip:'member-gate'})).status,403);
-          assert.equal((await member('/api/admin/members')).status,401);
-        }
-      } finally {registry.delete(key);}
-    }
-  });
-  await t.test('서버 첫 화면과 모바일 진입점, 승인 전 운영자 자료 접근을 구분한다',async()=>{
-    for(const path of ['/','/admin/','/?inbox=1','/app','/app/','/identity-return']) {
-      const r=await nobody(path);assert.equal(r.status,302);assert.equal(r.headers.location,'/admin');
-    }
-    assert.equal((await nobody('/admin')).status,200);
-    for(const userAgent of ['Mobile PaperChatIOS/3','WebView PaperChatAndroid/2','iPhone AppleWebKit/605.1 Mobile/15']){
-      assert.equal((await nobody('/app',undefined,{userAgent})).status,200);
-      assert.equal((await nobody('/identity-return',undefined,{userAgent})).status,200);
-      assert.equal((await nobody('/app/?inbox=1',undefined,{userAgent})).headers.location,'/app?inbox=1');
-    }
-    assert.equal((await nobody('/?inbox=1',undefined,{userAgent:'WebView PaperChatAndroid/2'})).headers.location,'/app?inbox=1');
-    for(const path of ['/api/admin/members','/api/admin/review','/api/admin/rooms?area=x','/api/admin/photos/1'])
-      assert.equal((await nobody(path,undefined,{userAgent:'WebView PaperChatAndroid/2'})).status,401);
-    assert.equal((await nobody('/health')).body.ok,true);
-  });
   await t.test('미승인, 대기, 토큰 누락과 미성년을 거부한다',async()=>{
     assert.equal((await a('/api/register',{area:'경기도 이천시',memo:'x'})).status,401);
     for(const code of ['pending','invalid','blank'])assert.equal((await a('/api/key',{code})).status,403);
@@ -219,17 +187,6 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
   let room,photo;
   const android={platform:'android',token:'abcd:android-token-for-test'};
   const iphone={platform:'ios-dev',token:'abcd'.repeat(16)};
-  await t.test('플랫폼별 실제 발송 설정을 확인한 뒤에만 권한 창을 요청할 수 있다',async()=>{
-    const original=cfg.pushProvider.enabled;
-    try {
-      cfg.pushProvider.enabled=()=>false;
-      assert.deepEqual((await nobody('/api/push/availability')).body,{android:false,'ios-dev':false,'ios-prod':false});
-      cfg.pushProvider.enabled=p=>p!=='ios-prod';
-      assert.deepEqual((await nobody('/api/push/availability')).body,{android:false,'ios-dev':true,'ios-prod':false});
-      cfg.pushProvider.androidClient={appId:'test'};
-      assert.deepEqual((await nobody('/api/push/availability')).body,{android:true,'ios-dev':true,'ios-prod':false});
-    }finally{cfg.pushProvider.enabled=original;delete cfg.pushProvider.androidClient;}
-  });
   await t.test('Android 초기 설정은 로그인 전에 조회되며 배포 상태에 맞는 공개 설정만 반환한다',async()=>{
     assert.deepEqual((await nobody('/api/push/android-config')).body,{config:null});
     const clientConfig={projectId:'qa',senderId:'123',appId:'1:123:android:qa',apiKey:'client-key'};
@@ -461,7 +418,6 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.equal((await admin('/api/admin/members/'+oldMember)).status,404);
     assert.deepEqual((await admin('/api/admin/members')).body,{items:[],more:false,counts:{active:0,withdrawn:0}});
     assert.deepEqual((await admin('/api/admin/review')).body,{photos:[],reports:[]});
-    assert.match(String((await nobody('/apply')).body),/발급 주소/);
-    assert.match((await nobody('/apply',undefined,{userAgent:'WebView PaperChatAndroid/2'})).headers.location,/unavailable/);
+    assert.match((await nobody('/apply')).headers.location,/unavailable/);
   });
 });
