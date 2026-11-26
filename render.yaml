@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: codenote-paper-chat
+    runtime: node
+    plan: starter
+    buildCommand: npm install --omit=dev --ignore-scripts
+    startCommand: npm start
+    healthCheckPath: /health
+    disk:
+      name: chat-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_VERSION
+        value: 24.19.0
+      - key: NODE_ENV
+        value: production
+      - key: DATA_DIR
+        value: /var/data
+      - key: SECRET
+        generateValue: true
+      - key: ADMIN_KEY
+        sync: false
+      - key: PORTONE_STORE_ID
+        sync: false
+      - key: PORTONE_CHANNEL_KEY
+        sync: false
+      - key: PORTONE_API_SECRET
+        sync: false
