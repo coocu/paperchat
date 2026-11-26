@@ -56,6 +56,13 @@ input[type=date]::-webkit-date-and-time-value {
 .profile-row{padding:16px;align-items:flex-start;gap:14px;border-radius:16px}
 .profile-row>span{flex:1}.profile-row>svg{margin-top:4px}
 .profile-row strong{font-size:18px}.profile-row small{margin-top:3px}
+.presence-badge{display:block;margin-top:5px;font:400 12px var(--sans);color:var(--sub);line-height:1.5}
+.presence-badge.online{color:var(--green);font-weight:650}
+.presence-badge.online::before{content:'';display:inline-block;width:7px;height:7px;margin-right:6px;border-radius:50%;background:currentColor}
+.member-row{display:flex;gap:12px;align-items:center;border-bottom:1px solid var(--line)}
+.member-row:last-child{border-bottom:0}.member-row>.row{flex:1;min-width:0;border:0}.member-row>.textBtn{flex:none;font-size:12px}
+.deleted-label{display:block;font-size:12px;color:var(--wine);margin-bottom:5px}
+.msg>[data-delete-message]{font-size:12px;padding:4px 0}
 .profile-memo-label{display:block;font-size:12px;color:var(--green);margin-top:12px;font-weight:650}
 .profile-memo{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden;white-space:pre-wrap;font-size:14px;font-weight:400;line-height:1.6;margin-top:3px}
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
@@ -66,7 +73,7 @@ main.chat-screen{position:fixed;top:var(--app-top,0px);left:0;right:0;height:var
 .chat-screen .hero h1{font-size:25px;margin:0;line-height:1.25}
 .chat-screen .hero p{font-size:12px;margin-top:4px;line-height:1.4}
 .chat-screen .screen-stack{display:flex;flex:1;min-height:0;flex-direction:column;gap:8px;align-items:stretch}
-.chat-tools{display:flex;align-items:center;justify-content:space-between;flex:none;gap:12px}
+.chat-tools{display:flex;align-items:center;justify-content:space-between;flex:none;gap:12px;flex-wrap:wrap}
 .chat-tools .textBtn{font-size:12px;min-height:30px;padding:3px 0}
 .chat-screen .log{flex:1;min-height:0;height:auto;padding:4px;overflow-y:auto}
 .chat-screen .compose{flex:none;margin:0;padding:10px;border-radius:16px}

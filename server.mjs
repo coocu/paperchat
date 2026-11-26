@@ -3,7 +3,7 @@ import { createHmac, createHash, randomBytes, randomUUID, timingSafeEqual } from
 import { readFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
-import { openStore, hour, transaction, clean, tables } from './store.mjs';
+import { openStore, hour, transaction, clean, closeRoom, tables } from './store.mjs';
 import { providers, reject, profileDetails, RequestError } from './providers.mjs';
 
 import { textVault } from './vault.mjs';
@@ -58,12 +58,47 @@ export function makeServer(config, upstream=providers) {
   const delivery=config.pushProvider || pushProvider();
   const pushes=pushQueue(db,delivery,safety);
   // Both directory listings and room listings join the other member as p.
-  const visiblePeer=`NOT EXISTS(SELECT 1 FROM restrictions x WHERE x.identity=p.identity AND x.until>?)
+  const visiblePeer=`p.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM restrictions x WHERE x.identity=p.identity AND x.until>?)
     AND NOT EXISTS(SELECT 1 FROM blocks x WHERE (x.owner=? AND x.peer=p.id) OR (x.owner=p.id AND x.peer=?))`;
   const vault=contactVault(secret);
   const get=(sql,...args)=>db.prepare(sql).get(...args);
   const all=(sql,...args)=>db.prepare(sql).all(...args);
   const run=(sql,...args)=>db.prepare(sql).run(...args);
+  const signupEpochs=new Map();
+  const presenceTTL=90000,inactiveAfter=30*24*hour;
+  function activity(member) {
+    const now=Date.now();
+    return {lastSeen:get('SELECT last_seen FROM member_activity WHERE member=?',member)?.last_seen??null,
+      online:Boolean(get(`SELECT 1 FROM session_presence p JOIN sessions s ON s.id=p.session
+        JOIN members m ON m.id=s.member WHERE s.member=? AND s.kind='member' AND s.expires>?
+        AND m.deleted_at IS NULL AND p.online=1 AND p.seen>?`,member,now,now-presenceTTL))};
+  }
+  function touch(member,session,online=true) {
+    const now=Date.now();
+    if(online)run('INSERT INTO member_activity VALUES(?,?) ON CONFLICT(member) DO UPDATE SET last_seen=MAX(last_seen,excluded.last_seen)',member,now);
+    if(session)run('INSERT INTO session_presence VALUES(?,?,?) ON CONFLICT(session) DO UPDATE SET seen=excluded.seen,online=excluded.online',session,now,Number(online));
+  }
+  function bumpRoom(room) {
+    run('INSERT INTO room_changes VALUES(?,1) ON CONFLICT(room) DO UPDATE SET version=version+1',room);
+  }
+  const roomVersion=room=>get('SELECT version FROM room_changes WHERE room=?',room)?.version||0;
+  const streams=new Set();
+  function streamValid(stream) {
+    return Boolean(get(`SELECT 1 FROM sessions s JOIN members m ON m.id=s.member
+      WHERE s.id=? AND s.member=? AND s.kind='member' AND s.expires>? AND m.deleted_at IS NULL`,stream.session,stream.member,Date.now()));
+  }
+  function endStream(stream) {streams.delete(stream);if(!stream.res.writableEnded)stream.res.end();}
+  function closeStreams(predicate=()=>true) {for(const stream of [...streams])if(predicate(stream))endStream(stream);}
+  function notifyRoom(room,change) {
+    const members=get('SELECT a,b,closed_at FROM rooms WHERE id=?',room);
+    if(!members)return;
+    const data=JSON.stringify({room,...change,version:roomVersion(room),...(change.closed?{closedAt:members.closed_at}:{})});
+    for(const stream of [...streams]) {
+      if(!streamValid(stream)){endStream(stream);continue;}
+      if(stream.member!==members.a && stream.member!==members.b)continue;
+      try {stream.res.write('event: room-change\ndata: '+data+'\n\n');}catch{endStream(stream);}
+    }
+  }
   run("INSERT OR IGNORE INTO service_meta VALUES('reset',?)",token());
   const resetVersion=()=>get("SELECT value FROM service_meta WHERE key='reset'").value;
   const adminVault=textVault(secret,'paperchat/admin-session/v1');
@@ -100,7 +135,7 @@ export function makeServer(config, upstream=providers) {
   function proof(code) { return h('recovery-index',code.replace(/[-\s]/g,'').toUpperCase()); }
   const attachKey=db.prepare('INSERT INTO account_keys(member,proof,joined) VALUES(?,?,?)');
   transaction(db,()=>{
-    for(const m of all('SELECT id FROM members WHERE id NOT IN (SELECT member FROM account_keys)'))
+    for(const m of all('SELECT id FROM members WHERE deleted_at IS NULL AND id NOT IN (SELECT member FROM account_keys)'))
       attachKey.run(m.id,proof(recoveryCode(m.id)),null);
     if(!get("SELECT 1 FROM service_meta WHERE key='signup-birth-date'")) {
       run("UPDATE sessions SET kind='gate_ok',year=NULL,gender=NULL WHERE kind='details'");
@@ -146,7 +181,8 @@ export function makeServer(config, upstream=providers) {
     const id=h('session',v), now=Date.now();
     if(admin)return get(`SELECT s.*,p.sealed AS proof FROM sessions s JOIN admin_session_proofs p ON p.session=s.id
       WHERE s.id=? AND s.kind='admin' AND s.expires>?`,id,now);
-    return get("SELECT * FROM sessions WHERE id=? AND kind!='admin' AND expires>?",id,now);
+    return get(`SELECT s.* FROM sessions s WHERE s.id=? AND s.kind!='admin' AND s.expires>?
+      AND (s.kind!='member' OR EXISTS(SELECT 1 FROM members m WHERE m.id=s.member AND m.deleted_at IS NULL))`,id,now);
   }
   function need(req,kind,limited=false) {
     const s=sessions(req,kind==='admin');
@@ -164,10 +200,11 @@ export function makeServer(config, upstream=providers) {
     const room=get('SELECT * FROM rooms WHERE id=?',id);
     const member=admin?null:need(req,'member').member;
     if(!room || (!admin && room.a!==member && room.b!==member)) reject(404,'대화방을 찾을 수 없어요.');
+    if(!admin && room.closed_at!==null)reject(404,'종료된 대화방이에요.');
     if(!admin)safety.pairAllowed(member,room.a===member?room.b:room.a);
     return room;
   }
-  const visibleMessage=`(v.state IS NULL OR v.state='approved')
+  const visibleMessage=`m.deleted_at IS NULL AND (v.state IS NULL OR v.state='approved')
     AND ((m.expires IS NULL AND m.body IS NOT NULL) OR (m.photo IS NOT NULL AND m.expires>?))
     AND NOT EXISTS(SELECT 1 FROM reports f WHERE f.message=m.id AND f.status='open')`;
   function unread(member,room) {
@@ -178,26 +215,33 @@ export function makeServer(config, upstream=providers) {
   function roomList(member,area=null) {
     return all(`SELECT r.id,p.id AS peer,p.nick,p.area,MAX(m.sent) AS recent FROM rooms r
       JOIN members p ON p.id=CASE WHEN r.a=? THEN r.b ELSE r.a END
-      LEFT JOIN messages m ON m.room=r.id WHERE (r.a=? OR r.b=?) AND (? IS NULL OR p.area=?) AND ${visiblePeer}
+      LEFT JOIN messages m ON m.room=r.id WHERE (r.a=? OR r.b=?) AND r.closed_at IS NULL AND (? IS NULL OR p.area=?) AND ${visiblePeer}
       GROUP BY r.id ORDER BY recent DESC,r.id`,member,member,member,area,area,Date.now(),member,member)
-      .map(room=>({...room,unread:unread(member,room.id)}));
+      .map(room=>({...room,...activity(room.peer),unread:unread(member,room.id),version:roomVersion(room.id)}));
+  }
+  const messageColumns=`m.id,m.room,m.author,p.nick,p.area,m.sent,m.body,m.expires,m.deleted_at AS deletedAt,
+    v.state,
+    (m.photo IS NOT NULL AND m.expires>?) AS live,
+    EXISTS(SELECT 1 FROM reports f WHERE f.message=m.id AND f.status='open') AS reported`;
+  const messageJoins=`FROM messages m JOIN members p ON m.author=p.id LEFT JOIN reviews v ON v.message=m.id`;
+  function presentMessage({state,live,reported,...m},admin) {
+    const deleted=m.deletedAt!==null;
+    let visibility='visible';
+    if(deleted && !admin)visibility='deleted';
+    else if(state==='removed')visibility='removed';
+    else if(m.expires && !live)visibility='expired';
+    else if(reported && !admin)visibility='reported';
+    else if(m.expires && state!=='approved' && !admin)visibility='pending';
+    return {...m,deleted,visibility,
+      body:visibility==='visible'?m.body:null,
+      viewable:Number(Boolean(live && visibility==='visible'))};
   }
   function processMessages(room,u,admin) {
     const before=u.searchParams.get('before');
     if(before && !/^\d+$/.test(before)) reject(400,'조회 범위를 확인해 주세요.');
-    const data=all(`SELECT m.id,m.author,p.nick,m.sent,m.body,m.expires,v.state,
-      (m.photo IS NOT NULL AND m.expires>?) AS live,
-      EXISTS(SELECT 1 FROM reports f WHERE f.message=m.id AND f.status='open') AS reported
-      FROM messages m JOIN members p ON m.author=p.id LEFT JOIN reviews v ON v.message=m.id
+    const data=all(`SELECT ${messageColumns} ${messageJoins}
       WHERE m.room=? AND m.id<? ORDER BY m.id DESC LIMIT 60`,Date.now(),room,before?Number(before):Number.MAX_SAFE_INTEGER);
-    return data.reverse().map(({state,live,reported,...m})=>{
-      let visibility='visible';
-      if(state==='removed')visibility='removed';
-      else if(m.expires && !live)visibility='expired';
-      else if(reported && !admin)visibility='reported';
-      else if(m.expires && state!=='approved' && !admin)visibility='pending';
-      return {...m,visibility,body:visibility==='visible'?m.body:null,viewable:Number(Boolean(live && visibility==='visible'))};
-    });
+    return data.reverse().map(m=>presentMessage(m,admin));
   }
   function configURL(){return get("SELECT value FROM settings WHERE name='form'")?.value||'';}
   async function handle(req,res) {
@@ -258,6 +302,14 @@ export function makeServer(config, upstream=providers) {
       return ok({version:revision,adminSignedIn,stage:s?.kind==='member'?safety.memberStage(s.member):(s?.kind||'gate'),
         ...(identity?safety.penalty(identity):{})});
     }
+    if(!post && p==='/api/events') {
+      const s=need(req,'member',true),stream={session:s.id,member:s.member,res};
+      res.writeHead(200,{'Content-Type':'text/event-stream; charset=utf-8','Connection':'keep-alive','X-Accel-Buffering':'no'});
+      streams.add(stream);
+      res.on('close',()=>streams.delete(stream));
+      res.write(': connected\n\n');
+      return;
+    }
     let b={};
     if(post) {
       if(req.headers.origin!==base) reject(403,'요청 출처를 확인할 수 없어요.');
@@ -277,6 +329,12 @@ export function makeServer(config, upstream=providers) {
     if(post && p==='/api/push/device') {
       const s=need(req,'member');
       return ok(pushes.bind(s.id,b.platform,b.token));
+    }
+    if(post && p==='/api/presence') {
+      const s=need(req,'member',true);
+      if(typeof b.online!=='boolean')reject(400,'접속 상태를 확인해 주세요.');
+      touch(s.member,s.id,b.online);
+      return ok(activity(s.member));
     }
     if(!post && p==='/api/state') {
       let s=sessions(req);
@@ -305,6 +363,7 @@ export function makeServer(config, upstream=providers) {
       const code=string(b.code,1,256,'인증키');
       const invitation=h('invite',code.normalize('NFKC').toLowerCase());
       const install=device(req,res);
+      const signupEpoch=signupEpochs.get(install);
       const available=()=>{
         if(get('SELECT 1 FROM used_invites WHERE proof=? AND pending_device IS NOT NULL AND pending_device<>? AND pending_until>?',invitation,install,Date.now()))
           reject(409,'이 인증키로 진행 중인 가입이 있어요.');
@@ -316,6 +375,7 @@ export function makeServer(config, upstream=providers) {
       if(v?.status==='pending') reject(403,'승인 대기 중이에요.');
       if(!registryApproved(v)) reject(403,'승인된 인증키를 확인해 주세요.');
       if(revision!==resetVersion()) reject(409,'서버가 초기화됐어요.');
+      if(signupEpoch!==signupEpochs.get(install))reject(409,'계정 정보가 변경됐어요. 인증키부터 다시 확인해 주세요.');
       transaction(db,()=>{
         checkSignup(install);available();
         const prev=sessions(req);
@@ -343,7 +403,7 @@ export function makeServer(config, upstream=providers) {
       throttle('recovery:'+ip,20,hour/4);
       const code=string(b.code,1,64,'개인 복구코드');
       const credential=proof(code);
-      const account=get('SELECT member FROM account_keys WHERE proof=?',credential);
+      const account=get('SELECT k.member FROM account_keys k JOIN members m ON m.id=k.member WHERE k.proof=? AND m.deleted_at IS NULL',credential);
       if(!account) {
         checkSignup(credential);
         reject(403,'개인 복구코드를 확인해 주세요.');
@@ -351,8 +411,10 @@ export function makeServer(config, upstream=providers) {
       transaction(db,()=>{
         run('INSERT OR IGNORE INTO account_devices VALUES(?,?)',account.member,device(req,res));
         if(s)run('DELETE FROM sessions WHERE id=?',s.id);
-        issue(res,'member',24*30*hour,account.member);
+        const sid=issue(res,'member',24*30*hour,account.member);
+        touch(account.member,sid);
       });
+      if(s)closeStreams(stream=>stream.session===s.id);
       return ok({stage:safety.memberStage(account.member)});
     }
     if(p==='/api/account/recovery') {
@@ -374,19 +436,21 @@ export function makeServer(config, upstream=providers) {
         const consumed=run('UPDATE used_invites SET pending_device=NULL,pending_until=NULL WHERE proof=? AND pending_device=? AND pending_until>?',s.identity,install,Date.now());
         if(consumed.changes!==1)reject(409,'가입 요청이 만료되었거나 이미 처리됐어요.');
         const id=randomUUID(),credential=proof(recoveryCode(id));
-        run('INSERT INTO members VALUES(?,?,?,?,?,?,?)',id,credential,s.nick,s.year,s.gender,b.area,memo);
+        run('INSERT INTO members(id,identity,nick,year,gender,area,memo) VALUES(?,?,?,?,?,?,?)',id,credential,s.nick,s.year,s.gender,b.area,memo);
         attachKey.run(id,credential,Date.now());
         run('INSERT INTO account_devices VALUES(?,?)',id,install);
         safety.accept(id,b.policy);
         // Keep this already-issued secret usable if the registration response is lost.
         const ttl=24*30*hour;
         run("UPDATE sessions SET kind='member',member=?,identity=NULL,nick=NULL,gender=NULL,year=NULL,expires=? WHERE id=?",id,Date.now()+ttl,s.id);
+        touch(id,s.id);
         cookie(res,'pc_user',cookieValue(req,'pc_user'),ttl);
       });
       return ok();
     }
     if(post && p==='/api/logout') {
       const s=sessions(req);if(s) run('DELETE FROM sessions WHERE id=?',s.id);
+      if(s)closeStreams(stream=>stream.session===s.id);
       cookie(res,'pc_user','',0);return ok();
     }
     if(post && p==='/api/policy') {
@@ -394,8 +458,10 @@ export function makeServer(config, upstream=providers) {
     }
     if(p==='/api/blocks') {
       const s=need(req,'member');
-      if(!post)return ok(all('SELECT p.id,p.nick FROM blocks x JOIN members p ON x.peer=p.id WHERE x.owner=? ORDER BY p.nick',s.member));
-      safety.setBlock(s.member,b.peer,b.remove===true);return ok();
+      if(!post)return ok(all('SELECT p.id,p.nick FROM blocks x JOIN members p ON x.peer=p.id WHERE x.owner=? AND p.deleted_at IS NULL ORDER BY p.nick',s.member));
+      const closed=safety.setBlock(s.member,b.peer,b.remove===true);
+      if(closed)notifyRoom(closed,{closed:true,reason:'blocked'});
+      return ok();
     }
     if(post && p==='/api/report') {
       const s=need(req,'member');throttle('report:'+s.member,30,hour);
@@ -418,12 +484,15 @@ export function makeServer(config, upstream=providers) {
         run('DELETE FROM sessions WHERE identity=?',m.identity);
         run('DELETE FROM members WHERE id=?',s.member);
       });
+      closeStreams(stream=>stream.member===s.member);
       cookie(res,'pc_user','',0);return ok();
     }
     if(!post && p==='/api/people') {
       const s=need(req,'member');
       const area=directoryArea(u);
-      return ok(all('SELECT '+profileCols+' FROM members p WHERE (? IS NULL OR p.area=?) AND p.id<>? AND '+visiblePeer+' ORDER BY nick,id',area,area,s.member,Date.now(),s.member,s.member));
+      return ok(all('SELECT '+profileCols+' FROM members p WHERE (? IS NULL OR p.area=?) AND p.id<>? AND '+visiblePeer+
+        ' ORDER BY (SELECT last_seen FROM member_activity WHERE member=p.id) DESC,p.id',area,area,s.member,Date.now(),s.member,s.member)
+        .map(member=>({...member,...activity(member.id)})));
     }
     if(!post && p==='/api/rooms') {
       const s=need(req,'member'),area=directoryArea(u);
@@ -442,15 +511,51 @@ export function makeServer(config, upstream=providers) {
         WHERE m.id=? AND m.room=? AND ${visibleMessage}`,b.through,room.id,Date.now()))
         reject(400,'이 대화에서 표시 중인 메시지만 읽음 처리할 수 있어요.');
       run('INSERT INTO room_reads VALUES(?,?,?) ON CONFLICT(room,member) DO UPDATE SET through=MAX(through,excluded.through)',room.id,s.member,b.through);
+      touch(s.member,null);
       return ok({unread:unread(s.member,room.id)});
+    }
+    const removingMessage=p.match(/^\/api\/messages\/(\d+)\/delete$/);
+    if(post && removingMessage) {
+      const s=need(req,'member',true);
+      if(b.confirm!==true)reject(400,'메시지 삭제를 확인해 주세요.');
+      const changed=transaction(db,()=>{
+        const m=get(`SELECT m.*,v.state FROM messages m LEFT JOIN reviews v ON v.message=m.id
+          WHERE m.id=? AND m.author=?`,removingMessage[1],s.member);
+        if(!m)reject(404,'내가 보낸 메시지를 찾을 수 없어요.');
+        if(m.deleted_at!==null)return;
+        const now=Date.now();
+        run('UPDATE messages SET deleted_at=?,photo=CASE WHEN expires>? THEN photo ELSE NULL END WHERE id=?',now,now,m.id);
+        run('DELETE FROM push_jobs WHERE message=?',m.id);
+        bumpRoom(m.room);
+        touch(s.member,null);
+        return m;
+      });
+      if(changed)notifyRoom(changed.room,{closed:false,deletedMessage:changed.id});
+      return ok({deleted:true});
+    }
+    const leaving=p.match(/^\/api\/rooms\/([a-f0-9-]+)\/leave$/);
+    if(post && leaving) {
+      const s=need(req,'member',true);
+      if(b.confirm!==true)reject(400,'대화 나가기를 확인해 주세요.');
+      const room=get('SELECT * FROM rooms WHERE id=?',leaving[1]);
+      if(!room || (room.a!==s.member && room.b!==s.member))reject(404,'대화방을 찾을 수 없어요.');
+      const changed=transaction(db,()=>closeRoom(db,room.id,'left'));
+      if(changed)notifyRoom(room.id,{closed:true,reason:'left'});
+      return ok({id:room.id,closed:true,version:roomVersion(room.id)});
     }
     if(post && p==='/api/room') {
       const s=need(req,'member');
-      if(!get('SELECT id FROM members WHERE id=?',String(b.peer)) || b.peer===s.member) reject(404,'상대 프로필을 찾을 수 없어요.');
+      if(!get('SELECT id FROM members WHERE id=? AND deleted_at IS NULL',String(b.peer)) || b.peer===s.member) reject(404,'상대 프로필을 찾을 수 없어요.');
       safety.pairAllowed(s.member,b.peer);
       const [a,other]=[s.member,b.peer].sort();
-      run('INSERT OR IGNORE INTO rooms VALUES(?,?,?)',randomUUID(),a,other);
-      return ok(get('SELECT id FROM rooms WHERE a=? AND b=?',a,other));
+      const room=transaction(db,()=>{
+        run('INSERT OR IGNORE INTO rooms(id,a,b) VALUES(?,?,?)',randomUUID(),a,other);
+        const room=get('SELECT id,closed_at FROM rooms WHERE a=? AND b=?',a,other);
+        if(room.closed_at!==null){run('UPDATE rooms SET closed_at=NULL,closed_reason=NULL WHERE id=?',room.id);bumpRoom(room.id);}
+        return room;
+      });
+      touch(s.member,null);
+      return ok({id:room.id,version:roomVersion(room.id)});
     }
     const dialog=p.match(/^\/api\/(admin\/)?rooms\/([a-f0-9-]+)\/messages$/);
     if(dialog) {
@@ -473,19 +578,22 @@ export function makeServer(config, upstream=providers) {
         const entry=run('INSERT INTO messages(room,author,sent,body,photo,expires) VALUES(?,?,?,?,?,?)',room.id,s.member,now,body,photo,photo?now+12*hour:null);
         if(photo)run("INSERT INTO reviews VALUES(?,'approved')",entry.lastInsertRowid);
         pushes.enqueue(entry.lastInsertRowid);
+        touch(s.member,null);
       });
       return ok();
     }
     const media=p.match(/^\/api\/(admin\/)?photos\/(\d+)$/);
     if(media && !post) {
-      const meta=get('SELECT room FROM messages WHERE id=?',media[2]);
+      const meta=get('SELECT room,deleted_at FROM messages WHERE id=?',media[2]);
       if(!meta) reject(404,'사진을 찾을 수 없어요.');
       roomFor(req,meta.room,!!media[1]);
+      if(!media[1] && meta.deleted_at!==null)reject(403,'삭제한 사진이에요.');
       if(!media[1] && !get(`SELECT 1 FROM reviews v WHERE v.message=? AND v.state='approved'
         AND NOT EXISTS(SELECT 1 FROM reports f WHERE f.message=v.message AND f.status='open')`,media[2]))
         reject(403,'열람할 수 없는 사진이에요.');
-      const m=get('SELECT photo FROM messages WHERE id=? AND expires>? AND photo IS NOT NULL',media[2],Date.now());
-      if(!m) reject(410,'보관 기간이 지난 사진이에요.');
+      const m=get(`SELECT m.photo FROM messages m LEFT JOIN reviews v ON v.message=m.id
+        WHERE m.id=? AND m.expires>? AND m.photo IS NOT NULL AND (v.state IS NULL OR v.state!='removed')`,media[2],Date.now());
+      if(!m?.photo) reject(410,'보관 기간이 지났거나 삭제된 사진이에요.');
       return finish(res,200,Buffer.from(m.photo),'image/jpeg');
     }
     if(p==='/api/admin/login' && post) {
@@ -504,19 +612,55 @@ export function makeServer(config, upstream=providers) {
       if(p==='/api/admin/members' && !post) {
         const offset=Number(u.searchParams.get('offset')||0);
         if(!Number.isSafeInteger(offset)||offset<0)reject(400,'목록 범위를 확인해 주세요.');
-        const now=Date.now();
-        const counts={active:get('SELECT COUNT(*) AS n FROM members').n,
+        const filter=u.searchParams.get('filter')||'all';
+        if(!['all','active','inactive','withdrawn'].includes(filter))reject(400,'회원 조회 조건을 확인해 주세요.');
+        const now=Date.now(),cutoff=now-inactiveAfter;
+        const counts={active:get('SELECT COUNT(*) AS n FROM members WHERE deleted_at IS NULL').n,
+          inactive:get(`SELECT COUNT(*) AS n FROM members p JOIN member_activity a ON a.member=p.id
+            WHERE p.deleted_at IS NULL AND a.last_seen<=?`,cutoff).n,
           withdrawn:get('SELECT COUNT(*) AS n FROM departures WHERE expires>?',now).n};
         const members=all(`SELECT * FROM (
-          SELECT p.id,p.nick,p.area,COALESCE(k.joined,c.joined) AS joined,'active' AS status,NULL AS withdrawn,NULL AS expires
+          SELECT p.id,p.nick,p.area,COALESCE(k.joined,c.joined) AS joined,'active' AS status,NULL AS withdrawn,NULL AS expires,
+            a.last_seen AS lastSeen
           FROM members p LEFT JOIN account_keys k ON k.member=p.id LEFT JOIN contacts c ON p.id=c.member
-          UNION ALL SELECT id,nick,NULL,NULL,'withdrawn',withdrawn,expires FROM departures WHERE expires>?
-        ) ORDER BY status,nick,id LIMIT 51 OFFSET ?`,now,offset);
-        return ok({items:members.slice(0,50),more:members.length>50,counts});
+          LEFT JOIN member_activity a ON a.member=p.id
+          WHERE p.deleted_at IS NULL AND ?!='withdrawn' AND (?!='inactive' OR a.last_seen<=?)
+          UNION ALL SELECT id,nick,NULL,NULL,'withdrawn',withdrawn,expires,NULL FROM departures
+          WHERE expires>? AND ? IN ('all','withdrawn')
+        ) ORDER BY status,CASE WHEN ?='inactive' THEN lastSeen END,nick,id LIMIT 51 OFFSET ?`,filter,filter,cutoff,now,filter,filter,offset);
+        return ok({items:members.slice(0,50).map(m=>({...m,online:m.status==='active'?activity(m.id).online:false})),more:members.length>50,counts});
+      }
+      const deletingMember=p.match(/^\/api\/admin\/members\/([a-f0-9-]+)\/delete$/);
+      if(deletingMember && post) {
+        if(b.confirm!==true)reject(400,'회원 삭제를 확인해 주세요.');
+        const target=deletingMember[1];
+        const devices=transaction(db,()=>{
+          const m=get('SELECT deleted_at FROM members WHERE id=?',target);
+          if(!m)reject(404,'가입자 정보가 없어요.');
+          if(m.deleted_at!==null)return [];
+          const linked=all('SELECT device FROM account_devices WHERE member=?',target).map(d=>d.device);
+          for(const device of linked) {
+            const pending=all('SELECT proof FROM used_invites WHERE pending_device=?',device);
+            for(const invite of pending)
+              run("DELETE FROM sessions WHERE identity=? AND kind IN ('gate_ok','details','verified')",invite.proof);
+            run('UPDATE used_invites SET pending_device=NULL,pending_until=NULL WHERE pending_device=?',device);
+          }
+          run('DELETE FROM push_jobs WHERE message IN (SELECT id FROM messages WHERE author=?)',target);
+          run('DELETE FROM sessions WHERE member=?',target);
+          for(const table of ['account_keys','account_devices','contacts','acceptances','room_reads'])
+            run('DELETE FROM '+table+' WHERE member=?',target);
+          run('DELETE FROM blocks WHERE owner=? OR peer=?',target,target);
+          run('UPDATE members SET deleted_at=? WHERE id=?',Date.now(),target);
+          for(const room of all('SELECT id FROM rooms WHERE a=? OR b=?',target,target))bumpRoom(room.id);
+          return linked;
+        });
+        for(const device of devices)signupEpochs.set(device,token());
+        closeStreams(stream=>stream.member===target);
+        return ok({deleted:true,id:target});
       }
       const memberPath=p.match(/^\/api\/admin\/members\/([a-f0-9-]+)$/);
       if(memberPath && !post){
-        const m=get(`SELECT p.id,p.nick,p.year,p.gender,p.area,p.memo,p.identity,c.encrypted,c.verified,COALESCE(k.joined,c.joined) AS joined
+        const m=get(`SELECT p.id,p.nick,p.year,p.gender,p.area,p.memo,p.identity,p.deleted_at AS deletedAt,c.encrypted,c.verified,COALESCE(k.joined,c.joined) AS joined
           FROM members p LEFT JOIN account_keys k ON k.member=p.id LEFT JOIN contacts c ON c.member=p.id WHERE p.id=?`,memberPath[1]);
         if(!m){
           const departed=get("SELECT nick,withdrawn,expires,'withdrawn' AS status FROM departures WHERE id=? AND expires>?",memberPath[1],Date.now());
@@ -524,7 +668,7 @@ export function makeServer(config, upstream=providers) {
           reject(404,'가입자 정보가 없어요.');
         }
         const {identity,encrypted,...profile}=m;
-        return ok({...profile,contact:vault.read(encrypted,identity),...safety.penalty(identity)});
+        return ok({...profile,status:profile.deletedAt===null?'active':'deleted',...activity(profile.id),contact:vault.read(encrypted,identity),...safety.penalty(identity)});
       }
       if(p==='/api/admin/review' && !post)return ok(safety.queue());
       if(p==='/api/admin/review' && post) {
@@ -542,12 +686,14 @@ export function makeServer(config, upstream=providers) {
       }
       if(p==='/api/admin/rooms' && !post) {
         const area=directoryArea(u);
-        return ok(all(`SELECT r.id,x.nick AS first,x.area AS firstArea,y.nick AS second,y.area AS secondArea,MAX(m.sent) AS recent
+        return ok(all(`SELECT r.id,x.nick AS first,x.area AS firstArea,y.nick AS second,y.area AS secondArea,
+          x.deleted_at AS firstDeletedAt,y.deleted_at AS secondDeletedAt,r.closed_at AS closedAt,r.closed_reason AS closedReason,MAX(m.sent) AS recent
           FROM rooms r JOIN members x ON r.a=x.id JOIN members y ON r.b=y.id
           LEFT JOIN messages m ON m.room=r.id WHERE (? IS NULL OR x.area=? OR y.area=?) GROUP BY r.id ORDER BY recent DESC,r.id`,area,area,area));
       }
       if(p==='/api/admin/reset' && post) {
         transaction(db,()=>{for(const table of tables) db.exec('DELETE FROM '+table);db.exec("DELETE FROM sqlite_sequence WHERE name='messages'");run("UPDATE service_meta SET value=? WHERE key='reset'",token());});
+        closeStreams();
         cookie(res,'pc_admin','',0);return ok();
       }
       if(p==='/api/admin/logout' && post) {run('DELETE FROM sessions WHERE id=?',s.id);cookie(res,'pc_admin','',0);return ok();}
@@ -563,7 +709,16 @@ export function makeServer(config, upstream=providers) {
   const timer=setInterval(()=>clean(db),30000);timer.unref();
   const pushTimer=setInterval(()=>pushes.flush().catch(()=>console.error('알림 대기열 처리 오류')),1000);
   pushTimer.unref();
-  server.on('close',()=>{clearInterval(timer);clearInterval(pushTimer);pushes.close();db.close();});
+  const eventTimer=setInterval(()=>{
+    for(const stream of [...streams]) {
+      if(!streamValid(stream)){endStream(stream);continue;}
+      try{stream.res.write(': heartbeat\n\n');}catch{endStream(stream);}
+    }
+  },15000);eventTimer.unref();
+  // End long-lived responses before Node waits for connections in server.close.
+  const close=server.close;
+  server.close=function(...args){closeStreams();return close.apply(this,args);};
+  server.on('close',()=>{closeStreams();clearInterval(timer);clearInterval(pushTimer);clearInterval(eventTimer);pushes.close();db.close();});
   return server;
 }
 if(process.argv[1] && pathToFileURL(resolve(process.argv[1])).href===import.meta.url) {

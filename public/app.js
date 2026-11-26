@@ -18,6 +18,11 @@ const paths={
 };
 const icon=n=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[n]||paths.mail}</svg>`;
 let me,regions,stage,activeTimer,epoch=0,currentBack=null,backBusy=false,unreadTotal=0,unreadRequest=0,accountState={};
+let accountRevision=0,bootSerial=0,presenceTimer=null,nativeForeground=window.paperChatNativeForeground!==false,pageForeground=true,lastPresence=null,lastPresenceAt=0;
+let memberEvents=null,roomEventHandler=null;
+const memberStages=new Set(['member','restricted','policy']);
+const hasMemberSession=()=>memberStages.has(stage);
+const staleRequest=()=>Object.assign(new Error('화면이 변경되어 이전 요청을 종료했어요.'),{stale:true});
 // Native Android back and the iOS edge gesture share the same screen navigation.
 window.paperChatBack=()=>{
   const dialog=document.querySelector('dialog[open]');
@@ -42,20 +47,87 @@ fitViewport();
 const scopes={people:{},rooms:{},monitor:{}};
 function resetScopes(){for(const scope of Object.values(scopes)){scope.regional=false;scope.area='';}}
 const draft={nick:'',birthDate:'',gender:'',province:'',district:'',memo:''};
-const err=e=>{const el=$('#error');if(el)el.textContent=e.message||String(e);};
-const note=msg=>{const el=$('#notice');el.textContent=msg;setTimeout(()=>{if(el.textContent===msg)el.textContent='';},3200);};
-async function api(path,body) {
-  const controller=path==='status'?new AbortController():null;
+const err=e=>{if(e?.stale)return;const el=$('#error');if(el)el.textContent=e.message||String(e);};
+const note=msg=>{const el=$('#notice');if(!el)return;el.textContent=msg;setTimeout(()=>{if(el.textContent===msg)el.textContent='';},3200);};
+async function api(path,body,{keepalive=false}={}) {
+  const revision=accountRevision,view=epoch;
+  const memberRequest=!admin&&hasMemberSession()&&!path.startsWith('admin/')&&!['key','account/login'].includes(path);
+  const background=['status','presence','unread','push/device'].includes(path);
+  const controller=['status','presence'].includes(path)?new AbortController():null;
   const timer=controller?setTimeout(()=>controller.abort(),8000):null;
   let res;
-  try{res=await fetch('/api/'+path+(path==='status' && !admin?'?member=1':''),{signal:controller?.signal,method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store'});}finally{if(timer)clearTimeout(timer);}
+  try{res=await fetch('/api/'+path+(path==='status' && !admin?'?member=1':''),{signal:controller?.signal,method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store',keepalive});}finally{if(timer)clearTimeout(timer);}
+  if(revision!==accountRevision)throw staleRequest();
   const version=res.headers.get('X-Service-Version');
   if(version)recordVersion(version);
   const data=await res.json();
+  if(revision!==accountRevision)throw staleRequest();
+  if(!res.ok&&res.status===401&&memberRequest){
+    clearMemberSession('사용자 정보가 없거나 로그인이 종료되었어요. 다시 인증해 주세요.');
+    throw staleRequest();
+  }
+  if(!background&&view!==epoch)throw staleRequest();
   if(Array.isArray(data))data.roomVersion=res.headers.get('X-Room-Version');
   if(!res.ok){const e=new Error(data.error||'요청에 실패했어요.');e.status=res.status;throw e;}
   return data;
 }
+function clearMemberSession(message=''){
+  accountRevision++;bootSerial++;unreadRequest++;
+  closeMemberEvents();
+  clearInterval(activeTimer);clearInterval(presenceTimer);presenceTimer=null;
+  me=null;accountState={};stage='gate';unreadTotal=0;nextPushSync=0;
+  currentBack=null;backBusy=false;lastPresence=null;lastPresenceAt=0;resetScopes();
+  for(const key of Object.keys(draft))draft[key]='';
+  sessionStorage.clear();main.replaceChildren();veil(false);gate();
+  if(message)err(new Error(message));
+}
+const foregroundVisible=()=>nativeForeground&&pageForeground&&!document.hidden;
+function presenceVisible(){return !admin&&hasMemberSession()&&foregroundVisible()&&navigator.onLine!==false;}
+function closeMemberEvents(){
+  const source=memberEvents;memberEvents=null;source?.close();
+}
+function syncMemberEvents(){
+  if(stage!=='member'||!presenceVisible()||typeof window.EventSource!=='function'){closeMemberEvents();return;}
+  if(memberEvents)return;
+  const revision=accountRevision;
+  let source;
+  try{source=new window.EventSource('/api/events');}catch{return;}
+  memberEvents=source;
+  const current=()=>source===memberEvents&&revision===accountRevision&&stage==='member'&&presenceVisible();
+  source.addEventListener('room-change',event=>{
+    if(!current())return;
+    let change;try{change=JSON.parse(event.data);}catch{return;}
+    if(!change||typeof change.room!=='string')return;
+    Promise.resolve(roomEventHandler?.(change)).catch(err);void syncUnread();
+  });
+  source.addEventListener('open',()=>{
+    if(!current())return;
+    // Fetch changes missed while disconnected without replacing the composer.
+    Promise.resolve(roomEventHandler?.({refresh:true})).catch(err);void syncUnread();
+  });
+  source.addEventListener('error',()=>{if(current())void pulse();});
+}
+async function sendPresence(online,force=false){
+  if(admin||!hasMemberSession())return;
+  if(!force&&lastPresence===online&&Date.now()-lastPresenceAt<25000)return;
+  lastPresence=online;lastPresenceAt=Date.now();const revision=accountRevision;
+  try{
+    await api('presence',{online},{keepalive:!online});
+    // Repair a slow foreground response that arrives after backgrounding, or vice versa.
+    if(revision===accountRevision&&hasMemberSession()&&online!==presenceVisible())void sendPresence(presenceVisible(),true);
+  }catch(e){if(!e.stale&&revision===accountRevision)lastPresenceAt=0;}
+}
+function updatePresence(force=false){
+  syncMemberEvents();
+  const online=presenceVisible();
+  if(!online){clearInterval(presenceTimer);presenceTimer=null;}
+  else if(!presenceTimer)presenceTimer=setInterval(()=>void sendPresence(presenceVisible(),true),30000);
+  if(hasMemberSession())void sendPresence(online,force);
+}
+window.paperChatPresence=active=>{
+  nativeForeground=active===true;updatePresence(true);
+  if(nativeForeground)void pulse(true);else veil(true);
+};
 function on(sel,event,fn) {
   const el=$(sel);if(!el)return;
   el.addEventListener(event,async e=>{
@@ -77,7 +149,7 @@ function field(id,title,opts=''){return `<div class="field"><label for="${id}">$
 const actions=(...parts)=>`<div class="actions">${parts.join('')}</div>`;
 const notice='<p class="error" id="error" role="alert"></p>';
 function paint(title,mark,body,{sub='',back,wide=false,nav=''}={}) {
-  clearInterval(activeTimer);epoch++;main.className=wide?'wide':'';
+  clearInterval(activeTimer);epoch++;roomEventHandler=null;main.className=wide?'wide':'';
   currentBack=back||(nav&&!nav.includes('id="tab-people" class="active"')?people:null);
   back=currentBack;
   main.innerHTML=`<header class="bar"><span class="brand">${icon('mail')}종이편지</span>${back?act('back','이전','textBtn'):''}</header><section class="hero"><h1>${icon(mark)}${esc(title)}</h1>${sub?`<p>${esc(sub)}</p>`:''}</section>${nav}<div id="sections" class="screen-stack">${body}</div>${body.includes(notice)?'':notice}`;
@@ -91,11 +163,11 @@ function tabs(current){
 function wireTabs(){on('#tab-people','click',people);on('#tab-rooms','click',rooms);on('#tab-settings','click',settings);}
 function row(id,title,subtitle,unread=0){return `<button type="button" class="row" data-id="${esc(id)}"><span>${esc(title)}<small>${esc(subtitle)}</small></span>${unread?`<span class="badge" aria-label="안 읽은 메시지 ${unread}개">${unread>99?'99+':unread}</span>`:''}${icon('arrow')}</button>`;}
 async function syncUnread(){
-  if(admin||stage!=='member'||document.hidden)return;
+  if(admin||stage!=='member'||!foregroundVisible())return;
   const request=++unreadRequest;
   try{
     const data=await api('unread');
-    if(request!==unreadRequest||stage!=='member')return;
+    if(request!==unreadRequest||stage!=='member'||!foregroundVisible())return;
     unreadTotal=Math.max(0,Number(data.total)||0);
     const badge=$('#unread-total');
     if(badge){badge.textContent=unreadTotal>99?'99+':String(unreadTotal);badge.hidden=!unreadTotal;badge.setAttribute('aria-label',`안 읽은 메시지 ${unreadTotal}개`);}
@@ -118,7 +190,7 @@ function recordVersion(version){
   const previous=knownVersion;knownVersion=version;
   localStorage.setItem(resetKey,version);
   if(previous && previous!==version){
-    leaving=true;clearInterval(activeTimer);epoch++;me=null;resetScopes();stage='gate';
+    leaving=true;closeMemberEvents();clearInterval(activeTimer);clearInterval(presenceTimer);presenceTimer=null;accountRevision++;bootSerial++;unreadRequest++;epoch++;me=null;accountState={};unreadTotal=0;currentBack=null;roomEventHandler=null;resetScopes();stage='gate';
     for(const k of Object.keys(draft))draft[k]='';
     sessionStorage.clear();
     main.replaceChildren();location.replace(admin?'/admin?reset=1':'/app?reset=1');
@@ -126,7 +198,7 @@ function recordVersion(version){
   }
 }
 function accountActions(){
-  on('#logout','click',async()=>{await api('logout',{});location.replace('/app');});
+  on('#logout','click',async()=>{await api('logout',{});closeMemberEvents();location.replace('/app');});
   on('#withdraw','click',()=>modal('회원탈퇴','프로필과 참여한 대화가 삭제돼요. 관리자 현황에는 닉네임과 탈퇴 시각이 24시간 표시돼요. 일반 재가입은 24시간 후, 이용 제한 중이면 제한 종료 후 가능해요.','탈퇴하기',async()=>{await api('withdraw',{confirm:true});location.replace('/app');}));
 }
 function limitedPage(state){
@@ -143,7 +215,7 @@ function reportUI(target,back){
   form(async f=>{await api('report',{...target,reason:f.get('reason')});await back();note('신고를 접수했어요.');});
 }
 function blockPeer(id,back){
-  modal('사용자 차단','서로의 프로필과 대화가 숨겨지고 메시지와 사진을 주고받을 수 없어요.','차단하기',async()=>{await api('blocks',{peer:id});await back();note('사용자를 차단했어요.');});
+  modal('사용자 차단','서로의 프로필이 숨겨지고 두 사람의 채팅방이 삭제돼요. 관리자는 원래 대화에서 기록을 확인할 수 있으며, 사진은 전송 후 12시간에 만료돼요.','차단하기',async()=>{await api('blocks',{peer:id});await back();note('사용자를 차단했어요.');void syncUnread();});
 }
 async function blockedList(){
   const items=await api('blocks');
@@ -226,11 +298,13 @@ function pushResult(status){
   if(status==='failed' || status==='checking')nextPushSync=Date.now()+15000;
 }
 async function syncPush(force=false){
-  if(admin || stage!=='member' || (!applePush && !androidPush) || (!force && Date.now()<nextPushSync))return;
+  if(admin || stage!=='member' || !foregroundVisible() || (!applePush && !androidPush) || (!force && Date.now()<nextPushSync))return;
+  const revision=accountRevision;
   nextPushSync=Date.now()+180000;
   try{
     if(androidPush){location.href='paperchat://push/sync';return;}
     const result=await applePush.postMessage('sync');
+    if(revision!==accountRevision||stage!=='member'||!foregroundVisible())return;
     if(!result.token){pushResult(result.status);return;}
     const binding=await api('push/device',{platform:result.platform,token:result.token});
     pushResult(binding.configured?'ready':'server');
@@ -255,7 +329,12 @@ async function scopedDirectory(key,endpoint,title,mark,renderRows,open,empty,{ba
   const change=regional=>{if(Boolean(scope.regional)===regional)return;scope.regional=regional;return reload();};
   on('#scope-all','click',()=>change(false));
   on('#scope-area','click',()=>change(true));
-  let request=0,pending=false;
+  let request=0,pending=false,directoryItems=[];
+  function render(items){
+    directoryItems=items;
+    list.innerHTML=items.map(renderRows).join('')||'<p class="empty">'+esc(empty(scope.regional))+'</p>';
+    rows(items,open);
+  }
   async function refresh(fromTimer=false){
     if(fromTimer && pending)return;
     const id=++request;pending=true;
@@ -263,8 +342,8 @@ async function scopedDirectory(key,endpoint,title,mark,renderRows,open,empty,{ba
     try{
       const items=await api(endpoint+query);
       if(current!==epoch || id!==request)return;
-      list.innerHTML=items.map(renderRows).join('')||'<p class="empty">'+esc(empty(scope.regional))+'</p>';
-      rows(items,open);
+      if(key==='people')items.sort((a,b)=>(Number(b.lastSeen)||0)-(Number(a.lastSeen)||0)||String(a.id).localeCompare(String(b.id)));
+      render(items);
     }catch(e){
       if(current!==epoch || id!==request)return;
       list.replaceChildren();
@@ -272,6 +351,13 @@ async function scopedDirectory(key,endpoint,title,mark,renderRows,open,empty,{ba
       err(e);
     }finally{if(id===request)pending=false;}
   }
+  if(key==='rooms')roomEventHandler=change=>{
+    if(current!==epoch)return;
+    const known=directoryItems.find(item=>item.id===change.room);
+    if(!change.refresh&&known&&Number(change.version)>0&&Number(change.version)<=Number(known.version))return;
+    if(change.closed){request++;render(directoryItems.filter(item=>item.id!==change.room));}
+    return refresh();
+  };
   if(scope.regional){
     regions||=await api('regions');
     if(current!==epoch)return;
@@ -279,22 +365,23 @@ async function scopedDirectory(key,endpoint,title,mark,renderRows,open,empty,{ba
     scope.area=areaOf();
   }
   await refresh();
-  if(live && current===epoch)activeTimer=setInterval(()=>{if(!document.hidden)void refresh(true);},4000);
+  if(live && current===epoch)activeTimer=setInterval(()=>{if(foregroundVisible())void refresh(true);},4000);
 }
+function presenceBadge(p){return `<span class="presence-badge ${p.online?'online':''}">${p.online?'접속 중':p.lastSeen?'최근 접속 · '+esc(at(p.lastSeen)):'접속 기록 없음'}</span>`;}
 function people(){
   return scopedDirectory('people','people','프로필 목록','book',
-    p=>`<button type="button" class="row profile-row" data-id="${esc(p.id)}"><span><strong>${esc(p.nick)}</strong><small>${esc(p.area+' · '+p.year+'년생 · '+p.gender)}</small><span class="profile-memo-label">성향 메모</span><span class="profile-memo">${esc(p.memo||'아직 작성된 성향 메모가 없어요.')}</span></span>${icon('arrow')}</button>`,profile,
-    regional=>regional?'이 지역에 다른 회원이 아직 없어요.':'아직 표시할 다른 회원이 없어요.');
+    p=>`<button type="button" class="row profile-row" data-id="${esc(p.id)}"><span><strong>${esc(p.nick)}</strong>${presenceBadge(p)}<small>${esc(p.area+' · '+p.year+'년생 · '+p.gender)}</small><span class="profile-memo-label">성향 메모</span><span class="profile-memo">${esc(p.memo||'아직 작성된 성향 메모가 없어요.')}</span></span>${icon('arrow')}</button>`,profile,
+    regional=>regional?'이 지역에 다른 회원이 아직 없어요.':'아직 표시할 다른 회원이 없어요.',{live:true,sub:'최근 접속한 회원부터 표시돼요.'});
 }
 function profile(p){
-  paint(p.nick,'book',`<article class="paper"><p class="sub">${esc(p.year)}년생 · ${esc(p.gender)} · ${esc(p.area)}</p><div class="rule"></div><h2>성향 메모</h2><p class="memo">${esc(p.memo)}</p>${actions(act('start','대화하기','primary'))}</article>`,{back:people});
+  paint(p.nick,'book',`<article class="paper">${presenceBadge(p)}<p class="sub">${esc(p.year)}년생 · ${esc(p.gender)} · ${esc(p.area)}</p><div class="rule"></div><h2>성향 메모</h2><p class="memo">${esc(p.memo)}</p>${actions(act('start','대화하기','primary'))}</article>`,{back:people});
   $('#sections').insertAdjacentHTML('beforeend',actions(act('report','프로필 신고'),act('block','사용자 차단','danger')));
   on('#report','click',()=>reportUI({kind:'profile',peer:p.id},()=>profile(p)));on('#block','click',()=>blockPeer(p.id,people));
-  on('#start','click',async()=>{const r=await api('room',{peer:p.id});await conversation(r.id,p.nick,false,rooms,p.id,p.area);});
+  on('#start','click',async()=>{const r=await api('room',{peer:p.id});await conversation(r.id,p.nick,false,rooms,p.id,p.area,r.version);});
 }
 function rooms(){
   return scopedDirectory('rooms','rooms','내 대화','chat',r=>row(r.id,r.nick,r.area,r.unread),
-    r=>conversation(r.id,r.nick,false,rooms,r.peer,r.area),
+    r=>conversation(r.id,r.nick,false,rooms,r.peer,r.area,r.version),
     regional=>regional?'선택한 지역의 회원과 나눈 대화가 없어요.':'프로필을 열고 첫 대화를 시작해 보세요.',{live:true});
 }
 function settings(){
@@ -312,77 +399,128 @@ async function jpeg(file){
   }finally{URL.revokeObjectURL(url);}
 }
 function message(m,isAdmin){
+  if(!isAdmin&&(m.deleted||m.visibility==='deleted'))return '';
   const when=new Date(m.sent).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});
   const labels={pending:'사진 검토 중',reported:'신고 접수 · 검토 중',removed:'이용규칙에 따라 삭제되었어요.',expired:'보관 기간이 지난 사진이에요.'};
-  const body=labels[m.visibility]||(m.expires?(m.viewable && m.expires>Date.now()?`<img draggable="false" alt="대화 사진" src="/api/${isAdmin?'admin/':''}photos/${m.id}">`:'보관 기간이 지난 사진이에요.'):esc(m.body));
-  return `<article class="msg ${!isAdmin&&m.author===me?.id?'mine':''}"><span class="by">${esc(m.nick)}</span><div class="bubble msgText">${body}</div><time class="time">${esc(when)}</time>${!isAdmin&&m.author!==me?.id&&!['reported','removed','expired'].includes(m.visibility)?`<button type="button" class="textBtn" data-report="${m.id}">신고</button>`:''}</article>`;
+  const deleted=isAdmin&&m.deleted,photoVisible=m.viewable&&m.expires>Date.now();
+  const body=m.visibility==='removed'?labels.removed:deleted?(m.expires?(photoVisible?`<img draggable="false" alt="삭제된 사진 원본" src="/api/admin/photos/${m.id}">`:labels.expired):esc(m.body)):
+    labels[m.visibility]||(m.expires?(photoVisible?`<img draggable="false" alt="대화 사진" src="/api/${isAdmin?'admin/':''}photos/${m.id}">`:'보관 기간이 지난 사진이에요.'):esc(m.body));
+  const mine=!isAdmin&&m.author===me?.id;
+  return `<article class="msg ${mine?'mine':''}" data-message="${m.id}"><span class="by">${esc(m.nick)}</span>${deleted?`<span class="deleted-label" title="삭제 · ${esc(at(m.deletedAt))}">${m.expires?'삭제된 사진':'삭제된 채팅'}</span>`:''}<div class="bubble msgText">${body}</div><time class="time">${esc(when)}</time>${mine?`<button type="button" class="textBtn danger" data-delete-message="${m.id}">${m.expires?'사진':'메시지'} 삭제</button>`:!isAdmin&&!['reported','removed','expired'].includes(m.visibility)?`<button type="button" class="textBtn" data-report="${m.id}">신고</button>`:''}</article>`;
 }
-async function conversation(id,title,isAdmin,back,peer,area=''){
+async function conversation(id,title,isAdmin,back,peer,area='',initialVersion=null){
   const endpoint=(isAdmin?'admin/':'')+'rooms/'+encodeURIComponent(id)+'/messages';
   const composer=`<form class="compose paper"><label class="sr-only" for="body">메시지</label><textarea id="body" name="body" maxlength="2000" rows="1" placeholder="전하고 싶은 말을 적어주세요."></textarea><input hidden class="off" id="photo" type="file" accept="image/*">${actions(act('attach',icon('photo')+'사진','secondary'),btn('보내기'))}</form>`;
-  paint(title,'chat',`<div class="chat-tools">${act('older','이전 메시지','textBtn')}${isAdmin?'':act('block','상대 차단','textBtn danger')}</div><div class="log" id="log"></div>${isAdmin?'':composer}`,{back,sub:[area,isAdmin?'운영자 열람 화면':'사진은 전송 즉시 표시되며 12시간 뒤 만료돼요.'].filter(Boolean).join(' · ')});
+  paint(title,'chat',`<div class="chat-tools">${act('older','이전 메시지','textBtn')}${isAdmin?'':act('block','상대 차단','textBtn danger')+act('leaveRoom','채팅 나가기','textBtn danger')}</div><div class="log" id="log"></div>${isAdmin?'':composer}`,{back,sub:[area,isAdmin?'운영자 열람 화면':'사진은 전송 즉시 표시되며 12시간 뒤 만료돼요.'].filter(Boolean).join(' · ')});
   main.className='chat-screen';fitViewport();
-  const reopen=()=>conversation(id,title,isAdmin,back,peer,area);
+  const reopen=()=>conversation(id,title,isAdmin,back,peer,area,roomVersion);
   if(!isAdmin){
-    on('#block','click',()=>blockPeer(peer,rooms));
+    on('#block','click',()=>blockPeer(peer,()=>returnToRooms()));
+    on('#leaveRoom','click',()=>modal('채팅 나가기','나와 상대방의 채팅방이 모두 삭제돼요. 관리자는 원래 대화에서 기록을 확인할 수 있으며, 사진은 전송 후 12시간에 만료돼요.','나가기',async()=>{
+      await roomRequest('rooms/'+encodeURIComponent(id)+'/leave',{confirm:true});
+      await returnToRooms('채팅방에서 나왔어요.');
+    }));
     on('#log','click',e=>{
       const target=e.target.closest('[data-report]');if(target)return reportUI({kind:'message',message:Number(target.dataset.report)},reopen);
+      const deletion=e.target.closest('[data-delete-message]');if(deletion){
+        const messageId=Number(deletion.dataset.deleteMessage),m=items.get(messageId);
+        if(!m||m.author!==me?.id)return;
+        modal(m.expires?'사진 삭제':'메시지 삭제','양쪽 대화에서 사라지지만 관리자는 원래 대화에서 확인할 수 있어요. 사진은 전송 후 12시간에 만료돼요.','삭제하기',async()=>{
+          await api('messages/'+messageId+'/delete',{confirm:true});
+          if(v!==epoch)return;
+          removeMessage(messageId);
+          note('삭제했어요.');void syncUnread();
+        });
+      }
     });
   }
-  let roomVersion=null;
-  const v=epoch,log=$('#log');let items=new Map(),signature='',busy=false,more=true,readThrough=0,reading=false;
+  let roomVersion=initialVersion,lastEventVersion=Number(initialVersion)||0;
+  const v=epoch,log=$('#log'),deletedLocally=new Set();let items=new Map(),signature='',busy=false,more=true,readThrough=0,reading=false,oldestCursor=null,loaded=false,closing=false;
+  function removeMessage(messageId){
+    deletedLocally.add(messageId);items.delete(messageId);signature='';
+    log.querySelector(`[data-message="${messageId}"]`)?.remove();
+    if(!items.size)log.innerHTML='<p class="empty">아직 대화가 없어요.</p>';
+  }
+  if(!isAdmin)roomEventHandler=change=>{
+    if(v!==epoch||closing)return;
+    if(change.refresh)return refresh();
+    if(change.room!==id)return;
+    const version=Number(change.version)||0;
+    if(version&&version<=Math.max(Number(roomVersion)||0,lastEventVersion))return;
+    lastEventVersion=Math.max(lastEventVersion,version);
+    if(change.closed)return returnToRooms('종료된 채팅방이에요. 내 대화로 돌아왔어요.');
+    if(Number.isSafeInteger(change.deletedMessage)&&change.deletedMessage>0)removeMessage(change.deletedMessage);
+  };
+  async function returnToRooms(message=''){
+    if(v!==epoch||closing)return;
+    closing=true;clearInterval(activeTimer);items.clear();log.replaceChildren();
+    $('#body').value='';$('#photo').value='';document.querySelector('dialog[open]')?.close();
+    await rooms();
+    if(stage==='member'){if(message)note(message);void syncUnread();}
+  }
+  async function roomRequest(path,body){
+    try{return await api(path,body);}catch(e){
+      if(!isAdmin&&[404,410].includes(e.status)&&v===epoch){
+        await returnToRooms('종료된 채팅방이에요. 내 대화로 돌아왔어요.');
+        throw staleRequest();
+      }
+      throw e;
+    }
+  }
+  const merge=messages=>{for(const m of messages){oldestCursor=oldestCursor===null?m.id:Math.min(oldestCursor,m.id);if(!isAdmin&&(m.deleted||m.visibility==='deleted'||deletedLocally.has(m.id)))items.delete(m.id);else items.set(m.id,m);}};
   async function markRead(){
-    if(isAdmin||document.hidden||v!==epoch||reading||log.scrollHeight-log.scrollTop-log.clientHeight>40)return;
-    const through=Math.max(0,...[...items.values()].filter(m=>!['reported','removed','pending','expired'].includes(m.visibility)).map(m=>m.id));
+    if(isAdmin||!foregroundVisible()||v!==epoch||reading||log.scrollHeight-log.scrollTop-log.clientHeight>40)return;
+    const through=Math.max(0,...[...items.values()].filter(m=>!m.deleted&&!['reported','removed','pending','expired','deleted'].includes(m.visibility)).map(m=>m.id));
     if(through<=readThrough)return;
     reading=true;
-    try{await api('rooms/'+encodeURIComponent(id)+'/read',{through});readThrough=through;await syncUnread();}
+    try{await roomRequest('rooms/'+encodeURIComponent(id)+'/read',{through});readThrough=through;await syncUnread();}
     catch{/* Retry after the next visible refresh. */}finally{reading=false;}
   }
   log.addEventListener('scroll',()=>void markRead());
   async function refresh(earlier=false){
     if(busy || v!==epoch)return;busy=true;
     try {
-      let ids=[...items.keys()];const before=earlier&&ids.length?Math.min(...ids):null;
-      const data=await api(endpoint+(before?'?before='+before:''));
+      let ids=[...items.keys()];const before=earlier?oldestCursor:null;
+      const data=await roomRequest(endpoint+(before?'?before='+before:''));
       if(v!==epoch)return;
       if(roomVersion!==null && roomVersion!==data.roomVersion){
-        items.clear();ids=[];signature='';
+        items.clear();ids=[];signature='';oldestCursor=null;loaded=false;
         if(earlier){busy=false;return await refresh();}
       }
       roomVersion=data.roomVersion;
       const atEnd=log.scrollHeight-log.scrollTop-log.clientHeight<40,height=log.scrollHeight;
-      if(earlier||!ids.length)more=data.length===60;
-      for(const m of data)items.set(m.id,m);
+      if(earlier||!loaded)more=data.length===60;
+      loaded=true;
+      merge(data);
       // A large burst between refreshes can leave gaps. Fill them from the preceding pages.
       if(!earlier && ids.length && data.length===60 && data[0].id>Math.max(...ids)){
         let cursor=data[0].id;
         while(cursor>Math.max(...ids)){
-          const page=await api(endpoint+'?before='+cursor);if(v!==epoch)return;
-          for(const m of page)items.set(m.id,m);
+          const page=await roomRequest(endpoint+'?before='+cursor);if(v!==epoch)return;
+          merge(page);
           if(page.length<60)break;cursor=page[0].id;
         }
       }
       const ordered=[...items.values()].sort((a,b)=>a.id-b.id);
-      const next=ordered.map(m=>[m.id,m.visibility,m.nick,(m.expires && (m.expires<=Date.now()||!m.viewable))?1:0].join(':')).join(',');
+      const next=ordered.map(m=>[m.id,m.visibility,m.nick,m.deleted,m.deletedAt,(m.expires&&(!m.viewable||m.expires<=Date.now()))?1:0].join(':')).join(',');
       if(next!==signature || !ordered.length){
         signature=next;log.innerHTML=ordered.map(m=>message(m,isAdmin)).join('')||'<p class="empty">아직 대화가 없어요.</p>';
         if(earlier)log.scrollTop+=log.scrollHeight-height;else if(atEnd||!ids.length)log.scrollTop=log.scrollHeight;
       }
       $('#older').hidden=!more;$('#older').classList.toggle('off',!more);
       await markRead();
-    }catch(e){if(v===epoch && [401,403,404].includes(e.status)){items.clear();log.replaceChildren();clearInterval(activeTimer);}throw e;}
+    }catch(e){if(e.stale)return;if(v===epoch && [401,403,404].includes(e.status)){items.clear();log.replaceChildren();clearInterval(activeTimer);if(!isAdmin){$('#body').value='';void pulse(true);}else if(e.status===401)adminLogin();}throw e;}
     finally{busy=false;}
   }
   on('#older','click',()=>refresh(true));
   if(!isAdmin){
-    form(async f=>{const body=String(f.get('body')).trim();if(!body)throw new Error('메시지를 입력해 주세요.');await api(endpoint,{body});$('#body').value='';await refresh();});
+    form(async f=>{const body=String(f.get('body')).trim();if(!body)throw new Error('메시지를 입력해 주세요.');await roomRequest(endpoint,{body});$('#body').value='';await refresh();});
     on('#attach','click',()=>$('#photo').click());on('#photo','change',async e=>{
       const f=e.target.files[0];e.target.value='';if(!f)return;const button=$('#attach');button.disabled=true;
-      try{await api(endpoint,{photo:await jpeg(f)});note('사진을 보냈어요. 전송 후 12시간 동안 볼 수 있어요.');await refresh();}finally{button.disabled=false;}
+      try{const photo=await jpeg(f);if(v!==epoch)return;await roomRequest(endpoint,{photo});note('사진을 보냈어요. 전송 후 12시간 동안 볼 수 있어요.');await refresh();}finally{button.disabled=false;}
     });
   }
-  await refresh();if(v===epoch)activeTimer=setInterval(()=>{if(!document.hidden)refresh().catch(err);},2500);
+  await refresh();if(v===epoch)activeTimer=setInterval(()=>{if(foregroundVisible())refresh().catch(err);},2500);
 }
 const at=t=>t?new Date(t).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'}):'기록 없음';
 let adminPrivate=false;
@@ -393,10 +531,10 @@ function watchDirectory(path,initial,render,expiry){
   async function refresh(){
     if(view!==epoch || leaving)return;
     try{
-      if(!document.hidden){
+      if(foregroundVisible()&&!document.querySelector('dialog[open]')){
         const current=await api(path);
         if(view!==epoch)return;
-        if(JSON.stringify(current)!==previous){await render(current);return;}
+        if(!document.querySelector('dialog[open]')&&JSON.stringify(current)!==previous){await render(current);return;}
       }
     }catch(e){
       if(view!==epoch || leaving)return;
@@ -409,28 +547,41 @@ function watchDirectory(path,initial,render,expiry){
   const delay=expiry?Math.max(20,Math.min(4000,expiry-Date.now()+20)):4000;
   activeTimer=setTimeout(refresh,delay);
 }
-async function membersPage(offset=0,page=null){
-  const path='admin/members?offset='+offset;
+function deleteMember(m,done){
+  modal('회원 삭제',`${m.nick}님의 계정과 회원 화면을 삭제할까요? 해당 회원은 다음 연결부터 이용할 수 없으며, 관리자 대화 기록은 보관됩니다.`,'회원 삭제',async()=>{
+    await api('admin/members/'+encodeURIComponent(m.id)+'/delete',{confirm:true});
+    await done();note('회원을 삭제했어요.');
+  });
+}
+async function membersPage(offset=0,page=null,filter=''){
+  const path='admin/members?offset='+offset+(filter?'&filter='+encodeURIComponent(filter):'');
   page??=await api(path);
-  const itemLabel=m=>m.status==='withdrawn'?'탈퇴 · '+at(m.expires)+' 삭제 예정':m.area;
-  paint('가입자 현황','book',`<p class="counts">가입 중 <strong>${page.counts.active}명</strong> · 탈퇴 후 24시간 이내 <strong>${page.counts.withdrawn}명</strong></p><section class="paper"><div class="rows">${page.items.map(m=>row(m.id,m.nick,itemLabel(m))).join('')||'가입자가 없어요.'}</div></section>${actions(offset?act('prevPage','이전 목록'):'',page.more?act('nextPage','다음 목록'):'')}`,{back:adminHome,sub:'회원을 선택하면 출생연도, 성별, 지역과 성향 메모를 볼 수 있어요.'});
-  watchDirectory(path,page,next=>membersPage(offset,next),Math.min(...page.items.filter(i=>i.expires).map(i=>i.expires)));
-  rows(page.items,m=>memberDetail(m.id,()=>membersPage(offset)));
-  on('#prevPage','click',()=>membersPage(Math.max(0,offset-50)));on('#nextPage','click',()=>membersPage(offset+50));
+  const itemLabel=m=>m.status==='withdrawn'?'탈퇴 · '+at(m.expires)+' 삭제 예정':m.area+' · '+(m.online?'접속 중':'최근 접속 '+at(m.lastSeen));
+  const reopen=()=>membersPage(offset,null,filter);
+  paint(filter==='inactive'?'30일 미접속 회원':'가입자 현황','book',`<p class="counts">가입 중 <strong>${page.counts.active}명</strong> · 30일 미접속 <strong>${page.counts.inactive||0}명</strong> · 탈퇴 후 24시간 이내 <strong>${page.counts.withdrawn}명</strong></p><section class="paper"><div class="rows">${page.items.map(m=>`<div class="member-row">${row(m.id,m.nick,itemLabel(m))}${m.status==='withdrawn'?'':`<button type="button" class="textBtn danger" data-delete-member="${esc(m.id)}" aria-label="${esc(m.nick)} 회원 삭제">회원 삭제</button>`}</div>`).join('')||'<p class="empty">해당하는 회원이 없어요.</p>'}</div></section>${actions(offset?act('prevPage','이전 목록'):'',page.more?act('nextPage','다음 목록'):'')}`,{back:adminHome,sub:filter==='inactive'?'마지막 접속 후 30일 이상 지난 회원이에요.':'회원을 선택하면 출생연도, 성별, 지역과 성향 메모를 볼 수 있어요.'});
+  watchDirectory(path,page,next=>membersPage(offset,next,filter),Math.min(...page.items.filter(i=>i.expires).map(i=>i.expires)));
+  rows(page.items,m=>memberDetail(m.id,reopen));
+  document.querySelectorAll('[data-delete-member]').forEach(el=>el.onclick=()=>{const m=page.items.find(i=>i.id===el.dataset.deleteMember);if(m)deleteMember(m,reopen);});
+  on('#prevPage','click',()=>membersPage(Math.max(0,offset-50),null,filter));on('#nextPage','click',()=>membersPage(offset+50,null,filter));
 }
 async function memberDetail(id,back,m=null){
   const path='admin/members/'+encodeURIComponent(id);
   m??=await api(path);
+  if(m.status==='deleted'){
+    paint('삭제된 회원','book',`<section class="paper"><h2>${esc(m.nick)}</h2><p>관리자 삭제 · ${esc(at(m.deletedAt))}</p><p class="note">삭제된 계정이에요. 관리자 대화 기록은 보관됩니다.</p></section>`,{back});
+    return;
+  }
   if(m.status==='withdrawn'){
     paint('탈퇴한 회원','book',`<section class="paper"><h2>${esc(m.nick)}</h2><p>탈퇴 · ${esc(at(m.withdrawn))}</p><p>현황에서 삭제 · ${esc(at(m.expires))}</p></section>`,{back});
     watchDirectory(path,m,next=>memberDetail(id,back,next),m.expires);
     return;
   }
-  const fields=[['닉네임',m.nick],['출생연도',m.year],['성별',m.gender],['지역',m.area],['성향 메모',m.memo],['회원 ID',m.id],['현재 벌점',(m.strikes||0)+' / 3'],['누적 신고 인정',m.totalStrikes||0]];
+  const fields=[['닉네임',m.nick],['출생연도',m.year],['성별',m.gender],['지역',m.area],['성향 메모',m.memo],['최근 접속',at(m.lastSeen)],['접속 상태',m.online?'접속 중':'접속 종료'],['회원 ID',m.id],['현재 벌점',(m.strikes||0)+' / 3'],['누적 신고 인정',m.totalStrikes||0]];
   if(m.contact)fields.push(['이전 인증 이름',m.contact.name],['이전 인증 전화번호',m.contact.phone],['이전 인증 일시',at(m.verified)]);
   if(m.restrictedUntil)fields.push(['이용 제한 종료',at(m.restrictedUntil)]);
-  paint('가입자 상세','book',`<section class="paper"><dl class="details">${fields.map(([k,v])=>`<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl></section>`,{back});
+  paint('가입자 상세','book',`<section class="paper"><dl class="details">${fields.map(([k,v])=>`<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl>${actions(act('deleteMember','회원 삭제','danger'))}</section>`,{back});
   watchDirectory(path,m,next=>memberDetail(id,back,next));
+  on('#deleteMember','click',()=>deleteMember(m,back));
 }
 async function reviewList(){
   const data=await api('admin/review');
@@ -461,8 +612,8 @@ function reviewItem(item,isPhoto){
 async function adminHome(){
   try{await api('admin/settings');}catch(e){if(e.status===401){adminLogin();return;}throw e;}
   adminPrivate=true;
-  paint('운영자 관리실','settings',`<div class="grid adminGrid">${menu('url','mail','인증폼 주소','발급 신청서 연결') }${menu('monitor','chat','대화 모니터링','전체·지역별 대화 열람')}${menu('members','book','가입자 현황','가입·탈퇴 회원 조회')}${menu('reset','bin','서버 초기화','서비스 데이터 전체 삭제','destructive')}</div>${act('out','관리자 로그아웃','textBtn')}`,{wide:true});
-  on('#members','click',()=>membersPage());on('#url','click',adminURL);on('#monitor','click',monitor);on('#reset','click',reset);on('#out','click',async()=>{await api('admin/logout',{});adminLogin();});
+  paint('운영자 관리실','settings',`<div class="grid adminGrid">${menu('url','mail','인증폼 주소','발급 신청서 연결') }${menu('monitor','chat','대화 모니터링','전체·지역별 대화 열람')}${menu('members','book','가입자 현황','가입·탈퇴 회원 조회')}${menu('inactiveMembers','book','30일 미접속 회원','최근 접속 확인·회원 삭제')}${menu('reset','bin','서버 초기화','서비스 데이터 전체 삭제','destructive')}</div>${act('out','관리자 로그아웃','textBtn')}`,{wide:true});
+  on('#members','click',()=>membersPage());on('#inactiveMembers','click',()=>membersPage(0,null,'inactive'));on('#url','click',adminURL);on('#monitor','click',monitor);on('#reset','click',reset);on('#out','click',async()=>{await api('admin/logout',{});adminLogin();});
 }
 function adminLogin(){
   adminPrivate=false;scopes.monitor={};
@@ -477,7 +628,7 @@ async function adminURL(){
 function monitor(){
   const participants=r=>r.first+' ('+r.firstArea+') · '+r.second+' ('+r.secondArea+')';
   return scopedDirectory('monitor','admin/rooms','대화 모니터링','chat',
-    r=>row(r.id,participants(r),r.recent?at(r.recent):'새 대화'),
+    r=>row(r.id,participants(r),[r.closedAt?'종료된 대화 · '+(r.closedReason==='blocked'?'차단':'채팅 나가기'):'',r.recent?at(r.recent):'새 대화'].filter(Boolean).join(' · ')),
     r=>conversation(r.id,r.first+' · '+r.second,true,monitor,null,participants(r)),
     regional=>regional?'이 지역의 회원이 참여한 대화가 없어요.':'아직 대화가 없어요.',
     {back:adminHome,sub:'지역별 목록에는 두 참여자 중 한 명이라도 선택한 지역에 속한 대화가 표시돼요.',
@@ -488,10 +639,14 @@ function reset(){
   form(async f=>{await api('admin/reset',{key:f.get('key'),confirm:f.get('confirm')});note('가입 중 0명 · 탈퇴 현황 0명으로 초기화했어요.');adminLogin();});
 }
 async function boot(){
-  const s=await api('state');stage=s.stage;me=s.profile;accountState=s;
+  const revision=accountRevision,serial=++bootSerial;
+  const s=await api('state');if(revision!==accountRevision||serial!==bootSerial)return;
+  if(s.stage==='gate'&&hasMemberSession()){clearMemberSession('사용자 정보가 없거나 로그인이 종료되었어요. 다시 인증해 주세요.');return;}
+  stage=s.stage;me=s.profile;accountState=s;updatePresence(true);
   if(['policy','restricted'].includes(stage)){limitedPage(stage);return;}
   if(stage==='member'){
     await syncUnread();
+    if(revision!==accountRevision||serial!==bootSerial||stage!=='member')return;
     if(s.needsRecoveryCopy){await recoveryPage();return;}
     void syncPush(true);
     if(new URLSearchParams(location.search).get('inbox')==='1'){
@@ -515,7 +670,7 @@ function veil(show,message='서버의 계정 상태를 확인하고 있어요.')
   if(show){document.querySelectorAll('dialog[open]').forEach(d=>d.close());}
 }
 function pulse(protect=false){
-  if(document.hidden)return;
+  if(document.hidden||!nativeForeground||!pageForeground)return;
   if(protect)veil(true);
   if(pulseTask)return pulseTask;
   pulseTask=(async()=>{
@@ -525,22 +680,22 @@ function pulse(protect=false){
       if(!admin && stage==='restricted' && status.stage==='restricted' && status.restrictedUntil!==accountState.restrictedUntil){accountState=status;limitedPage(stage);}
       if(admin && adminPrivate && !status.adminSignedIn){adminLogin();note('관리자 로그인이 종료됐어요.');}
       if(!admin && ['member','restricted','policy'].includes(stage) && status.stage!==stage){
-        if(status.stage==='gate'){me=null;resetScopes();await boot();err(new Error('사용자 정보가 없거나 로그인이 종료되었어요. 다시 인증해 주세요.'));}
+        if(status.stage==='gate'){clearMemberSession('사용자 정보가 없거나 로그인이 종료되었어요. 다시 인증해 주세요.');return;}
         else await boot();
       }
       if(status.stage==='member'){void syncPush(protect);void syncUnread();}
-      veil(false);
-    }catch{if(!leaving)veil(true,'서버에 연결하면 계정 상태를 다시 확인해요.');}
+      if(foregroundVisible())veil(false);
+    }catch(e){if(!leaving&&!e.stale)veil(true,'서버에 연결하면 계정 상태를 다시 확인해요.');}
     finally{pulseTask=null;}
   })();
   return pulseTask;
 }
 setInterval(()=>pulse(),4000);
-document.addEventListener('visibilitychange',()=>{if(document.hidden)veil(true);else pulse(true);});
-window.addEventListener('pagehide',()=>veil(true));
-window.addEventListener('pageshow',e=>{if(e.persisted)pulse(true);});
-window.addEventListener('online',()=>pulse(true));
-window.addEventListener('offline',()=>veil(true,'연결이 끊어졌어요. 서버에 다시 연결되면 계속할 수 있어요.'));
-start().catch(e=>{paint('연결을 확인해 주세요','mail',actions(act('retry','다시 시도','primary')));err(e);on('#retry','click',()=>location.reload());});
+document.addEventListener('visibilitychange',()=>{updatePresence(true);if(document.hidden)veil(true);else pulse(true);});
+window.addEventListener('pagehide',()=>{pageForeground=false;updatePresence(true);veil(true);});
+window.addEventListener('pageshow',e=>{pageForeground=true;updatePresence(true);if(e.persisted)pulse(true);});
+window.addEventListener('online',()=>{updatePresence(true);pulse(true);});
+window.addEventListener('offline',()=>{updatePresence(true);veil(true,'연결이 끊어졌어요. 서버에 다시 연결되면 계속할 수 있어요.');});
+start().catch(e=>{if(e.stale)return;paint('연결을 확인해 주세요','mail',actions(act('retry','다시 시도','primary')));err(e);on('#retry','click',()=>location.reload());});
 document.addEventListener('contextmenu',e=>{if(e.target.closest('.msg'))e.preventDefault();});
 

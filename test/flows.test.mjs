@@ -399,7 +399,9 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     }
     assert.equal((await a('/api/blocks')).body[0].id,B.id);
     await b('/api/blocks',{peer:A.id,remove:true});assert.equal((await b('/api/photos/'+photo)).status,404);
-    await a('/api/blocks',{peer:B.id,remove:true});assert.equal((await b('/api/photos/'+photo)).status,200);
+    await a('/api/blocks',{peer:B.id,remove:true});assert.equal((await b('/api/photos/'+photo)).status,404);
+    assert.equal((await a('/api/room',{peer:B.id})).body.id,room);
+    assert.equal((await b('/api/photos/'+photo)).status,403);
   });
   await t.test('푸시 재시도, 차단, 기기 교체, 만료 토큰과 로그아웃이 대기열에 반영된다',async()=>{
     const path='/api/rooms/'+room+'/messages';
@@ -415,6 +417,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     await a('/api/blocks',{peer:idB});await deliveryQueue.flush();
     assert.equal(delivered.length,1);
     await a('/api/blocks',{peer:idB,remove:true});
+    await a('/api/room',{peer:idB});
     await a(path,{body:'기기 연결 변경 전 메시지'});
     await c('/api/push/device',iphone);await deliveryQueue.flush();assert.equal(delivered.length,1);
     await b('/api/push/device',iphone);
@@ -427,6 +430,8 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     await b('/api/logout',{});await deliveryQueue.flush();assert.equal(delivered.length,1);
     assert.equal(db.prepare('SELECT 1 FROM push_devices WHERE token=?').get(iphone.token),undefined);
     await pass(b,'','DI-B');await b('/api/push/device',iphone);
+    await a(path,{photo:Buffer.from([255,216,255,217]).toString('base64')});
+    photo=(await b(path)).body.at(-1).id;
   });
   await t.test('재시작 후에도 세션·폼·대화가 유지되고 12시간에 사진 열람 및 정리가 적용된다',async()=>{
     const version=(await a('/api/status')).body.version;
@@ -443,7 +448,9 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     now=stamp-1;assert.equal((await b('/api/photos/'+photo)).status,200);
     now=stamp;assert.equal((await b('/api/photos/'+photo)).status,410);
     clean(db,now);assert.equal(db.prepare('SELECT photo FROM messages WHERE id=?').get(photo).photo,null);
-    assert.equal((await a('/api/rooms/'+room+'/messages')).body[0].body,'반가워요');
+    assert.equal((await a('/api/rooms/'+room+'/messages')).body[0].visibility,'deleted');
+    await admin('/api/admin/login',{key:adminKey});
+    assert.equal((await admin('/api/admin/rooms/'+room+'/messages')).body[0].body,'반가워요');
   });
   await t.test('이전 버전 회원 세션과 대화는 유지되고 검토 이력이 없는 사진은 즉시 표시한다',async()=>{
     const C=(await c('/api/state')).body.profile, A=(await a('/api/state')).body.profile;
@@ -469,7 +476,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.equal((await other('/api/state')).body.stage,'gate');
     assert.equal((await b('/api/rooms')).body.length,0);
     const directory=await admin('/api/admin/members');
-    assert.deepEqual(directory.body.counts,{active:2,withdrawn:1});
+    assert.deepEqual(directory.body.counts,{active:2,inactive:0,withdrawn:1});
     const record=(await admin('/api/admin/members/'+old)).body;
     assert.deepEqual(Object.keys(record).sort(),['expires','nick','status','withdrawn']);
     assert.equal(record.status,'withdrawn');assert.equal(record.expires-record.withdrawn,24*hour);
@@ -482,7 +489,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.equal((await pass(other,'다른 닉네임','new-alias')).status,403);
     now+=1;
     assert.equal((await admin('/api/admin/members/'+old)).status,404);
-    assert.deepEqual((await admin('/api/admin/members')).body.counts,{active:2,withdrawn:0});
+    assert.deepEqual((await admin('/api/admin/members')).body.counts,{active:2,inactive:0,withdrawn:0});
     assert.equal((await pass(a,'새 이름','DI-A')).body.stage,'details');
     assert.equal((await a('/api/register',{area:'경기도 이천시',policy:policyVersion,memo:'새 메모'})).status,200);
     assert.notEqual((await a('/api/state')).body.profile.id,old);
@@ -555,7 +562,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.notEqual(after.version,oldVersion);assert.equal(after.stage,'gate');
     assert.equal((await admin('/api/admin/login',{key:adminKey})).status,200);
     assert.equal((await admin('/api/admin/members/'+oldMember)).status,404);
-    assert.deepEqual((await admin('/api/admin/members')).body,{items:[],more:false,counts:{active:0,withdrawn:0}});
+    assert.deepEqual((await admin('/api/admin/members')).body,{items:[],more:false,counts:{active:0,inactive:0,withdrawn:0}});
     assert.deepEqual((await admin('/api/admin/review')).body,{photos:[],reports:[]});
     assert.match(String((await nobody('/apply')).body),/발급 주소/);
     assert.match((await nobody('/apply',undefined,{userAgent:'WebView PaperChatAndroid/2'})).headers.location,/unavailable/);
@@ -567,8 +574,8 @@ test('기존 pending 사진 이관은 신고·삭제·만료를 보존하고 동
   t.after(()=>{db.close();rmSync(dir,{recursive:true,force:true});});
   const now=Date.now();
   for(const id of ['author','receiver','other'])
-    db.prepare('INSERT INTO members VALUES(?,?,?,?,?,?,?)').run(id,id+'-identity',id,1995,'여성','경기도 이천시','소개');
-  db.prepare('INSERT INTO rooms VALUES(?,?,?)').run('room','author','receiver');
+    db.prepare('INSERT INTO members(id,identity,nick,year,gender,area,memo) VALUES(?,?,?,?,?,?,?)').run(id,id+'-identity',id,1995,'여성','경기도 이천시','소개');
+  db.prepare('INSERT INTO rooms(id,a,b) VALUES(?,?,?)').run('room','author','receiver');
   const ids=[];
   for(const [state,expires] of [['pending',now+hour],['pending',now+hour],['removed',now+hour],['pending',now-1]]){
     const id=Number(db.prepare('INSERT INTO messages(room,author,sent,photo,expires) VALUES(?,?,?,?,?)').run('room','author',now,Buffer.from([255,216,255,217]),expires).lastInsertRowid);

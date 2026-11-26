@@ -1,5 +1,5 @@
 import { reject } from './providers.mjs';
-import { hour, transaction } from './store.mjs';
+import { hour, transaction, closeRoom } from './store.mjs';
 import { policyVersion, reasons } from './public/rules.js';
 import { createHash } from 'node:crypto';
 
@@ -35,7 +35,7 @@ export function moderation(db) {
     return 'profile:'+id+':'+createHash('sha256').update(JSON.stringify(m)).digest('hex');
   }
   function memberStage(id) {
-    const m=get('SELECT identity FROM members WHERE id=?',id);
+    const m=get('SELECT identity FROM members WHERE id=? AND deleted_at IS NULL',id);
     if(!m) return 'gate';
     if(restricted(m.identity))return 'restricted';
     return get('SELECT 1 FROM acceptances WHERE member=? AND version=?',id,policyVersion)?'member':'policy';
@@ -45,26 +45,30 @@ export function moderation(db) {
     run('INSERT OR REPLACE INTO acceptances VALUES(?,?,?)',id,version,Date.now());
   }
   function pairAllowed(id,peer) {
-    const m=get('SELECT identity FROM members WHERE id=?',peer);
+    const m=get('SELECT identity FROM members WHERE id=? AND deleted_at IS NULL',peer);
     if(!m || restricted(m.identity) || get('SELECT 1 FROM blocks WHERE (owner=? AND peer=?) OR (owner=? AND peer=?)',id,peer,peer,id))
       reject(404,'이 대화를 이용할 수 없어요.');
   }
   function setBlock(id,peer,remove) {
-    if(typeof peer!=='string' || id===peer || !get('SELECT 1 FROM members WHERE id=?',peer))reject(404,'회원을 찾을 수 없어요.');
-    if(remove)run('DELETE FROM blocks WHERE owner=? AND peer=?',id,peer);
-    else run('INSERT OR IGNORE INTO blocks VALUES(?,?)',id,peer);
+    if(typeof peer!=='string' || id===peer || !get('SELECT 1 FROM members WHERE id=? AND deleted_at IS NULL',peer))reject(404,'회원을 찾을 수 없어요.');
+    return transaction(db,()=>{
+      if(remove){run('DELETE FROM blocks WHERE owner=? AND peer=?',id,peer);return null;}
+      run('INSERT OR IGNORE INTO blocks VALUES(?,?)',id,peer);
+      const room=get('SELECT id FROM rooms WHERE (a=? AND b=?) OR (a=? AND b=?)',id,peer,peer,id);
+      return room && closeRoom(db,room.id,'blocked')?room.id:null;
+    });
   }
   function report(reporter,b) {
     if(!reasons.includes(b.reason))reject(400,'신고 사유를 선택해 주세요.');
     let peer,room=null,message=null;
     if(b.kind==='message'){
       if(!Number.isSafeInteger(b.message))reject(400,'신고할 메시지를 선택해 주세요.');
-      const m=get('SELECT m.id,m.author,m.room,r.a,r.b FROM messages m JOIN rooms r ON m.room=r.id WHERE m.id=?',b.message);
+      const m=get('SELECT m.id,m.author,m.room,r.a,r.b FROM messages m JOIN rooms r ON m.room=r.id JOIN members p ON p.id=m.author WHERE m.id=? AND p.deleted_at IS NULL AND r.closed_at IS NULL',b.message);
       if(!m || (m.a!==reporter && m.b!==reporter) || m.author===reporter)reject(404,'신고할 메시지를 찾을 수 없어요.');
       peer=m.author;room=m.room;message=m.id;
     } else if(b.kind==='profile') {
       peer=b.peer;
-      if(typeof peer!=='string' || peer===reporter || !get('SELECT 1 FROM members WHERE id=?',peer))reject(404,'프로필을 찾을 수 없어요.');
+      if(typeof peer!=='string' || peer===reporter || !get('SELECT 1 FROM members WHERE id=? AND deleted_at IS NULL',peer))reject(404,'프로필을 찾을 수 없어요.');
     } else reject(400,'신고 대상을 확인해 주세요.');
     transaction(db,()=>{
       const content=message==null?profileContent(peer):'message:'+message;
@@ -109,7 +113,8 @@ export function moderation(db) {
       photos:[],
       reports:all(`SELECT r.id,r.reason,r.created,r.message,r.reporter,u.id AS sender,u.nick,u.area,
         CASE WHEN r.message IS NULL THEN u.memo ELSE m.body END AS excerpt,
-        CASE WHEN m.photo IS NOT NULL AND m.expires>? THEN m.id END AS photo
+        CASE WHEN m.photo IS NOT NULL AND m.expires>? THEN m.id END AS photo,
+        m.deleted_at AS deletedAt
         FROM reports r JOIN members u ON r.target=u.id LEFT JOIN messages m ON r.message=m.id
         WHERE r.status='open' ORDER BY r.created,r.id LIMIT 100`,Date.now())
     };
