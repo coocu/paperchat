@@ -8,12 +8,13 @@ import { policyVersion,reasons,rules } from '../public/rules.js';
 // The real native shells use the same controller.
 const script=readFileSync(new URL('../public/app.js',import.meta.url),'utf8')
   .replace(/^import [^\n]+\n/,'').replace('start().catch(', 'Promise.resolve().catch(');
-function browser({version,search='',fetchReply}){
+function browser({version,search='',userAgent='',fetchReply}){
   const nodes=new Map(),local=new Map(),session=new Map();
   if(version)local.set('paperchat.reset',version);
   function element(k){
     if(!nodes.has(k))nodes.set(k,{
-      innerHTML:'',textContent:'',hidden:true,handlers:{},options:[],value:'',
+      innerHTML:'',textContent:'',hidden:true,handlers:{},options:[],value:'',attributes:{},
+      setAttribute(k,v){this.attributes[k]=v;},
       add(option){this.options.push(option);if(this.options.length===1)this.value=option.value;},
       addEventListener(e,cb){this.handlers[e]=cb;},
       insertAdjacentHTML(where,html){this.innerHTML+=html;},
@@ -23,7 +24,7 @@ function browser({version,search='',fetchReply}){
   }
   const storage=map=>({getItem:k=>map.get(k)||null,setItem:(k,v)=>map.set(k,v),clear:()=>map.clear()});
   const location={pathname:'/app',search,replace(url){this.redirect=url;}};
-  const ctx=createContext({document:{querySelector:element,querySelectorAll:()=>[],hidden:false,addEventListener(){}},
+  const ctx=createContext({document:{querySelector:s=>s==='dialog[open]'?null:element(s),querySelectorAll:()=>[],hidden:false,addEventListener(){}},navigator:{userAgent},
     location,window:{addEventListener(){},scrollTo(){}},setInterval:()=>42,clearInterval(){},setTimeout:()=>7,clearTimeout,AbortController,
     policyVersion,reasons,rules,sessionStorage:storage(session),localStorage:storage(local),
     Option:class { constructor(text,value){this.text=text;this.value=value;} },
@@ -40,6 +41,40 @@ test('열린 앱에서 초기화를 감지하면 현재 화면과 가입 초안�
   assert.equal(b.run('me'),null);assert.equal(b.run('draft.memo'),'');assert.equal(b.local.get('paperchat.reset'),'fresh');
   const reloaded=browser({version:'fresh',search:'?reset=1',fetchReply:()=>({version:'fresh',stage:'gate'})});
   await reloaded.run('boot()');assert.match(reloaded.element('#error').textContent,/등록된 사용자 정보가 없습니다/);
+});
+
+test('네이티브 뒤로가기는 상세에서 목록으로 이동하고 첫 화면에서는 종료를 요청하지 않는다',async()=>{
+  const requests=[];
+  const b=browser({fetchReply:url=>{requests.push(url);return [];}});
+  b.run("me={id:'self'};profile({id:'other',nick:'봄',area:'경기도 이천시'})");
+  assert.equal(b.run('window.paperChatBack()'),true);
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(requests[0],'/api/people');
+  assert.equal(b.run('window.paperChatBack()'),false);
+  b.run('settings()');
+  assert.equal(b.run('window.paperChatBack()'),true);
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(requests.at(-1),'/api/people');
+});
+
+test('업데이트한 Android 앱도 푸시 연결을 요청한다',async()=>{
+  const b=browser({userAgent:'Mobile PaperChatAndroid/3',fetchReply:()=>({})});
+  b.run("stage='member'");await b.run('syncPush(true)');
+  assert.equal(b.location.href,'paperchat://push/sync');
+});
+
+test('프로필이 비공개인 제한 계정에도 서버가 준 제한 종료 시각을 표시한다',async()=>{
+  const b=browser({fetchReply:()=>({stage:'restricted',profile:null,restrictedUntil:Date.UTC(2026,10,27,9)})});
+  await b.run('boot()');assert.match(b.element('#app').innerHTML,/이용 재개:/);
+});
+
+test('안 읽은 개수를 메뉴와 방에 표시하고 모두 읽으면 메뉴 배지를 숨긴다',async()=>{
+  let total=4;
+  const b=browser({fetchReply:()=>({total})});b.run("stage='member'");
+  await b.run('syncUnread()');
+  assert.match(b.run("tabs('people')"),/안 읽은 메시지 4개/);
+  assert.match(b.run("row('r','봄','경기도 이천시',2)"),/안 읽은 메시지 2개/);
+  total=0;await b.run('syncUnread()');assert.equal(b.element('#unread-total').hidden,true);
 });
 test('앱 복귀 시 서버 확인 실패는 이전 내용을 가리고 정상 연결 후 재표시한다',async()=>{
   let offline=true;const b=browser({version:'one',fetchReply:()=>{

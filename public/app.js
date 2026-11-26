@@ -17,7 +17,28 @@ const paths={
   arrow:'<path d="m9 5 7 7-7 7"/>',photo:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m4 17 5-6 4 4 3-3 5 5"/><circle cx="16" cy="9" r="1.5"/>'
 };
 const icon=n=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[n]||paths.mail}</svg>`;
-let me,regions,stage,activeTimer,epoch=0;
+let me,regions,stage,activeTimer,epoch=0,currentBack=null,backBusy=false,unreadTotal=0,unreadRequest=0,accountState={};
+// Native Android back and the iOS edge gesture share the same screen navigation.
+window.paperChatBack=()=>{
+  const dialog=document.querySelector('dialog[open]');
+  if(dialog){dialog.close();return true;}
+  if(backBusy)return true;
+  if(!currentBack)return false;
+  backBusy=true;
+  Promise.resolve().then(currentBack).catch(err).finally(()=>{backBusy=false;});
+  return true;
+};
+function fitViewport(){
+  const viewport=window.visualViewport;
+  const height=viewport?.height||window.innerHeight;
+  if(!height)return;
+  document.documentElement.style.setProperty('--app-height',height+'px');
+  document.documentElement.style.setProperty('--app-top',(viewport?.offsetTop||0)+'px');
+}
+window.visualViewport?.addEventListener('resize',fitViewport);
+window.visualViewport?.addEventListener('scroll',fitViewport);
+window.addEventListener('resize',fitViewport);
+fitViewport();
 const scopes={people:{},rooms:{},monitor:{}};
 function resetScopes(){for(const scope of Object.values(scopes)){scope.regional=false;scope.area='';}}
 const draft={nick:'',birthDate:'',gender:'',province:'',district:'',memo:''};
@@ -57,16 +78,29 @@ const actions=(...parts)=>`<div class="actions">${parts.join('')}</div>`;
 const notice='<p class="error" id="error" role="alert"></p>';
 function paint(title,mark,body,{sub='',back,wide=false,nav=''}={}) {
   clearInterval(activeTimer);epoch++;main.className=wide?'wide':'';
+  currentBack=back||(nav&&!nav.includes('id="tab-people" class="active"')?people:null);
+  back=currentBack;
   main.innerHTML=`<header class="bar"><span class="brand">${icon('mail')}종이편지</span>${back?act('back','이전','textBtn'):''}</header><section class="hero"><h1>${icon(mark)}${esc(title)}</h1>${sub?`<p>${esc(sub)}</p>`:''}</section>${nav}<div id="sections" class="screen-stack">${body}</div>${body.includes(notice)?'':notice}`;
-  if(back)on('#back','click',back);
+  if(back)on('#back','click',()=>window.paperChatBack());
   document.title=title+' · 종이편지';
   window.scrollTo(0,0);
 }
 function tabs(current){
-  return '<nav class="tabs" aria-label="앱 메뉴">'+[['people','프로필 목록'],['rooms','내 대화'],['settings','설정']].map(([id,l])=>act('tab-'+id,l,id===current?'active':'')).join('')+'</nav>';
+  return '<nav class="tabs" aria-label="앱 메뉴">'+[['people','프로필 목록'],['rooms','내 대화'],['settings','설정']].map(([id,l])=>act('tab-'+id,l+(id==='rooms'?`<span id="unread-total" class="badge" ${unreadTotal?'':'hidden'} aria-label="안 읽은 메시지 ${unreadTotal}개">${unreadTotal>99?'99+':unreadTotal}</span>`:''),id===current?'active':'')).join('')+'</nav>';
 }
 function wireTabs(){on('#tab-people','click',people);on('#tab-rooms','click',rooms);on('#tab-settings','click',settings);}
-function row(id,title,subtitle){return `<button type="button" class="row" data-id="${esc(id)}"><span>${esc(title)}<small>${esc(subtitle)}</small></span>${icon('arrow')}</button>`;}
+function row(id,title,subtitle,unread=0){return `<button type="button" class="row" data-id="${esc(id)}"><span>${esc(title)}<small>${esc(subtitle)}</small></span>${unread?`<span class="badge" aria-label="안 읽은 메시지 ${unread}개">${unread>99?'99+':unread}</span>`:''}${icon('arrow')}</button>`;}
+async function syncUnread(){
+  if(admin||stage!=='member'||document.hidden)return;
+  const request=++unreadRequest;
+  try{
+    const data=await api('unread');
+    if(request!==unreadRequest||stage!=='member')return;
+    unreadTotal=Math.max(0,Number(data.total)||0);
+    const badge=$('#unread-total');
+    if(badge){badge.textContent=unreadTotal>99?'99+':String(unreadTotal);badge.hidden=!unreadTotal;badge.setAttribute('aria-label',`안 읽은 메시지 ${unreadTotal}개`);}
+  }catch{/* The regular connection check presents offline/account errors. */}
+}
 function rows(items,fn){
   document.querySelectorAll('.row').forEach(el=>el.onclick=()=>Promise.resolve(fn(items.find(x=>x.id===el.dataset.id))).catch(err));
 }
@@ -76,7 +110,7 @@ function modal(title,desc,label,fn){
   main.append(d);d.showModal();d.onclose=()=>d.remove();
   d.querySelector('#dismiss').onclick=()=>d.close();d.querySelector('#proceed').onclick=async()=>{d.close();try{await fn();}catch(e){err(e);}};
 }
-const rulesCard=()=>`<aside class="letter"><h2>${icon('book')}이용규칙</h2><ul>${rules.map(r=>'<li>'+esc(r)+'</li>').join('')}</ul></aside>`;
+const rulesCard=()=>`<aside class="letter"><h2>${icon('book')}이용규칙</h2><ul>${rules.map(r=>'<li>'+esc(r)+'</li>').join('')}</ul><a class="textBtn" href="/support">운영자 문의</a></aside>`;
 const resetKey='paperchat.reset';
 let leaving=false,knownVersion=localStorage.getItem(resetKey);
 function recordVersion(version){
@@ -98,7 +132,7 @@ function accountActions(){
 function limitedPage(state){
   const policy=state==='policy';
   paint(policy?'이용규칙 확인':'계정 이용 제한','book',rulesCard()+
-    (policy?`<form class="paper"><label class="check"><input required type="checkbox">이용규칙에 동의해요</label>${actions(btn('확인하고 계속'))}</form>`:'<p>신고 검토 결과에 따라 계정 이용이 제한되었어요.</p>')+
+    (policy?`<form class="paper"><label class="check"><input required type="checkbox">이용규칙에 동의해요</label>${actions(btn('확인하고 계속'))}</form>`:`<section class="paper"><p>신고 검토 결과에 따라 계정 이용이 제한되었어요. 새 신고는 인정 3회마다 24시간 제한이 적용돼요.</p>${accountState.restrictedUntil?`<p>이용 재개: ${esc(at(accountState.restrictedUntil))}</p>`:''}</section>`)+
     actions(act('recovery','개인 복구코드 보기'),act('logout','로그아웃'),act('withdraw','회원탈퇴','danger')));
   if(policy)form(async()=>{await api('policy',{version:policyVersion});await boot();});
   on('#recovery','click',()=>recoveryPage(()=>limitedPage(state)));
@@ -119,7 +153,7 @@ async function blockedList(){
 function gate(){
   paint('인증키를 입력해 주세요','key',`<form class="paper">${field('code','발급받은 일반 인증키','autocomplete="off" maxlength="256" aria-describedby="error" placeholder="인증키 입력"')}${notice}${actions(btn('인증하고 계속'))}</form>
     ${act('existing','기존 회원 로그인','secondary')}
-    <aside class="letter"><h2>${icon('mail')}인증키 발급 안내</h2><p>새로 가입할 때 한 번 쓰는 개인별 인증키예요.</p><div class="rule"></div><a class="btn forest" href="/apply">발급 신청서 열기</a></aside>
+    <aside class="letter"><h2>${icon('mail')}인증키 발급 안내</h2><p>발급 서버에서 현재 승인된 인증키로 가입할 수 있어요. 사용했던 키도 관리자가 다시 활성화하면 사용할 수 있어요.</p><div class="rule"></div><a class="btn forest" href="/apply">발급 신청서 열기</a></aside>
     ${rulesCard()}`);
   on('#existing','click',loginPage);
   form(async f=>{await api('key',{code:f.get('code')});nick();});
@@ -127,7 +161,7 @@ function gate(){
   if(new URLSearchParams(location.search).has('form'))err(new Error('등록된 발급 주소가 없어요.'));
 }
 function nick(){
-  paint('어떻게 불러드릴까요?','pen',`<form class="paper">${field('nick','닉네임',`value="${esc(draft.nick)}" maxlength="24" placeholder="대화에서 사용할 이름"`)}${actions(btn('다음'))}</form>`);
+  paint('어떻게 불러드릴까요?','pen',`<form class="paper">${field('nick','닉네임',`value="${esc(draft.nick)}" maxlength="24" placeholder="대화에서 사용할 이름"`)}${actions(btn('다음'))}</form>`,{back:()=>{draft.nick=$('#nick').value;gate();}});
   form(f=>{draft.nick=f.get('nick').trim();details();});
 }
 function loginPage(){
@@ -138,7 +172,7 @@ function details(){
   paint('생년월일과 성별','pen',`<form class="paper">${field('birthDate','생년월일',`type="date" autocomplete="bday" min="1900-01-01" value="${esc(draft.birthDate)}"`)}
     <div class="field"><label for="gender">성별</label><select id="gender" name="gender" required><option value="">선택해 주세요</option>${[['남성','남자'],['여성','여자']].map(([v,l])=>`<option value="${v}" ${draft.gender===v?'selected':''}>${l}</option>`).join('')}</select></div>
     <p class="note">직접 입력한 생년월일로 만 19세 이상인지 확인해요. 프로필에는 출생연도와 성별만 표시돼요.</p>
-    ${actions(btn('다음'))}</form>`,{back:nick});
+    ${actions(btn('다음'))}</form>`,{back:()=>{draft.birthDate=$('#birthDate').value;draft.gender=$('#gender').value;nick();}});
   form(async f=>{
     draft.birthDate=f.get('birthDate');draft.gender=f.get('gender');
     await api('profile-details',{nick:draft.nick,birthDate:draft.birthDate,gender:draft.gender});
@@ -186,7 +220,7 @@ function memo(){
   form(async f=>{draft.memo=f.get('memo');await api('register',{area:draft.province+' '+draft.district,memo:draft.memo,policy:policyVersion});draft.birthDate='';await boot();});
 }
 const applePush=window.webkit?.messageHandlers?.paperChatPush;
-const androidPush=/PaperChatAndroid\/2/.test(globalThis.navigator?.userAgent||'');
+const androidPush=/PaperChatAndroid\/\d+/.test(globalThis.navigator?.userAgent||'');
 let nextPushSync=0;
 function pushResult(status){
   if(status==='failed' || status==='checking')nextPushSync=Date.now()+15000;
@@ -249,7 +283,7 @@ async function scopedDirectory(key,endpoint,title,mark,renderRows,open,empty,{ba
 }
 function people(){
   return scopedDirectory('people','people','프로필 목록','book',
-    p=>row(p.id,p.nick,p.area+' · '+p.year+'년생 · '+p.gender),profile,
+    p=>`<button type="button" class="row profile-row" data-id="${esc(p.id)}"><span><strong>${esc(p.nick)}</strong><small>${esc(p.area+' · '+p.year+'년생 · '+p.gender)}</small><span class="profile-memo-label">성향 메모</span><span class="profile-memo">${esc(p.memo||'아직 작성된 성향 메모가 없어요.')}</span></span>${icon('arrow')}</button>`,profile,
     regional=>regional?'이 지역에 다른 회원이 아직 없어요.':'아직 표시할 다른 회원이 없어요.');
 }
 function profile(p){
@@ -259,7 +293,7 @@ function profile(p){
   on('#start','click',async()=>{const r=await api('room',{peer:p.id});await conversation(r.id,p.nick,false,rooms,p.id,p.area);});
 }
 function rooms(){
-  return scopedDirectory('rooms','rooms','내 대화','chat',r=>row(r.id,r.nick,r.area),
+  return scopedDirectory('rooms','rooms','내 대화','chat',r=>row(r.id,r.nick,r.area,r.unread),
     r=>conversation(r.id,r.nick,false,rooms,r.peer,r.area),
     regional=>regional?'선택한 지역의 회원과 나눈 대화가 없어요.':'프로필을 열고 첫 대화를 시작해 보세요.',{live:true});
 }
@@ -279,24 +313,33 @@ async function jpeg(file){
 }
 function message(m,isAdmin){
   const when=new Date(m.sent).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});
-  const labels={pending:'사진 검토 중',reported:'신고 접수로 숨겨진 메시지예요.',removed:'이용규칙에 따라 삭제되었어요.',expired:'보관 기간이 지난 사진이에요.'};
+  const labels={pending:'사진 검토 중',reported:'신고 접수 · 검토 중',removed:'이용규칙에 따라 삭제되었어요.',expired:'보관 기간이 지난 사진이에요.'};
   const body=labels[m.visibility]||(m.expires?(m.viewable && m.expires>Date.now()?`<img draggable="false" alt="대화 사진" src="/api/${isAdmin?'admin/':''}photos/${m.id}">`:'보관 기간이 지난 사진이에요.'):esc(m.body));
-  return `<article class="msg ${!isAdmin&&m.author===me?.id?'mine':''}"><span class="by">${esc(m.nick)}</span><div class="bubble msgText">${body}</div><time class="time">${esc(when)}</time>${!isAdmin&&m.author!==me?.id?`<button type="button" class="textBtn" data-report="${m.id}">신고</button>`:''}</article>`;
+  return `<article class="msg ${!isAdmin&&m.author===me?.id?'mine':''}"><span class="by">${esc(m.nick)}</span><div class="bubble msgText">${body}</div><time class="time">${esc(when)}</time>${!isAdmin&&m.author!==me?.id&&!['reported','removed','expired'].includes(m.visibility)?`<button type="button" class="textBtn" data-report="${m.id}">신고</button>`:''}</article>`;
 }
 async function conversation(id,title,isAdmin,back,peer,area=''){
   const endpoint=(isAdmin?'admin/':'')+'rooms/'+encodeURIComponent(id)+'/messages';
-  const composer=`<form class="compose paper"><label for="body">메시지</label><textarea id="body" name="body" maxlength="2000" rows="2" placeholder="전하고 싶은 말을 적어주세요."></textarea><input hidden class="off" id="photo" type="file" accept="image/*">${actions(act('attach',icon('photo')+'사진 보내기','secondary'),btn('보내기'))}</form>`;
-  paint(title,'chat',`${act('older','이전 메시지','textBtn')}<div class="log" id="log"></div>${isAdmin?'':composer}`,{back,sub:[area,isAdmin?'운영자 열람 화면':'사진은 운영자가 승인한 후 표시되며 전송 12시간 뒤 만료돼요.'].filter(Boolean).join(' · ')});
+  const composer=`<form class="compose paper"><label class="sr-only" for="body">메시지</label><textarea id="body" name="body" maxlength="2000" rows="1" placeholder="전하고 싶은 말을 적어주세요."></textarea><input hidden class="off" id="photo" type="file" accept="image/*">${actions(act('attach',icon('photo')+'사진','secondary'),btn('보내기'))}</form>`;
+  paint(title,'chat',`<div class="chat-tools">${act('older','이전 메시지','textBtn')}${isAdmin?'':act('block','상대 차단','textBtn danger')}</div><div class="log" id="log"></div>${isAdmin?'':composer}`,{back,sub:[area,isAdmin?'운영자 열람 화면':'사진은 전송 즉시 표시되며 12시간 뒤 만료돼요.'].filter(Boolean).join(' · ')});
+  main.className='chat-screen';fitViewport();
   const reopen=()=>conversation(id,title,isAdmin,back,peer,area);
   if(!isAdmin){
-    $('#sections').insertAdjacentHTML('beforeend',actions(act('block','상대 차단','danger')));
     on('#block','click',()=>blockPeer(peer,rooms));
     on('#log','click',e=>{
       const target=e.target.closest('[data-report]');if(target)return reportUI({kind:'message',message:Number(target.dataset.report)},reopen);
     });
   }
   let roomVersion=null;
-  const v=epoch,log=$('#log');let items=new Map(),signature='',busy=false,more=true;
+  const v=epoch,log=$('#log');let items=new Map(),signature='',busy=false,more=true,readThrough=0,reading=false;
+  async function markRead(){
+    if(isAdmin||document.hidden||v!==epoch||reading||log.scrollHeight-log.scrollTop-log.clientHeight>40)return;
+    const through=Math.max(0,...[...items.values()].filter(m=>!['reported','removed','pending','expired'].includes(m.visibility)).map(m=>m.id));
+    if(through<=readThrough)return;
+    reading=true;
+    try{await api('rooms/'+encodeURIComponent(id)+'/read',{through});readThrough=through;await syncUnread();}
+    catch{/* Retry after the next visible refresh. */}finally{reading=false;}
+  }
+  log.addEventListener('scroll',()=>void markRead());
   async function refresh(earlier=false){
     if(busy || v!==epoch)return;busy=true;
     try {
@@ -327,6 +370,7 @@ async function conversation(id,title,isAdmin,back,peer,area=''){
         if(earlier)log.scrollTop+=log.scrollHeight-height;else if(atEnd||!ids.length)log.scrollTop=log.scrollHeight;
       }
       $('#older').hidden=!more;$('#older').classList.toggle('off',!more);
+      await markRead();
     }catch(e){if(v===epoch && [401,403,404].includes(e.status)){items.clear();log.replaceChildren();clearInterval(activeTimer);}throw e;}
     finally{busy=false;}
   }
@@ -335,7 +379,7 @@ async function conversation(id,title,isAdmin,back,peer,area=''){
     form(async f=>{const body=String(f.get('body')).trim();if(!body)throw new Error('메시지를 입력해 주세요.');await api(endpoint,{body});$('#body').value='';await refresh();});
     on('#attach','click',()=>$('#photo').click());on('#photo','change',async e=>{
       const f=e.target.files[0];e.target.value='';if(!f)return;const button=$('#attach');button.disabled=true;
-      try{await api(endpoint,{photo:await jpeg(f)});note('사진을 접수했어요. 운영자가 확인한 뒤 표시돼요.');await refresh();}finally{button.disabled=false;}
+      try{await api(endpoint,{photo:await jpeg(f)});note('사진을 보냈어요. 전송 후 12시간 동안 볼 수 있어요.');await refresh();}finally{button.disabled=false;}
     });
   }
   await refresh();if(v===epoch)activeTimer=setInterval(()=>{if(!document.hidden)refresh().catch(err);},2500);
@@ -382,7 +426,7 @@ async function memberDetail(id,back,m=null){
     watchDirectory(path,m,next=>memberDetail(id,back,next),m.expires);
     return;
   }
-  const fields=[['닉네임',m.nick],['출생연도',m.year],['성별',m.gender],['지역',m.area],['성향 메모',m.memo],['회원 ID',m.id]];
+  const fields=[['닉네임',m.nick],['출생연도',m.year],['성별',m.gender],['지역',m.area],['성향 메모',m.memo],['회원 ID',m.id],['현재 벌점',(m.strikes||0)+' / 3'],['누적 신고 인정',m.totalStrikes||0]];
   if(m.contact)fields.push(['이전 인증 이름',m.contact.name],['이전 인증 전화번호',m.contact.phone],['이전 인증 일시',at(m.verified)]);
   if(m.restrictedUntil)fields.push(['이용 제한 종료',at(m.restrictedUntil)]);
   paint('가입자 상세','book',`<section class="paper"><dl class="details">${fields.map(([k,v])=>`<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl></section>`,{back});
@@ -390,9 +434,8 @@ async function memberDetail(id,back,m=null){
 }
 async function reviewList(){
   const data=await api('admin/review');
-  const photoItems=data.photos.map(i=>row('p'+i.id,i.nick+' · 사진',i.area+' · '+at(i.sent))).join('');
   const reports=data.reports.map(i=>row('r'+i.id,i.nick+' · '+(i.message?'메시지':'프로필'),i.reason+' · '+at(i.created))).join('');
-  paint('사진·신고 검토','book',`<section class="paper"><h2>승인 대기 사진</h2><div class="rows">${photoItems||'대기 중인 사진이 없어요.'}</div></section><section class="paper"><h2>접수된 신고</h2><div class="rows">${reports||'접수된 신고가 없어요.'}</div></section>${actions(act('reloadQueue','새로고침'))}`,{back:monitor});
+  paint('신고 검토','book',`<section class="letter"><p>사진은 전송 즉시 표시돼요. 신고된 콘텐츠만 검토하며, 신고 인정 3회마다 24시간 이용을 제한해요.</p></section><section class="paper"><h2>접수된 신고</h2><div class="rows">${reports||'접수된 신고가 없어요.'}</div></section>${actions(act('reloadQueue','새로고침'))}`,{back:monitor});
   for(const el of document.querySelectorAll('.row'))el.onclick=()=>{
     const key=el.dataset.id,photo=key.startsWith('p'),id=Number(key.slice(1));
     reviewItem((photo?data.photos:data.reports).find(item=>item.id===id),photo);
@@ -402,7 +445,7 @@ async function reviewList(){
 function reviewItem(item,isPhoto){
   const picture=isPhoto?item.id:item.photo;
   const outcome=async action=>{await api('admin/review',{kind:isPhoto?'photo':'report',id:item.id,action});await reviewList();note('검토 결과를 반영했어요.');};
-  paint(isPhoto?'사진 검토':'신고 검토','mail',`<section class="paper"><h2>${esc(item.nick)}</h2><p>${isPhoto||item.message?'보낸 회원':'프로필 작성자'} · ${esc(item.area)}</p>${actions(act('sender','가입자 정보 보기','secondary'),isPhoto?'':act('reporter','신고자 정보 보기'))}<div class="rule"></div><p>${esc(isPhoto?'사진 만료 · '+at(item.expires):item.reason)}</p>${item.excerpt?`<p class="memo">${esc(item.excerpt)}</p>`:''}${picture?act('showPhoto','검토용 사진 열기'):''}<div id="preview"></div>${isPhoto?actions('<button disabled type="button" id="approve" class="primary">사진 승인</button>',act('deny','사진 거절','danger')):actions(act('dismissReport','위반 없음'),act('remove','콘텐츠 삭제','danger'),act('suspend','삭제 및 30일 이용 제한','danger'))}</section>`,{back:reviewList});
+  paint(isPhoto?'사진 검토':'신고 검토','mail',`<section class="paper"><h2>${esc(item.nick)}</h2><p>${isPhoto||item.message?'보낸 회원':'프로필 작성자'} · ${esc(item.area)}</p>${actions(act('sender','가입자 정보 보기','secondary'),isPhoto?'':act('reporter','신고자 정보 보기'))}<div class="rule"></div><p>${esc(isPhoto?'사진 만료 · '+at(item.expires):item.reason)}</p>${item.excerpt?`<p class="memo">${esc(item.excerpt)}</p>`:''}${picture?act('showPhoto','검토용 사진 열기'):''}<div id="preview"></div>${isPhoto?actions('<button disabled type="button" id="approve" class="primary">사진 승인</button>',act('deny','사진 거절','danger')):actions(act('dismissReport','신고 거부 · 복원'),act('acceptReport','신고 인정 · 벌점 1점','danger'))}<p class="note">신고를 인정하면 위반 콘텐츠를 삭제하고 작성자에게 벌점 1점을 부여해요. 3점마다 24시간 이용을 제한해요. 같은 콘텐츠에 대한 벌점은 중복 부과하지 않아요.</p></section>`,{back:reviewList});
   const reopen=()=>reviewItem(item,isPhoto);
   on('#sender','click',()=>memberDetail(item.sender,reopen));on('#reporter','click',()=>memberDetail(item.reporter,reopen));
   on('#showPhoto','click',()=>{
@@ -413,8 +456,7 @@ function reviewItem(item,isPhoto){
   });
   on('#approve','click',()=>outcome('approve'));on('#deny','click',()=>modal('사진 거절','사진을 삭제하고 상대에게 공개하지 않아요.','거절하기',()=>outcome('reject')));
   on('#dismissReport','click',()=>outcome('dismiss'));
-  on('#remove','click',()=>modal('위반 콘텐츠 삭제','신고된 내용을 삭제할까요?','삭제',()=>outcome('remove')));
-  on('#suspend','click',()=>modal('30일 이용 제한','신고된 내용을 삭제하고 해당 회원의 활동과 재가입을 30일간 제한할까요?','제한 적용',()=>outcome('suspend')));
+  on('#acceptReport','click',()=>modal('신고 인정','위반 콘텐츠를 삭제하고 작성자에게 벌점 1점을 부여할까요? 3점이 되면 24시간 이용을 제한해요.','신고 인정',()=>outcome('accept')));
 }
 async function adminHome(){
   try{await api('admin/settings');}catch(e){if(e.status===401){adminLogin();return;}throw e;}
@@ -446,9 +488,10 @@ function reset(){
   form(async f=>{await api('admin/reset',{key:f.get('key'),confirm:f.get('confirm')});note('가입 중 0명 · 탈퇴 현황 0명으로 초기화했어요.');adminLogin();});
 }
 async function boot(){
-  const s=await api('state');stage=s.stage;me=s.profile;
+  const s=await api('state');stage=s.stage;me=s.profile;accountState=s;
   if(['policy','restricted'].includes(stage)){limitedPage(stage);return;}
   if(stage==='member'){
+    await syncUnread();
     if(s.needsRecoveryCopy){await recoveryPage();return;}
     void syncPush(true);
     if(new URLSearchParams(location.search).get('inbox')==='1'){
@@ -479,12 +522,13 @@ function pulse(protect=false){
     try{
       const status=await api('status');
       if(leaving)return;
+      if(!admin && stage==='restricted' && status.stage==='restricted' && status.restrictedUntil!==accountState.restrictedUntil){accountState=status;limitedPage(stage);}
       if(admin && adminPrivate && !status.adminSignedIn){adminLogin();note('관리자 로그인이 종료됐어요.');}
       if(!admin && ['member','restricted','policy'].includes(stage) && status.stage!==stage){
         if(status.stage==='gate'){me=null;resetScopes();await boot();err(new Error('사용자 정보가 없거나 로그인이 종료되었어요. 다시 인증해 주세요.'));}
         else await boot();
       }
-      if(status.stage==='member')void syncPush(protect);
+      if(status.stage==='member'){void syncPush(protect);void syncUnread();}
       veil(false);
     }catch{if(!leaving)veil(true,'서버에 연결하면 계정 상태를 다시 확인해요.');}
     finally{pulseTask=null;}

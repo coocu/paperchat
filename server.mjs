@@ -21,7 +21,7 @@ function directoryArea(url) {
   return area;
 }
 const profileCols='id,nick,year,gender,area,memo';
-const assets=new Map(Object.entries({'/app':'index.html','/admin':'index.html','/app.js':'app.js','/theme.css':'theme.css','/icon.svg':'icon.svg','/headings.woff':'headings.woff','/rules.js':'rules.js'}));
+const assets=new Map(Object.entries({'/app':'index.html','/admin':'index.html','/privacy':'privacy.html','/support':'support.html','/app.js':'app.js','/theme.css':'theme.css','/icon.svg':'icon.svg','/headings.woff':'headings.woff','/rules.js':'rules.js'}));
 const type={html:'text/html',js:'text/javascript',css:'text/css',svg:'image/svg+xml',woff:'font/woff'};
 const token=()=>randomBytes(32).toString('hex');
 const digest=s=>createHash('sha256').update(s).digest();
@@ -167,6 +167,21 @@ export function makeServer(config, upstream=providers) {
     if(!admin)safety.pairAllowed(member,room.a===member?room.b:room.a);
     return room;
   }
+  const visibleMessage=`(v.state IS NULL OR v.state='approved')
+    AND ((m.expires IS NULL AND m.body IS NOT NULL) OR (m.photo IS NOT NULL AND m.expires>?))
+    AND NOT EXISTS(SELECT 1 FROM reports f WHERE f.message=m.id AND f.status='open')`;
+  function unread(member,room) {
+    return get(`SELECT COUNT(*) AS n FROM messages m LEFT JOIN reviews v ON v.message=m.id
+      WHERE m.room=? AND m.author<>? AND m.id>COALESCE((SELECT through FROM room_reads WHERE room=? AND member=?),0)
+      AND ${visibleMessage}`,room,member,room,member,Date.now()).n;
+  }
+  function roomList(member,area=null) {
+    return all(`SELECT r.id,p.id AS peer,p.nick,p.area,MAX(m.sent) AS recent FROM rooms r
+      JOIN members p ON p.id=CASE WHEN r.a=? THEN r.b ELSE r.a END
+      LEFT JOIN messages m ON m.room=r.id WHERE (r.a=? OR r.b=?) AND (? IS NULL OR p.area=?) AND ${visiblePeer}
+      GROUP BY r.id ORDER BY recent DESC,r.id`,member,member,member,area,area,Date.now(),member,member)
+      .map(room=>({...room,unread:unread(member,room.id)}));
+  }
   function processMessages(room,u,admin) {
     const before=u.searchParams.get('before');
     if(before && !/^\d+$/.test(before)) reject(400,'조회 범위를 확인해 주세요.');
@@ -209,6 +224,13 @@ export function makeServer(config, upstream=providers) {
       return ok({android:Boolean(delivery.androidClient) && available('android'),
         'ios-dev':available('ios-dev'),'ios-prod':available('ios-prod')});
     }
+    if(!post && p==='/api/public-info') {
+      const email=String(process.env.SUPPORT_EMAIL || 'code_note95@naver.com').trim();
+      let supportUrl='';
+      try {const url=new URL(process.env.SUPPORT_URL || '');if(url.protocol==='https:' && !url.username && !url.password)supportUrl=url.href;}catch{}
+      return ok({supportEmail:/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)?email:'',supportUrl,
+        operator:String(process.env.OPERATOR_NAME || '').trim(),appName:'종이편지'});
+    }
     if(!post && assets.has(p)) {
       const file=assets.get(p);
       return finish(res,200,readFileSync(new URL('./public/'+file,import.meta.url)),type[file.split('.').at(-1)]+'; charset=utf-8');
@@ -232,7 +254,9 @@ export function makeServer(config, upstream=providers) {
       const adminSignedIn=u.searchParams.has('member') ? false : await stillApproved(sessions(req,true));
       if(revision!==resetVersion())reject(409,'서버가 초기화됐어요.');
       if(!s && /(?:^|;\s*)pc_user=/.test(req.headers.cookie||''))cookie(res,'pc_user','',0);
-      return ok({version:revision,adminSignedIn,stage:s?.kind==='member'?safety.memberStage(s.member):(s?.kind||'gate')});
+      const identity=s?.kind==='member'?get('SELECT identity FROM members WHERE id=?',s.member)?.identity:null;
+      return ok({version:revision,adminSignedIn,stage:s?.kind==='member'?safety.memberStage(s.member):(s?.kind||'gate'),
+        ...(identity?safety.penalty(identity):{})});
     }
     let b={};
     if(post) {
@@ -272,6 +296,7 @@ export function makeServer(config, upstream=providers) {
         needsRecoveryCopy=!get('SELECT saved FROM account_keys WHERE member=?',s.member)?.saved;
       }
       return ok({stage,nick:s?.nick||'',year:s?.year,gender:s?.gender,needsRecoveryCopy,
+        ...(s?.kind==='member'?safety.penalty(get('SELECT identity FROM members WHERE id=?',s.member).identity):{}),
         profile:stage==='member'?get('SELECT '+profileCols+' FROM members WHERE id=?',s.member):null});
     }
     if(!post && p==='/api/regions') return ok(regions);
@@ -280,23 +305,24 @@ export function makeServer(config, upstream=providers) {
       const code=string(b.code,1,256,'인증키');
       const invitation=h('invite',code.normalize('NFKC').toLowerCase());
       const install=device(req,res);
-      const unused=()=>{
-        if(get('SELECT 1 FROM used_invites WHERE proof=?',invitation))reject(409,'이미 사용한 가입 인증키예요.');
-        if(get('SELECT 1 FROM used_invites WHERE pending_device=? AND pending_until>?',install,Date.now()))
+      const available=()=>{
+        if(get('SELECT 1 FROM used_invites WHERE proof=? AND pending_device IS NOT NULL AND pending_device<>? AND pending_until>?',invitation,install,Date.now()))
+          reject(409,'이 인증키로 진행 중인 가입이 있어요.');
+        if(get('SELECT 1 FROM used_invites WHERE proof<>? AND pending_device=? AND pending_until>?',invitation,install,Date.now()))
           reject(409,'이 기기에서 진행 중인 가입을 먼저 완료해 주세요.');
       };
-      checkSignup(install);unused();
+      checkSignup(install);
       const v=await upstream.check(code);
       if(v?.status==='pending') reject(403,'승인 대기 중이에요.');
       if(!registryApproved(v)) reject(403,'승인된 인증키를 확인해 주세요.');
       if(revision!==resetVersion()) reject(409,'서버가 초기화됐어요.');
       transaction(db,()=>{
-        checkSignup(install);unused();
+        checkSignup(install);available();
         const prev=sessions(req);
         if(prev?.kind==='member')reject(409,'이미 로그인한 계정이에요.');
         if(prev)run('DELETE FROM sessions WHERE id=?',prev.id);
         run('UPDATE used_invites SET pending_device=NULL,pending_until=NULL WHERE pending_device=?',install);
-        run('INSERT INTO used_invites VALUES(?,?,?)',invitation,install,Date.now()+24*hour);
+        run('INSERT INTO used_invites VALUES(?,?,?) ON CONFLICT(proof) DO UPDATE SET pending_device=excluded.pending_device,pending_until=excluded.pending_until',invitation,install,Date.now()+24*hour);
         const sid=issue(res,'gate_ok',24*hour);
         run('UPDATE sessions SET identity=? WHERE id=?',invitation,sid);
       });
@@ -401,9 +427,22 @@ export function makeServer(config, upstream=providers) {
     }
     if(!post && p==='/api/rooms') {
       const s=need(req,'member'),area=directoryArea(u);
-      return ok(all(`SELECT r.id,p.id AS peer,p.nick,p.area,MAX(m.sent) AS recent FROM rooms r
-        JOIN members p ON p.id=CASE WHEN r.a=? THEN r.b ELSE r.a END
-        LEFT JOIN messages m ON m.room=r.id WHERE (r.a=? OR r.b=?) AND (? IS NULL OR p.area=?) AND ${visiblePeer} GROUP BY r.id ORDER BY recent DESC,r.id`,s.member,s.member,s.member,area,area,Date.now(),s.member,s.member));
+      return ok(roomList(s.member,area));
+    }
+    if(!post && p==='/api/unread') {
+      const s=need(req,'member');
+      const rooms=roomList(s.member).map(({id,unread})=>({id,unread}));
+      return ok({total:rooms.reduce((sum,r)=>sum+r.unread,0),rooms});
+    }
+    const reading=p.match(/^\/api\/rooms\/([a-f0-9-]+)\/read$/);
+    if(post && reading) {
+      const room=roomFor(req,reading[1]),s=need(req,'member');
+      if(!Number.isSafeInteger(b.through) || b.through<0)reject(400,'읽은 메시지를 확인해 주세요.');
+      if(b.through && !get(`SELECT 1 FROM messages m LEFT JOIN reviews v ON v.message=m.id
+        WHERE m.id=? AND m.room=? AND ${visibleMessage}`,b.through,room.id,Date.now()))
+        reject(400,'이 대화에서 표시 중인 메시지만 읽음 처리할 수 있어요.');
+      run('INSERT INTO room_reads VALUES(?,?,?) ON CONFLICT(room,member) DO UPDATE SET through=MAX(through,excluded.through)',room.id,s.member,b.through);
+      return ok({unread:unread(s.member,room.id)});
     }
     if(post && p==='/api/room') {
       const s=need(req,'member');
@@ -432,8 +471,8 @@ export function makeServer(config, upstream=providers) {
       } else {body=string(b.body,1,2000,'메시지');checkText(body);}
       transaction(db,()=>{
         const entry=run('INSERT INTO messages(room,author,sent,body,photo,expires) VALUES(?,?,?,?,?,?)',room.id,s.member,now,body,photo,photo?now+12*hour:null);
-        if(photo)run("INSERT INTO reviews VALUES(?,'pending')",entry.lastInsertRowid);
-        else pushes.enqueue(entry.lastInsertRowid);
+        if(photo)run("INSERT INTO reviews VALUES(?,'approved')",entry.lastInsertRowid);
+        pushes.enqueue(entry.lastInsertRowid);
       });
       return ok();
     }
@@ -485,7 +524,7 @@ export function makeServer(config, upstream=providers) {
           reject(404,'가입자 정보가 없어요.');
         }
         const {identity,encrypted,...profile}=m;
-        return ok({...profile,contact:vault.read(encrypted,identity),restrictedUntil:safety.restricted(identity)});
+        return ok({...profile,contact:vault.read(encrypted,identity),...safety.penalty(identity)});
       }
       if(p==='/api/admin/review' && !post)return ok(safety.queue());
       if(p==='/api/admin/review' && post) {

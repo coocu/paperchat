@@ -101,7 +101,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
       } finally {registry.delete(key);}
     }
   });
-  await t.test('일회용 키 동시 사용을 차단하고, 가입 응답을 놓친 기기에서만 중단한 가입을 이어간다',async()=>{
+  await t.test('진행 중 가입은 한 기기에서 이어가고 사용 이력과 무관하게 발급 서버 승인에 따라 키를 재사용한다',async()=>{
     const code='invite-race', first=client(),second=client();
     await first('/api/state');await second('/api/state');
     let pending=[];
@@ -116,7 +116,21 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     await winner('/api/logout',{});
     assert.equal((await winner('/api/state')).body.stage,'gate_ok');
     assert.equal((await loser('/api/state')).body.stage,'gate');
+    registry.set(code,{status:'approved',token:'once'});
     assert.equal((await loser('/api/key',{code})).status,409);
+    assert.equal((await winner('/api/profile-details',{nick:'키 재사용 검증',birthDate:'1995-01-01',gender:'여성'})).status,200);
+    assert.equal((await winner('/api/register',{area:'경기도 이천시',memo:'검증',policy:policyVersion})).status,200);
+    const member=(await winner('/api/state')).body.profile.id;
+    registry.set(code,{status:'expired',token:'old'});
+    const checked=registryLookups.length;
+    assert.equal((await loser('/api/key',{code})).status,403);
+    assert.equal(registryLookups.length,checked+1);
+    registry.set(code,{status:'approved',token:'reopened'});
+    assert.equal((await loser('/api/key',{code})).status,200);
+    assert.equal((await loser('/api/state')).body.stage,'gate_ok');
+    assert.equal((await loser('/api/key',{code})).status,200);
+    assert.equal((await loser('/api/register',{area:'경기도 이천시',memo:'검증',policy:policyVersion})).status,401);
+    db.prepare('DELETE FROM members WHERE id=?').run(member);
     registry.delete(code);
   });
   await t.test('서버 첫 화면과 모바일 진입점, 승인 전 운영자 자료 접근을 구분한다',async()=>{
@@ -133,6 +147,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     for(const path of ['/api/admin/members','/api/admin/review','/api/admin/rooms?area=x','/api/admin/photos/1'])
       assert.equal((await nobody(path,undefined,{userAgent:'WebView PaperChatAndroid/2'})).status,401);
     assert.equal((await nobody('/health')).body.ok,true);
+    assert.equal((await nobody('/api/public-info')).body.appName,'종이편지');
   });
   await t.test('미승인, 대기, 토큰 누락과 미성년을 거부한다',async()=>{
     assert.equal((await a('/api/register',{area:'경기도 이천시',memo:'x'})).status,401);
@@ -270,14 +285,12 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.equal((await a(path,{body:'반가워요'})).status,200);
     const jpeg=Buffer.from([255,216,255,224,0,0,255,217]).toString('base64');
     assert.equal((await b(path,{photo:jpeg})).status,200);
-    await deliveryQueue.flush();assert.deepEqual(delivered.map(d=>d.token),[iphone.token]);
-    const messages=(await a(path)).body;assert.equal(messages.length,2);photo=messages[1].id;
-    assert.equal((await a('/api/photos/'+photo)).status,403);
-    assert.equal((await a(path)).body[1].visibility,'pending');
-    const queue=(await admin('/api/admin/review')).body;
-    assert.equal(queue.photos[0].sender,profile.id);
-    assert.equal((await admin('/api/admin/review',{kind:'photo',id:photo,action:'approve'})).status,200);
     await deliveryQueue.flush();assert.deepEqual(delivered.map(d=>d.token),[iphone.token,android.token]);
+    const messages=(await a(path)).body;assert.equal(messages.length,2);photo=messages[1].id;
+    assert.equal((await a('/api/photos/'+photo)).status,200);
+    assert.equal((await a(path)).body[1].visibility,'visible');
+    assert.equal((await admin('/api/admin/review')).body.photos.length,0);
+    assert.equal((await admin('/api/admin/review',{kind:'photo',id:photo,action:'approve'})).status,409);
     assert.notEqual(delivered[0].event,delivered[1].event);
     assert.equal((await a('/api/photos/'+photo)).headers['content-type'],'image/jpeg');
     assert.equal((await c(path)).status,404);
@@ -304,6 +317,22 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.equal((await admin('/api/admin/rooms/'+room+'/messages')).body.length,2);
     assert.equal((await admin('/api/admin/photos/'+photo)).status,200);
   });
+  await t.test('안 읽은 개수는 수신 메시지만 세고 검증된 방별 읽음 위치를 기기 간에 유지한다',async()=>{
+    const path='/api/rooms/'+room+'/messages';
+    const first=(await b(path)).body[0].id;
+    assert.equal((await nobody('/api/unread')).status,401);
+    assert.deepEqual((await a('/api/unread')).body,{total:1,rooms:[{id:room,unread:1}]});
+    assert.equal((await b('/api/rooms')).body[0].unread,1);
+    assert.equal((await c('/api/rooms/'+room+'/read',{through:first})).status,404);
+    for(const through of [-1,1.5,'1',Number.MAX_SAFE_INTEGER])
+      assert.equal((await b('/api/rooms/'+room+'/read',{through})).status,400);
+    assert.deepEqual((await b('/api/rooms/'+room+'/read',{through:first})).body,{unread:0});
+    assert.equal((await b('/api/unread')).body.total,0);
+    assert.deepEqual((await b('/api/rooms/'+room+'/read',{through:0})).body,{unread:0});
+    const otherDevice=client();await pass(otherDevice,'','DI-B');
+    assert.equal((await otherDevice('/api/unread')).body.total,0);
+    assert.equal((await a('/api/unread')).body.total,1);
+  });
   await t.test('관리자는 직접 입력한 회원 정보를 보고 신규 회원의 연락처는 수집하지 않는다',async()=>{
     const id=(await b('/api/state')).body.profile.id;
     const listing=await admin('/api/admin/members');assert.equal(listing.body.items.length,3);
@@ -327,19 +356,32 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.equal((await a('/api/report',report)).status,200);
     assert.equal((await b('/api/photos/'+photo)).status,403);
     const hidden=(await a(path)).body.at(-1);assert.equal(hidden.visibility,'reported');assert.equal(hidden.viewable,0);
+    assert.equal((await a('/api/unread')).body.total,0);
+    assert.equal((await a('/api/rooms/'+room+'/read',{through:photo})).status,400);
     const list=(await admin('/api/admin/review')).body.reports;assert.equal(list.length,1);
     assert.equal(list[0].sender,idB);assert.equal(list[0].reporter,idA);
     assert.equal((await a('/api/admin/review',{kind:'report',id:list[0].id,action:'dismiss'})).status,401);
     assert.equal((await admin('/api/admin/review',{kind:'report',id:list[0].id,action:'dismiss'})).status,200);
     assert.equal((await a('/api/photos/'+photo)).status,200);
+    assert.equal((await admin('/api/admin/review',{kind:'report',id:list[0].id,action:'dismiss'})).status,200);
+    assert.equal((await a('/api/unread')).body.total,1);
+    assert.equal((await a('/api/rooms/'+room+'/read',{through:photo})).body.unread,0);
     assert.equal((await a(path,{body:'누드 사 진 보 내'})).status,422);
     assert.equal((await a(path,{body:'성향과 취미를 존중해요'})).status,200);
     const jpeg=Buffer.from([255,216,1,2,255,217]).toString('base64');
     assert.equal((await a(path,{photo:jpeg})).status,200);
-    const incoming=(await admin('/api/admin/review')).body.photos[0];
-    assert.equal((await admin('/api/admin/review',{kind:'photo',id:incoming.id,action:'reject'})).status,200);
+    const incoming=(await b(path)).body.at(-1);
+    assert.equal((await b('/api/photos/'+incoming.id)).status,200);
+    await b('/api/report',{kind:'message',reason:'원치 않는 성적 대화·사진',message:incoming.id});
+    const accepted=(await admin('/api/admin/review')).body.reports[0];
+    assert.equal((await admin('/api/admin/review',{kind:'report',id:accepted.id,action:'accept'})).status,200);
+    assert.equal((await admin('/api/admin/review',{kind:'report',id:accepted.id,action:'accept'})).status,200);
+    assert.equal((await admin('/api/admin/review',{kind:'report',id:accepted.id,action:'dismiss'})).status,409);
     assert.equal((await b('/api/photos/'+incoming.id)).status,403);
     assert.equal(db.prepare('SELECT photo FROM messages WHERE id=?').get(incoming.id).photo,null);
+    const detail=(await admin('/api/admin/members/'+idA)).body;
+    assert.equal(detail.strikes,1);assert.equal(detail.totalStrikes,1);assert.equal(detail.restrictedUntil,0);
+    assert.equal((await a('/api/state')).body.stage,'member');
   });
   await t.test('차단한 두 회원은 기존 방 조회·생성·사진 접근·전송이 양방향 차단된다',async()=>{
     const A=(await a('/api/state')).body.profile,B=(await b('/api/state')).body.profile;
@@ -350,6 +392,8 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
       assert.equal((await user('/api/rooms/'+room+'/messages',{body:'hi'})).status,404);
       assert.equal((await user('/api/photos/'+photo)).status,404);
       assert.equal((await user('/api/rooms')).body.length,0);
+      assert.deepEqual((await user('/api/unread')).body,{total:0,rooms:[]});
+      assert.equal((await user('/api/rooms/'+room+'/read',{through:photo})).status,404);
       assert.equal((await user('/api/people?area='+encodeURIComponent(peer.area))).body.length,0);
       assert.ok(!(await user('/api/people')).body.some(p=>p.id===peer.id));
     }
@@ -393,6 +437,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.equal((await admin('/api/admin/settings')).status,200);
     assert.equal((await a('/api/status')).body.version,version);
     assert.equal((await a('/api/state')).body.stage,'member');
+    assert.equal((await a('/api/unread')).body.total,0);
     assert.equal((await nobody('/apply')).headers.location,'https://two.example/apply');
     const stamp=db.prepare('SELECT expires FROM messages WHERE id=?').get(photo).expires;
     now=stamp-1;assert.equal((await b('/api/photos/'+photo)).status,200);
@@ -400,7 +445,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     clean(db,now);assert.equal(db.prepare('SELECT photo FROM messages WHERE id=?').get(photo).photo,null);
     assert.equal((await a('/api/rooms/'+room+'/messages')).body[0].body,'반가워요');
   });
-  await t.test('이전 버전 회원 세션은 복구코드를 받을 수 있고 대화와 사진 검토는 유지된다',async()=>{
+  await t.test('이전 버전 회원 세션과 대화는 유지되고 검토 이력이 없는 사진은 즉시 표시한다',async()=>{
     const C=(await c('/api/state')).body.profile, A=(await a('/api/state')).body.profile;
     db.prepare('DELETE FROM account_keys WHERE member=?').run(C.id);
     db.prepare('DELETE FROM acceptances WHERE member=?').run(C.id);
@@ -413,8 +458,8 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.deepEqual((await c('/api/state')).body.profile,C);
     const old=db.prepare('INSERT INTO messages(room,author,sent,photo,expires) VALUES(?,?,?,?,?)').run(room,A.id,now,Buffer.from([255,216,255,217]),now+12*hour);
     server.emit('close');server=makeServer(cfg,providers);
-    assert.equal((await b('/api/photos/'+old.lastInsertRowid)).status,403);
-    assert.equal(db.prepare('SELECT state FROM reviews WHERE message=?').get(old.lastInsertRowid).state,'pending');
+    assert.equal((await b('/api/photos/'+old.lastInsertRowid)).status,200);
+    assert.equal(db.prepare('SELECT state FROM reviews WHERE message=?').get(old.lastInsertRowid).state,'approved');
   });
   await t.test('탈퇴하면 전 기기 세션이 종료되고 24시간 뒤 새 계정으로 가입한다',async()=>{
     const other=client();assert.equal((await pass(other,'','DI-A')).body.stage,'member');
@@ -443,18 +488,36 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.notEqual((await a('/api/state')).body.profile.id,old);
     clean(db,now);assert.equal(db.prepare('SELECT COUNT(*) AS n FROM cooldowns').get().n,0);
   });
-  await t.test('제재된 기존 세션은 즉시 제한되며 재인증·탈퇴 후에도 30일 제한이 유지된다',async()=>{
+  await t.test('신고 승인 3회마다 24시간 제한하며 중복 결정은 가산하지 않고 만료·재제재·탈퇴를 처리한다',async()=>{
     const C=(await c('/api/state')).body.profile;
+    const B=(await b('/api/state')).body.profile;
     await admin('/api/admin/login',{key:adminKey});
-    await b('/api/report',{kind:'profile',peer:C.id,reason:'괴롭힘·기타 위반'});
-    const r=(await admin('/api/admin/review')).body.reports[0];
-    assert.equal((await admin('/api/admin/review',{kind:'report',id:r.id,action:'suspend'})).status,200);
-    assert.equal((await c('/api/status')).body.stage,'restricted');
-    assert.equal((await c('/api/people?area='+encodeURIComponent(C.area))).status,403);
-    await pass(c,'','DI-C');assert.equal((await c('/api/state')).body.stage,'restricted');
+    const dialog=(await c('/api/room',{peer:B.id})).body.id;
+    const path='/api/rooms/'+dialog+'/messages';
+    for(let cycle=0;cycle<2;cycle++){
+      for(let strike=1;strike<=3;strike++){
+        assert.equal((await c(path,{body:'신고 대상 '+cycle+' '+strike})).status,200);
+        const message=(await b(path)).body.at(-1).id;
+        await b('/api/report',{kind:'message',message,reason:'괴롭힘·기타 위반'});
+        const r=(await admin('/api/admin/review')).body.reports[0];
+        assert.equal((await admin('/api/admin/review',{kind:'report',id:r.id,action:'accept'})).status,200);
+        assert.equal((await admin('/api/admin/review',{kind:'report',id:r.id,action:'accept'})).status,200);
+        const detail=(await admin('/api/admin/members/'+C.id)).body;
+        assert.equal(detail.totalStrikes,cycle*3+strike);assert.equal(detail.strikes,strike%3);
+        assert.equal((await c('/api/status')).body.stage,strike===3?'restricted':'member');
+        if(strike===3)assert.equal(detail.restrictedUntil,now+24*hour);
+      }
+      assert.equal((await c('/api/people')).status,403);
+      await pass(c,'','DI-C');assert.equal((await c('/api/state')).body.stage,'restricted');
+      if(cycle===0){
+        now+=24*hour-1;assert.equal((await c('/api/status')).body.stage,'restricted');
+        now+=1;assert.equal((await c('/api/status')).body.stage,'member');
+        await admin('/api/admin/login',{key:adminKey});
+      }
+    }
     assert.equal((await c('/api/withdraw',{confirm:true})).status,200);
-    now+=25*hour;assert.equal((await pass(c,'다시','DI-C')).status,403);
-    now+=30*24*hour;assert.equal((await pass(c,'다시','DI-C')).body.stage,'details');
+    now+=23*hour;assert.equal((await pass(c,'다시','DI-C')).status,403);
+    now+=hour;assert.equal((await pass(c,'다시','DI-C')).body.stage,'details');
     await c('/api/register',{area:C.area,memo:'취미',policy:policyVersion});
   });
   await t.test('초기화 시 진행 중 인증·세션·설정·서비스 데이터까지 제거한다',async()=>{
@@ -497,4 +560,42 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.match(String((await nobody('/apply')).body),/발급 주소/);
     assert.match((await nobody('/apply',undefined,{userAgent:'WebView PaperChatAndroid/2'})).headers.location,/unavailable/);
   });
+});
+
+test('기존 pending 사진 이관은 신고·삭제·만료를 보존하고 동일 콘텐츠 신고 벌점은 한 번만 부여한다',t=>{
+  const dir=mkdtempSync(join(tmpdir(),'paperchat-migrate-'));let db=openStore(dir);
+  t.after(()=>{db.close();rmSync(dir,{recursive:true,force:true});});
+  const now=Date.now();
+  for(const id of ['author','receiver','other'])
+    db.prepare('INSERT INTO members VALUES(?,?,?,?,?,?,?)').run(id,id+'-identity',id,1995,'여성','경기도 이천시','소개');
+  db.prepare('INSERT INTO rooms VALUES(?,?,?)').run('room','author','receiver');
+  const ids=[];
+  for(const [state,expires] of [['pending',now+hour],['pending',now+hour],['removed',now+hour],['pending',now-1]]){
+    const id=Number(db.prepare('INSERT INTO messages(room,author,sent,photo,expires) VALUES(?,?,?,?,?)').run('room','author',now,Buffer.from([255,216,255,217]),expires).lastInsertRowid);
+    db.prepare('INSERT INTO reviews VALUES(?,?)').run(id,state);ids.push(id);
+  }
+  const reason='괴롭힘·기타 위반';
+  db.prepare('INSERT INTO reports(reporter,target,message,reason,created) VALUES(?,?,?,?,?)').run('receiver','author',ids[1],reason,now);
+  db.close();db=openStore(dir);
+  assert.deepEqual(ids.map(id=>db.prepare('SELECT state FROM reviews WHERE message=?').get(id).state),['approved','pending','removed','pending']);
+  const safety=moderation(db),legacy=db.prepare('SELECT id,content FROM reports').get();
+  assert.equal(legacy.content,'message:'+ids[1]);
+  safety.reportDecision(legacy.id,'dismiss');
+  assert.equal(db.prepare('SELECT state FROM reviews WHERE message=?').get(ids[1]).state,'approved');
+  safety.report('receiver',{kind:'profile',peer:'author',reason});
+  safety.report('other',{kind:'profile',peer:'author',reason});
+  const reports=safety.queue().reports;assert.equal(reports.length,2);
+  safety.reportDecision(reports[0].id,'accept');
+  safety.reportDecision(reports[1].id,'accept');
+  assert.equal(safety.penalty('author-identity').totalStrikes,1);
+  assert.equal(safety.penalty('author-identity').restrictedUntil,0);
+  assert.equal(safety.queue().reports.length,0);
+  db.prepare("UPDATE members SET memo='새 소개' WHERE id='author'").run();
+  safety.report('receiver',{kind:'profile',peer:'author',reason});
+  const next=safety.queue().reports;assert.equal(next.length,1);
+  safety.reportDecision(next[0].id,'accept');
+  assert.equal(safety.penalty('author-identity').totalStrikes,2);
+  db.prepare('INSERT INTO room_reads VALUES(?,?,?)').run('room','receiver',ids[0]);
+  db.prepare("DELETE FROM members WHERE id='receiver'").run();
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM room_reads').get().n,0);
 });

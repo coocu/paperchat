@@ -1,9 +1,10 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 
 export const hour = 3600_000;
-export const tables = ['used_invites','account_devices','account_keys','push_jobs','push_devices','admin_session_proofs','departures','pending_contacts','contacts','reports','reviews','room_changes','blocks','acceptances','restrictions','messages','rooms','sessions','members','cooldowns','settings','attempts'];
+export const tables = ['used_invites','account_devices','account_keys','push_jobs','push_devices','admin_session_proofs','departures','pending_contacts','contacts','reports','penalty_events','reviews','room_reads','room_changes','blocks','acceptances','restrictions','messages','rooms','sessions','members','cooldowns','settings','attempts'];
 export function openStore(dir) {
   mkdirSync(dir, {recursive:true, mode:0o700});
   const db = new DatabaseSync(join(dir,'chat.sqlite'));
@@ -53,11 +54,29 @@ export function openStore(dir) {
     CREATE INDEX IF NOT EXISTS blocked_peer ON blocks(peer,owner);
     CREATE TABLE IF NOT EXISTS reviews(message INTEGER PRIMARY KEY REFERENCES messages ON DELETE CASCADE,state TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS room_changes(room TEXT PRIMARY KEY REFERENCES rooms ON DELETE CASCADE,version INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS room_reads(room TEXT NOT NULL REFERENCES rooms ON DELETE CASCADE,member TEXT NOT NULL REFERENCES members ON DELETE CASCADE,through INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(room,member));
     CREATE TABLE IF NOT EXISTS restrictions(identity TEXT PRIMARY KEY,until INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS penalty_events(content TEXT PRIMARY KEY,identity TEXT NOT NULL,created INTEGER NOT NULL);
+    CREATE INDEX IF NOT EXISTS penalties_by_identity ON penalty_events(identity);
     CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY,reporter TEXT NOT NULL REFERENCES members ON DELETE CASCADE,target TEXT NOT NULL REFERENCES members ON DELETE CASCADE,message INTEGER REFERENCES messages ON DELETE CASCADE,reason TEXT NOT NULL,created INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'open');
     CREATE INDEX IF NOT EXISTS reports_by_message ON reports(message,status);
-    INSERT OR IGNORE INTO reviews SELECT id,'pending' FROM messages WHERE photo IS NOT NULL;
+    INSERT OR IGNORE INTO reviews SELECT id,'approved' FROM messages WHERE photo IS NOT NULL;
   `));
+  transaction(db,()=>{
+    if(!db.prepare('PRAGMA table_info(reports)').all().some(c=>c.name==='content'))
+      db.exec('ALTER TABLE reports ADD COLUMN content TEXT');
+    db.exec("UPDATE reports SET content='message:'||message WHERE content IS NULL AND message IS NOT NULL");
+    for(const row of db.prepare('SELECT DISTINCT target FROM reports WHERE content IS NULL').all()) {
+      const profile=db.prepare('SELECT nick,memo FROM members WHERE id=?').get(row.target);
+      const content='profile:'+row.target+':'+createHash('sha256').update(JSON.stringify(profile)).digest('hex');
+      db.prepare('UPDATE reports SET content=? WHERE content IS NULL AND target=?').run(content,row.target);
+    }
+    // Only legacy, unreported, unexpired pending photos become public. Decisions
+    // and open reports survive this migration unchanged.
+    db.prepare(`UPDATE reviews SET state='approved' WHERE state='pending'
+      AND message IN (SELECT id FROM messages WHERE photo IS NOT NULL AND expires>?)
+      AND NOT EXISTS(SELECT 1 FROM reports WHERE reports.message=reviews.message AND status='open')`).run(Date.now());
+  });
   return db;
 }
 export function transaction(db, fn) {
