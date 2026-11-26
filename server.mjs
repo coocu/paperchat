@@ -6,7 +6,10 @@ import { resolve } from 'node:path';
 import { openStore, hour, transaction, clean, tables } from './store.mjs';
 import { providers, reject, adultInfo, RequestError } from './providers.mjs';
 
+import { textVault } from './vault.mjs';
 import { contactVault } from './contacts.mjs';
+import { pushProvider } from './push-provider.mjs';
+import { pushQueue } from './push-queue.mjs';
 import { moderation, checkText } from './moderation.mjs';
 import { policyVersion } from './public/rules.js';
 
@@ -40,13 +43,15 @@ async function payload(req) {
   reject(400,'입력값을 확인해 주세요.');
 }
 export function makeServer(config, upstream=providers) {
-  const {adminKey,secret,origin}=config;
-  if(!adminKey?.includes('codenote') || !adminKey.includes('kyh') || !secret || secret.length<32)
-    throw Error('ADMIN_KEY에 codenote와 kyh를 모두 포함하고 SECRET은 32자 이상으로 설정하세요.');
+  const {secret,origin}=config;
+  if(typeof secret!=='string' || secret.length<32)
+    throw Error('SECRET을 32자 이상으로 설정하세요.');
   const base=new URL(origin).origin, secure=base.startsWith('https://');
   if(!secure && !['localhost','127.0.0.1','[::1]'].includes(new URL(base).hostname)) throw Error('HTTPS URL을 설정하세요.');
   const db=openStore(config.dir), h=(scope,v)=>createHmac('sha256',secret).update(scope+'|'+v).digest('hex');
   const safety=moderation(db);
+  const delivery=config.pushProvider || pushProvider();
+  const pushes=pushQueue(db,delivery,safety);
   // Both directory listings and room listings join the other member as p.
   const visiblePeer=`NOT EXISTS(SELECT 1 FROM restrictions x WHERE x.identity=p.identity AND x.until>?)
     AND NOT EXISTS(SELECT 1 FROM blocks x WHERE (x.owner=? AND x.peer=p.id) OR (x.owner=p.id AND x.peer=?))`;
@@ -56,6 +61,34 @@ export function makeServer(config, upstream=providers) {
   const run=(sql,...args)=>db.prepare(sql).run(...args);
   run("INSERT OR IGNORE INTO service_meta VALUES('reset',?)",token());
   const resetVersion=()=>get("SELECT value FROM service_meta WHERE key='reset'").value;
+  const adminVault=textVault(secret,'paperchat/admin-session/v1');
+  // Sessions issued by the former local-password login have no registry key.
+  run("DELETE FROM sessions WHERE kind='admin' AND NOT EXISTS(SELECT 1 FROM admin_session_proofs WHERE session=sessions.id)");
+  const checksInFlight=new Map();
+  function registryApproved(answer) {
+    return answer?.status==='approved' && typeof answer.token==='string' && Boolean(answer.token.trim());
+  }
+  function adminCode(value) {
+    const code=typeof value==='string' ? value.trim() : '';
+    if(code.length>256 || !code.includes('codenote') || !code.includes('kyh'))
+      reject(403,'승인된 관리자 보안키를 확인해 주세요.');
+    return code;
+  }
+  async function stillApproved(s) {
+    if(!s) return false;
+    // Overlapping UI requests share only the current lookup. No positive cache.
+    let pending=checksInFlight.get(s.id);
+    if(!pending) {
+      const code=adminVault.open(s.proof,s.id);
+      pending=upstream.check(code).then(registryApproved).finally(()=>checksInFlight.delete(s.id));
+      checksInFlight.set(s.id,pending);
+    }
+    if(!await pending){
+      run('DELETE FROM sessions WHERE id=?',s.id);
+      return false;
+    }
+    return Boolean(get("SELECT 1 FROM sessions WHERE id=? AND kind='admin' AND expires>?",s.id,Date.now()));
+  }
   function saveContact(id,claim,isNew) {
     run(`INSERT INTO contacts VALUES(?,?,?,?,?) ON CONFLICT(member) DO UPDATE SET
       encrypted=excluded.encrypted,consented=excluded.consented,verified=excluded.verified`,
@@ -69,17 +102,20 @@ export function makeServer(config, upstream=providers) {
   function cookie(res,name,value,ttl) {
     res.setHeader('Set-Cookie',name+'='+value+'; Path=/; HttpOnly; SameSite=Lax; Max-Age='+Math.floor(ttl/1000)+(secure?'; Secure':''));
   }
-  function issue(res,kind,ttl,member=null) {
+  function issue(res,kind,ttl,member=null,adminCredential=null) {
     const raw=token(),id=h('session',raw);
     run('INSERT INTO sessions(id,kind,expires,member) VALUES(?,?,?,?)',id,kind,Date.now()+ttl,member);
+    if(adminCredential)run('INSERT INTO admin_session_proofs(session,sealed) VALUES(?,?)',id,adminVault.seal(adminCredential,id));
     cookie(res,kind==='admin'?'pc_admin':'pc_user',raw,ttl);
   }
   function sessions(req,admin=false) {
     const name=admin?'pc_admin':'pc_user';
     const v=(req.headers.cookie||'').split(';').map(s=>s.trim()).find(s=>s.startsWith(name+'='))?.slice(name.length+1);
     if(!v || !/^[a-f0-9]{64}$/.test(v)) return;
-    const s=get('SELECT * FROM sessions WHERE id=? AND expires>?',h('session',v),Date.now());
-    if(s && (admin ? s.kind==='admin' : s.kind!=='admin')) return s;
+    const id=h('session',v), now=Date.now();
+    if(admin)return get(`SELECT s.*,p.sealed AS proof FROM sessions s JOIN admin_session_proofs p ON p.session=s.id
+      WHERE s.id=? AND s.kind='admin' AND s.expires>?`,id,now);
+    return get("SELECT * FROM sessions WHERE id=? AND kind!='admin' AND expires>?",id,now);
   }
   function need(req,kind,limited=false) {
     const s=sessions(req,kind==='admin');
@@ -131,6 +167,9 @@ export function makeServer(config, upstream=providers) {
       const file=assets.get(p);
       return finish(res,200,readFileSync(new URL('./public/'+file,import.meta.url)),type[file.split('.').at(-1)]+'; charset=utf-8');
     }
+    if(!post && p==='/api/push/android-config') {
+      return ok({config:delivery.androidClient || null});
+    }
     if(!post && p==='/health') return ok({ok:true});
     if(!post && p==='/apply') {
       const link=configURL();
@@ -141,14 +180,30 @@ export function makeServer(config, upstream=providers) {
     res.setHeader('X-Service-Version',revision);
     if(!post && p==='/api/status'){
       const s=sessions(req);
+      const adminSignedIn=u.searchParams.has('member') ? false : await stillApproved(sessions(req,true));
+      if(revision!==resetVersion())reject(409,'서버가 초기화됐어요.');
       if(!s && /(?:^|;\s*)pc_user=/.test(req.headers.cookie||''))cookie(res,'pc_user','',0);
-      return ok({version:revision,adminSignedIn:Boolean(sessions(req,true)),stage:s?.kind==='member'?safety.memberStage(s.member):(s?.kind||'gate')});
+      return ok({version:revision,adminSignedIn,stage:s?.kind==='member'?safety.memberStage(s.member):(s?.kind||'gate')});
     }
     let b={};
     if(post) {
       if(req.headers.origin!==base) reject(403,'요청 출처를 확인할 수 없어요.');
       b=await payload(req);
       if(revision!==resetVersion()) reject(409,'서버가 초기화됐어요.');
+    }
+    if(p.startsWith('/api/admin/') && p!=='/api/admin/login' && p!=='/api/admin/logout') {
+      const s=need(req,'admin');
+      if(post && p==='/api/admin/reset') {
+        throttle('admin-reset:'+ip,12,hour/4);
+        if(b.confirm!=='전체 삭제' || !same(adminCode(b.key),adminVault.open(s.proof,s.id)))
+          reject(403,'로그인한 관리자 보안키와 전체 삭제 문구를 확인해 주세요.');
+      }
+      if(!await stillApproved(s)) reject(401,'관리자 보안키의 승인을 다시 확인해 주세요.');
+      if(revision!==resetVersion())reject(409,'서버가 초기화됐어요.');
+    }
+    if(post && p==='/api/push/device') {
+      const s=need(req,'member');
+      return ok(pushes.bind(s.id,b.platform,b.token));
     }
     if(!post && p==='/api/state') {
       const s=sessions(req);
@@ -164,7 +219,7 @@ export function makeServer(config, upstream=providers) {
       if(config.keyMarker && !code.toLowerCase().includes(config.keyMarker.toLowerCase())) reject(403,'이 앱에 발급된 인증키를 입력해 주세요.');
       const v=await upstream.check(code);
       if(v?.status==='pending') reject(403,'승인 대기 중이에요.');
-      if(v?.status!=='approved' || typeof v.token!=='string' || !v.token.trim()) reject(403,'승인된 인증키를 확인해 주세요.');
+      if(!registryApproved(v)) reject(403,'승인된 인증키를 확인해 주세요.');
       if(revision!==resetVersion()) reject(409,'서버가 초기화됐어요.');
       const prev=sessions(req);
       if(prev) run('DELETE FROM sessions WHERE id=?',prev.id);
@@ -303,6 +358,7 @@ export function makeServer(config, upstream=providers) {
       transaction(db,()=>{
         const entry=run('INSERT INTO messages(room,author,sent,body,photo,expires) VALUES(?,?,?,?,?,?)',room.id,s.member,now,body,photo,photo?now+12*hour:null);
         if(photo)run("INSERT INTO reviews VALUES(?,'pending')",entry.lastInsertRowid);
+        else pushes.enqueue(entry.lastInsertRowid);
       });
       return ok();
     }
@@ -320,9 +376,14 @@ export function makeServer(config, upstream=providers) {
     }
     if(p==='/api/admin/login' && post) {
       throttle('admin:'+ip,12,hour/4);
-      if(!same(String(b.key||''),adminKey)) reject(403,'관리자 보안키를 확인해 주세요.');
-      const prev=sessions(req,true);if(prev) run('DELETE FROM sessions WHERE id=?',prev.id);
-      issue(res,'admin',4*hour);return ok();
+      const code=adminCode(b.key);
+      if(!registryApproved(await upstream.check(code))) reject(403,'승인된 관리자 보안키를 확인해 주세요.');
+      if(revision!==resetVersion()) reject(409,'서버가 초기화됐어요.');
+      transaction(db,()=>{
+        const prev=sessions(req,true);if(prev)run('DELETE FROM sessions WHERE id=?',prev.id);
+        issue(res,'admin',4*hour,null,code);
+      });
+      return ok();
     }
     if(p.startsWith('/api/admin/')) {
       const s=need(req,'admin');
@@ -354,7 +415,7 @@ export function makeServer(config, upstream=providers) {
       if(p==='/api/admin/review' && !post)return ok(safety.queue());
       if(p==='/api/admin/review' && post) {
         if(!Number.isSafeInteger(b.id))reject(400,'검토 대상을 확인해 주세요.');
-        if(b.kind==='photo')safety.photoDecision(b.id,b.action);
+        if(b.kind==='photo')safety.photoDecision(b.id,b.action,pushes.enqueue);
         else if(b.kind==='report')safety.reportDecision(b.id,b.action);
         else reject(400,'검토 대상을 확인해 주세요.');
         return ok();
@@ -373,7 +434,6 @@ export function makeServer(config, upstream=providers) {
           LEFT JOIN messages m ON m.room=r.id WHERE x.area=? OR y.area=? GROUP BY r.id ORDER BY recent DESC`,area,area));
       }
       if(p==='/api/admin/reset' && post) {
-        if(b.confirm!=='전체 삭제' || !same(String(b.key||''),adminKey)) reject(403,'보안키와 전체 삭제 문구를 확인해 주세요.');
         transaction(db,()=>{for(const table of tables) db.exec('DELETE FROM '+table);db.exec("DELETE FROM sqlite_sequence WHERE name='messages'");run("UPDATE service_meta SET value=? WHERE key='reset'",token());});
         cookie(res,'pc_admin','',0);return ok();
       }
@@ -388,13 +448,15 @@ export function makeServer(config, upstream=providers) {
   }));
   clean(db);
   const timer=setInterval(()=>clean(db),30000);timer.unref();
-  server.on('close',()=>{clearInterval(timer);db.close();});
+  const pushTimer=setInterval(()=>pushes.flush().catch(()=>console.error('알림 대기열 처리 오류')),1000);
+  pushTimer.unref();
+  server.on('close',()=>{clearInterval(timer);clearInterval(pushTimer);pushes.close();db.close();});
   return server;
 }
 if(process.argv[1] && pathToFileURL(resolve(process.argv[1])).href===import.meta.url) {
   const env=process.env,port=Number(env.PORT||3000);
   const origin=env.PUBLIC_BASE_URL||env.RENDER_EXTERNAL_URL||('http://localhost:'+port);
   const server=makeServer({origin,dir:env.DATA_DIR||fileURLToPath(new URL('./data',import.meta.url)),
-    adminKey:env.ADMIN_KEY,secret:env.SECRET,store:env.PORTONE_STORE_ID,channel:env.PORTONE_CHANNEL_KEY,liveOnly:env.NODE_ENV==='production',keyMarker:env.APP_KEY_MARKER});
+    secret:env.SECRET,store:env.PORTONE_STORE_ID,channel:env.PORTONE_CHANNEL_KEY,liveOnly:env.NODE_ENV==='production',keyMarker:env.APP_KEY_MARKER});
   server.listen(port,'0.0.0.0',()=>console.log('채팅 서버 시작 ('+port+')'));
 }

@@ -5,9 +5,11 @@ import { mkdtempSync,rmSync,readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { pushQueue } from '../push-queue.mjs';
+import { moderation } from '../moderation.mjs';
 import { makeServer } from '../server.mjs';
 import { policyVersion } from '../public/rules.js';
-import { adultInfo } from '../providers.mjs';
+import { adultInfo,RequestError } from '../providers.mjs';
 import { openStore,clean,hour,tables } from '../store.mjs';
 
 const birth=(di,date='1995-01-01')=>({status:'VERIFIED',verifiedCustomer:{di,name:'검증회원',phoneNumber:'01000000000',birthDate:date,gender:'FEMALE'}});
@@ -20,13 +22,31 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
   const dir=mkdtempSync(join(tmpdir(),'paperchat-test-'));
   const origin='https://paperchat.example';
   const adminKey='codenote-'+randomBytes(16).toString('hex')+'-kyh';
-  const cfg={dir,origin,adminKey,secret:randomBytes(40).toString('hex'),store:'store-test',channel:'channel-test'};
+  const cfg={dir,origin,secret:randomBytes(40).toString('hex'),store:'store-test',channel:'channel-test'};
+  const delivered=[];
+  let pushResult='sent';
+  cfg.pushProvider={enabled:()=>true,async send(job,event,valid){
+    assert.equal(valid(),true);
+    if(pushResult==='transient')throw new Error('FCM 503');
+    if(pushResult==='sent')delivered.push({token:job.token,event});
+    return pushResult;
+  }};
   const db=openStore(dir);
+  const deliveryQueue=pushQueue(db,cfg.pushProvider,moderation(db));
+  t.after(()=>deliveryQueue.close());
   const original=Date.now;let now=original();Date.now=()=>now;
   const verified=new Map();
   let unblock,started;
+  const registry=new Map([[adminKey,{status:'approved',token:'registry-token'}]]);
+  const registryLookups=[];
   const providers={
     check:async code=>{
+      registryLookups.push(code);
+      if(registry.has(code)){
+        const answer=registry.get(code);
+        if(answer instanceof Error)throw answer;
+        return typeof answer==='function' ? answer() : answer;
+      }
       if(code==='slow'){started();await new Promise(r=>{unblock=r;});return {status:'approved',token:'ok'};}
       if(code==='blank')return {status:'approved',token:'   '};
       return {status:code==='ok'?'approved':code,token:'test-token'};
@@ -93,6 +113,51 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
       assert.equal((await nobody('/apply')).headers.location,url);
     }
   });
+  await t.test('하나의 키에 소문자 두 문구와 발급 서버 승인이 모두 필요하다',async()=>{
+    const tester=client(), originIp={ip:'key-contract'};
+    for(const key of ['codenote','kyh','code-kyh']){
+      registry.set(key,{status:'approved',token:'would-approve'});
+      const count=registryLookups.length;
+      assert.equal((await tester('/api/admin/login',{key},originIp)).status,403);
+      assert.equal(registryLookups.length,count);
+      registry.delete(key);
+    }
+    const other='kyh__codenote__'+randomBytes(18).toString('hex');
+    for(const answer of [{status:'invalid'},{status:'pending',token:'old'},{status:'approved',token:'  '},null]){
+      registry.set(other,answer);
+      assert.equal((await tester('/api/admin/login',{key:other},originIp)).status,403);
+      assert.equal((await tester('/api/admin/members')).status,401);
+    }
+    registry.set(other,{status:'approved',token:'active'});
+    assert.equal((await tester('/api/admin/login',{key:' '+other+' '},originIp)).status,200);
+    assert.equal((await tester('/api/admin/settings')).status,200);
+    assert.ok(!readFileSync(join(dir,'chat.sqlite')).includes(Buffer.from(other)));
+    registry.set(other,new RequestError(503,'인증 서버 응답 없음'));
+    assert.equal((await tester('/api/admin/members')).status,503);
+    assert.equal((await tester('/api/admin/reset',{key:other,confirm:'전체 삭제'},originIp)).status,503);
+    registry.delete(other);
+    assert.equal((await tester('/api/admin/settings',{url:'https://denied.example'})).status,401);
+    assert.equal((await tester('/api/status')).body.adminSignedIn,false);
+    assert.equal((await admin('/api/admin/settings')).body.url,'https://two.example/apply');
+    registry.set(other,{status:'approved',token:'active-again'});
+    assert.equal((await tester('/api/admin/members')).status,401);
+    registry.delete(other);
+  });
+  await t.test('발급 서버 확인 중 로그아웃하면 진행 중인 초기화도 취소한다',async()=>{
+    const tester=client(), key='codenote-kyh-'+randomBytes(12).toString('hex');
+    registry.set(key,{status:'approved',token:'yes'});
+    await tester('/api/admin/login',{key},{ip:'reset-race'});
+    let release,seen;
+    const started=new Promise(r=>seen=r);
+    registry.set(key,()=>{seen();return new Promise(r=>release=r);});
+    const waiting=tester('/api/admin/reset',{key,confirm:'전체 삭제'},{ip:'reset-race'});
+    await started;
+    assert.equal((await tester('/api/admin/logout',{})).status,200);
+    release({status:'approved',token:'yes'});
+    assert.equal((await waiting).status,401);
+    assert.equal((await admin('/api/admin/settings')).body.url,'https://two.example/apply');
+    registry.delete(key);
+  });
   await t.test('실명정보 동의와 인증기관의 이름·전화번호가 모두 필요하다',async()=>{
     const guest=client();await guest('/api/key',{code:'ok'});
     assert.equal((await guest('/api/identity/start',{nick:'검증'})).status,400);
@@ -120,6 +185,27 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.deepEqual((await a('/api/state')).body.profile,old);
   });
   let room,photo;
+  const android={platform:'android',token:'abcd:android-token-for-test'};
+  const iphone={platform:'ios-dev',token:'abcd'.repeat(16)};
+  await t.test('Android 초기 설정은 로그인 전에 조회되며 배포 상태에 맞는 공개 설정만 반환한다',async()=>{
+    assert.deepEqual((await nobody('/api/push/android-config')).body,{config:null});
+    const clientConfig={projectId:'qa',senderId:'123',appId:'1:123:android:qa',apiKey:'client-key'};
+    cfg.pushProvider.androidClient=clientConfig;
+    try {
+      const response=await nobody('/api/push/android-config');
+      assert.equal(response.status,200);
+      assert.deepEqual(response.body,{config:clientConfig});
+      assert.match(response.headers['cache-control'],/no-store/);
+    } finally {delete cfg.pushProvider.androidClient;}
+  });
+  await t.test('기기 연결은 본인 세션을 요구하며 재등록은 중복되지 않는다',async()=>{
+    assert.equal((await nobody('/api/push/device',android)).status,401);
+    assert.equal((await a('/api/push/device',{...iphone,token:'wrong'})).status,400);
+    for(const [client,device] of [[a,android],[b,iphone],[b,iphone]]) {
+      assert.deepEqual((await client('/api/push/device',device)).body,{configured:true});
+    }
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM push_devices').get().n,2);
+  });
   await t.test('두 지역에서 관리자 열람, 참여자 외 회원의 대화·사진 차단',async()=>{
     const profile=(await b('/api/state')).body.profile;
     room=(await a('/api/room',{peer:profile.id})).body.id;
@@ -128,12 +214,15 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.equal((await a(path,{body:'반가워요'})).status,200);
     const jpeg=Buffer.from([255,216,255,224,0,0,255,217]).toString('base64');
     assert.equal((await b(path,{photo:jpeg})).status,200);
+    await deliveryQueue.flush();assert.deepEqual(delivered.map(d=>d.token),[iphone.token]);
     const messages=(await a(path)).body;assert.equal(messages.length,2);photo=messages[1].id;
     assert.equal((await a('/api/photos/'+photo)).status,403);
     assert.equal((await a(path)).body[1].visibility,'pending');
     const queue=(await admin('/api/admin/review')).body;
     assert.equal(queue.photos[0].sender,profile.id);
     assert.equal((await admin('/api/admin/review',{kind:'photo',id:photo,action:'approve'})).status,200);
+    await deliveryQueue.flush();assert.deepEqual(delivered.map(d=>d.token),[iphone.token,android.token]);
+    assert.notEqual(delivered[0].event,delivered[1].event);
     assert.equal((await a('/api/photos/'+photo)).headers['content-type'],'image/jpeg');
     assert.equal((await c(path)).status,404);
     assert.equal((await c('/api/photos/'+photo)).status,404);
@@ -196,9 +285,40 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     await b('/api/blocks',{peer:A.id,remove:true});assert.equal((await b('/api/photos/'+photo)).status,404);
     await a('/api/blocks',{peer:B.id,remove:true});assert.equal((await b('/api/photos/'+photo)).status,200);
   });
+  await t.test('푸시 재시도, 차단, 기기 교체, 만료 토큰과 로그아웃이 대기열에 반영된다',async()=>{
+    const path='/api/rooms/'+room+'/messages';
+    const idB=(await b('/api/state')).body.profile.id;
+    await deliveryQueue.flush();delivered.length=0;
+    await a(path,{body:'재시도'});
+    pushResult='transient';await deliveryQueue.flush();
+    assert.equal(db.prepare('SELECT tries FROM push_jobs').get().tries,1);
+    now+=6000;pushResult='sent';
+    await deliveryQueue.flush();await deliveryQueue.flush();
+    assert.deepEqual(delivered.map(d=>d.token),[iphone.token]);
+    await a(path,{body:'차단 전 보낸 메시지'});
+    await a('/api/blocks',{peer:idB});await deliveryQueue.flush();
+    assert.equal(delivered.length,1);
+    await a('/api/blocks',{peer:idB,remove:true});
+    await a(path,{body:'기기 연결 변경 전 메시지'});
+    await c('/api/push/device',iphone);await deliveryQueue.flush();assert.equal(delivered.length,1);
+    await b('/api/push/device',iphone);
+    const updated={...iphone,token:'ffff'.repeat(16)};
+    await b('/api/push/device',updated);
+    assert.equal(db.prepare('SELECT 1 FROM push_devices WHERE token=?').get(iphone.token),undefined);
+    await a(path,{body:'토큰 정리'});pushResult='invalid';await deliveryQueue.flush();pushResult='sent';
+    assert.equal(db.prepare('SELECT 1 FROM push_devices WHERE token=?').get(updated.token),undefined);
+    await b('/api/push/device',iphone);await a(path,{body:'로그아웃 전 메시지'});
+    await b('/api/logout',{});await deliveryQueue.flush();assert.equal(delivered.length,1);
+    assert.equal(db.prepare('SELECT 1 FROM push_devices WHERE token=?').get(iphone.token),undefined);
+    await pass(b,'','DI-B');await b('/api/push/device',iphone);
+  });
   await t.test('재시작 후에도 세션·폼·대화가 유지되고 12시간에 사진 열람 및 정리가 적용된다',async()=>{
     const version=(await a('/api/status')).body.version;
+    const oldId=randomBytes(32).toString('hex');
+    db.prepare('INSERT INTO sessions(id,kind,expires) VALUES(?,?,?)').run(oldId,'admin',now+hour);
     server.emit('close');server=makeServer(cfg,providers);
+    assert.equal(db.prepare('SELECT id FROM sessions WHERE id=?').get(oldId),undefined);
+    assert.equal((await admin('/api/admin/settings')).status,200);
     assert.equal((await a('/api/status')).body.version,version);
     assert.equal((await a('/api/state')).body.stage,'member');
     assert.equal((await nobody('/apply')).headers.location,'https://two.example/apply');
@@ -267,6 +387,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.equal((await admin('/api/admin/reset',{key:adminKey,confirm:'전체 삭제'},{origin:'https://other.example'})).status,403);
     const oldVersion=(await c('/api/status')).body.version;
     const oldMember=(await c('/api/state')).body.profile.id;
+    assert.equal((await c('/api/push/device',android)).status,200);
     // Include a fresh tombstone when resetting, before its 24-hour expiry.
     const departing=(await b('/api/state')).body.profile;
     if(!departing)await pass(b,'','DI-B');
@@ -275,8 +396,16 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     const probe='reset-probe-'+randomBytes(10).toString('hex');
     db.prepare('INSERT INTO settings VALUES(?,?)').run('reset-check',probe);
     assert.ok(readFileSync(join(dir,'chat.sqlite')).includes(Buffer.from(probe)));
+    let releaseAdmin,signal;
+    const lateKey='kyh-codenote-'+randomBytes(12).toString('hex'),lateAdmin=client();
+    const checking=new Promise(r=>signal=r);
+    registry.set(lateKey,()=>{signal();return new Promise(r=>releaseAdmin=r);});
+    const loginPending=lateAdmin('/api/admin/login',{key:lateKey},{ip:'late-login'});await checking;
     const began=new Promise(r=>started=r);const pending=nobody('/api/key',{code:'slow'});await began;
     assert.equal((await admin('/api/admin/reset',{key:adminKey,confirm:'전체 삭제'})).status,200);
+    releaseAdmin({status:'approved',token:'delayed'});
+    assert.equal((await loginPending).status,409);
+    assert.equal((await lateAdmin('/api/admin/settings')).status,401);
     unblock();assert.equal((await pending).status,409);
     assert.equal(db.prepare('PRAGMA secure_delete').get().secure_delete,1);
     assert.equal(readFileSync(join(dir,'chat.sqlite')).includes(Buffer.from(probe)),false);

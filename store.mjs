@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 export const hour = 3600_000;
-export const tables = ['departures','pending_contacts','contacts','reports','reviews','room_changes','blocks','acceptances','restrictions','messages','rooms','sessions','members','cooldowns','settings','attempts'];
+export const tables = ['push_jobs','push_devices','admin_session_proofs','departures','pending_contacts','contacts','reports','reviews','room_changes','blocks','acceptances','restrictions','messages','rooms','sessions','members','cooldowns','settings','attempts'];
 export function openStore(dir) {
   mkdirSync(dir, {recursive:true, mode:0o700});
   const db = new DatabaseSync(join(dir,'chat.sqlite'));
@@ -41,6 +41,7 @@ export function openStore(dir) {
     CREATE TABLE IF NOT EXISTS departures(id TEXT PRIMARY KEY,nick TEXT NOT NULL,withdrawn INTEGER NOT NULL,expires INTEGER NOT NULL);
     CREATE INDEX IF NOT EXISTS departure_expiry ON departures(expires);
     CREATE TABLE IF NOT EXISTS service_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS admin_session_proofs(session TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,sealed BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS pending_contacts(session TEXT PRIMARY KEY REFERENCES sessions ON DELETE CASCADE,challenge TEXT NOT NULL,consented INTEGER NOT NULL,encrypted BLOB);
     CREATE TABLE IF NOT EXISTS contacts(member TEXT PRIMARY KEY REFERENCES members ON DELETE CASCADE,encrypted BLOB NOT NULL,consented INTEGER NOT NULL,verified INTEGER NOT NULL,joined INTEGER);
     CREATE TABLE IF NOT EXISTS acceptances(member TEXT PRIMARY KEY REFERENCES members ON DELETE CASCADE,version TEXT NOT NULL,accepted INTEGER NOT NULL);

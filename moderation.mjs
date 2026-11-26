@@ -65,13 +65,14 @@ export function moderation(db) {
       if(room)bump(room);
     });
   }
-  function photoDecision(id,decision) {
+  function photoDecision(id,decision,onApproved) {
     if(!['approve','reject'].includes(decision))reject(400,'검토 결과를 확인해 주세요.');
     transaction(db,()=>{
       const p=get("SELECT m.room FROM messages m JOIN reviews v ON v.message=m.id WHERE m.id=? AND v.state='pending' AND m.photo IS NOT NULL AND m.expires>?",id,Date.now());
       if(!p)reject(409,'이미 처리되었거나 보관 기간이 지났어요.');
       run('UPDATE reviews SET state=? WHERE message=?',decision==='approve'?'approved':'removed',id);
       if(decision==='reject')run('UPDATE messages SET photo=NULL WHERE id=?',id);
+      if(decision==='approve')onApproved(id);
       bump(p.room);
     });
   }

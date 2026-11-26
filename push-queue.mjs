@@ -1,0 +1,75 @@
+import { randomUUID } from 'node:crypto';
+import { transaction } from './store.mjs';
+import { reject } from './providers.mjs';
+
+export function pushQueue(db, provider, safety) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS push_devices (
+      id TEXT PRIMARY KEY, session TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      platform TEXT NOT NULL, token TEXT NOT NULL, UNIQUE(platform,token), UNIQUE(session,platform));
+    CREATE TABLE IF NOT EXISTS push_jobs (
+      id TEXT PRIMARY KEY, message INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+      device TEXT NOT NULL REFERENCES push_devices(id) ON DELETE CASCADE,
+      due INTEGER NOT NULL, expires INTEGER NOT NULL, tries INTEGER NOT NULL DEFAULT 0, UNIQUE(message,device));
+    CREATE INDEX IF NOT EXISTS push_due ON push_jobs(due);
+  `);
+  const run = (sql,...a) => db.prepare(sql).run(...a);
+  const get = (sql,...a) => db.prepare(sql).get(...a);
+  let running, closed = false;
+
+  function bind(session, platform, token) {
+    const valid = platform==='android' ? /^[\w:-]{20,4096}$/ : /^(?:[\da-f]{2}){16,256}$/;
+    if (!['android','ios-dev','ios-prod'].includes(platform) || typeof token!=='string' || !valid.test(token))
+      reject(400,'알림 기기 정보를 확인해 주세요.');
+    transaction(db,()=>{
+      if (get('SELECT 1 FROM push_devices WHERE session=? AND platform=? AND token=?',session,platform,token)) return;
+      run('DELETE FROM push_devices WHERE platform=? AND (session=? OR token=?)',platform,session,token);
+      run('INSERT INTO push_devices VALUES(?,?,?,?)',randomUUID(),session,platform,token);
+    });
+    return {configured:provider.enabled(platform)};
+  }
+  function enqueue(message) {
+    const now=Date.now();
+    const devices=db.prepare(`SELECT d.id FROM messages m JOIN rooms r ON r.id=m.room
+      JOIN sessions s ON s.member=CASE WHEN r.a=m.author THEN r.b ELSE r.a END
+      JOIN push_devices d ON d.session=s.id WHERE m.id=? AND s.expires>?`).all(message,now);
+    for(const d of devices) run('INSERT OR IGNORE INTO push_jobs(id,message,device,due,expires) VALUES(?,?,?,?,?)',
+      randomUUID(),message,d.id,now,now+600000);
+  }
+  function deliverable(id) {
+    if (closed) return false;
+    const now=Date.now();
+    const row=get(`SELECT s.member,m.author FROM push_jobs j JOIN push_devices d ON d.id=j.device
+      JOIN sessions s ON s.id=d.session JOIN messages m ON m.id=j.message
+      LEFT JOIN reviews v ON v.message=m.id WHERE j.id=? AND j.expires>? AND s.expires>?
+      AND ((m.body IS NOT NULL AND v.state IS NULL) OR (v.state='approved' AND m.photo IS NOT NULL AND m.expires>?))
+      AND NOT EXISTS (SELECT 1 FROM reports WHERE message=m.id AND status='open')`,id,now,now,now);
+    if (!row || safety.memberStage(row.member)!=='member' || safety.memberStage(row.author)!=='member') return false;
+    try { safety.pairAllowed(row.member,row.author); return true; } catch { return false; }
+  }
+  async function deliver(job) {
+    try {
+      const valid=()=>deliverable(job.id);
+      const result=valid() && provider.enabled(job.platform) ? await provider.send(job,job.id,valid) : 'skip';
+      if (closed) return;
+      if (result==='invalid') run('DELETE FROM push_devices WHERE id=?',job.device);
+      run('DELETE FROM push_jobs WHERE id=?',job.id);
+    } catch(e) {
+      if (closed) return;
+      if (job.tries===0) console.warn('푸시 전송 재시도',job.platform, e.message?.match(/^(FCM|APNs) [A-Za-z0-9 ]{1,60}$/)?.[0] || '연결 오류');
+      run('UPDATE push_jobs SET tries=tries+1,due=? WHERE id=?',Date.now()+Math.min(120000,5000*2**job.tries),job.id);
+    }
+  }
+  async function drain() {
+    if (closed) return;
+    run('DELETE FROM push_jobs WHERE expires<=?',Date.now());
+    const jobs=db.prepare(`SELECT j.*,d.token,d.platform FROM push_jobs j JOIN push_devices d ON d.id=j.device
+      WHERE j.due<=? ORDER BY j.due,j.rowid LIMIT 12`).all(Date.now());
+    await Promise.all(jobs.map(deliver));
+  }
+  function flush() {
+    running ||= drain().finally(()=>{running=null;});
+    return running;
+  }
+  return {bind,enqueue,flush,close(){closed=true;}};
+}

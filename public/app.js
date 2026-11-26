@@ -24,7 +24,7 @@ async function api(path,body) {
   const controller=path==='status'?new AbortController():null;
   const timer=controller?setTimeout(()=>controller.abort(),8000):null;
   let res;
-  try{res=await fetch('/api/'+path,{signal:controller?.signal,method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store'});}finally{if(timer)clearTimeout(timer);}
+  try{res=await fetch('/api/'+path+(path==='status' && !admin?'?member=1':''),{signal:controller?.signal,method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store'});}finally{if(timer)clearTimeout(timer);}
   const version=res.headers.get('X-Service-Version');
   if(version)recordVersion(version);
   const data=await res.json();
@@ -170,6 +170,28 @@ function memo(){
   paint('당신의 성향을 알려주세요','leaf',rulesCard()+`<form class="paper"><label for="memo">성향 메모</label><textarea id="memo" name="memo" required maxlength="800" placeholder="나를 소개하는 글을 자유롭게 적어주세요.">${esc(draft.memo)}</textarea><div class="rule"></div><label class="check"><input type="checkbox" required><span>이용규칙에 동의해요. 지역·성향 메모는 회원에게 공개되며, 운영자는 신고 처리와 사진 검토를 위해 대화를 열람할 수 있어요.</span></label>${actions(btn('확인'))}</form>`,{back:()=>{draft.memo=$('#memo').value;return regionStep();}});
   form(async f=>{draft.memo=f.get('memo');await api('register',{area:draft.province+' '+draft.district,memo:draft.memo,policy:policyVersion});await boot();});
 }
+const applePush=window.webkit?.messageHandlers?.paperChatPush;
+const androidPush=/PaperChatAndroid\/2/.test(globalThis.navigator?.userAgent||'');
+const pushLabels={checking:'알림 연결 확인 중',ready:'이 기기의 채팅 알림이 연결됐어요.',denied:'휴대폰 설정에서 채팅 알림을 허용해 주세요.',server:'운영 서버의 알림 설정을 기다리고 있어요.',restart:'알림 프로젝트가 변경됐어요. 앱을 완전히 종료하고 다시 열어 주세요.',failed:'알림을 연결하지 못했어요. 네트워크를 확인하고 다시 시도해 주세요.'};
+let pushState='checking',nextPushSync=0;
+function showPush(state){
+  pushState=pushLabels[state]?state:'failed';
+  const el=$('#push-state');if(el)el.textContent=pushLabels[pushState];
+}
+async function syncPush(force=false){
+  if(admin || stage!=='member' || (!applePush && !androidPush) || (!force && Date.now()<nextPushSync))return;
+  nextPushSync=Date.now()+180000;
+  try{
+    if(androidPush){location.href='paperchat://push/sync';return;}
+    const result=await applePush.postMessage('sync');
+    if(!result.token){showPush(result.status);return;}
+    const binding=await api('push/device',{platform:result.platform,token:result.token});
+    showPush(binding.configured?'ready':'server');
+  }catch{showPush('failed');}
+}
+window.addEventListener('message',e=>{
+  if(androidPush && typeof e.data==='string' && e.data.startsWith('paperchat-push:'))showPush(e.data.slice('paperchat-push:'.length));
+});
 async function people(){
   regions||=await api('regions');selectedArea||=me.area;
   paint('프로필 목록','book',`<div class="paper">${picker()}<div class="rule"></div><div class="rows" id="list"></div></div>`,{nav:tabs('people')});wireTabs();
@@ -193,6 +215,11 @@ async function rooms(){
 function settings(){
   paint('내 설정','settings',`<div class="paper"><h2>${esc(me.nick)}</h2><p class="sub">${esc(me.year)}년생 · ${esc(me.gender)} · ${esc(me.area)}</p><div class="rule"></div><p class="memo">${esc(me.memo)}</p>${actions(act('logout','로그아웃'),act('withdraw','회원탈퇴','danger'))}</div>`,{nav:tabs('settings')});
   main.insertAdjacentHTML('beforeend',actions(act('blocked','차단한 사용자'))+rulesCard());
+  if(applePush || androidPush){
+    main.insertAdjacentHTML('beforeend',`<section class="paper"><h2>채팅 알림</h2><p id="push-state">${esc(pushLabels[pushState])}</p>${actions(act('push-check','다시 연결'),act('push-settings','휴대폰 알림 설정'))}</section>`);
+    on('#push-check','click',()=>syncPush(true));
+    on('#push-settings','click',()=>{if(applePush)return applePush.postMessage('settings');location.href='paperchat://push/settings';});
+  }
   wireTabs();accountActions();on('#blocked','click',blockedList);
 }
 async function jpeg(file){
@@ -350,7 +377,7 @@ async function adminHome(){
 }
 function adminLogin(){
   adminPrivate=false;
-  paint('관리자 로그인','key',`<form class="paper">${field('key','관리자 보안키','type="password" autocomplete="current-password" maxlength="512"')}${actions(btn('로그인'))}</form>`);
+  paint('관리자 로그인','key',`<form class="paper">${field('key','관리자 보안키','type="password" autocomplete="current-password" maxlength="256"')}<p class="note">발급 서버에서 승인한 관리자 보안키를 입력해 주세요.</p>${actions(btn('로그인'))}</form>`);
   form(async f=>{await api('admin/login',{key:f.get('key')});await adminHome();});
 }
 async function adminURL(){
@@ -370,13 +397,19 @@ async function monitor(){
   wirePicker(monitorArea,()=>refresh().catch(err));await refresh();if(v===epoch)activeTimer=setInterval(()=>refresh().catch(err),4000);
 }
 function reset(){
-  paint('서버 초기화','bin',`<form class="paper"><p>회원, 프로필, 대화, 사진, 로그인 정보, 탈퇴 후 24시간 현황, 실명·전화번호, 신고·제재·차단·동의 기록과 발급 폼 주소까지 모두 지워요. 사용자 앱은 다음 연결 때 초기화됩니다.</p>${field('key','관리자 보안키','type="password" autocomplete="current-password"')}${field('confirm','확인을 위해 ‘전체 삭제’ 입력','autocomplete="off"')}${actions(btn('전체 삭제','danger fill'))}</form>`,{back:adminHome});
+  paint('서버 초기화','bin',`<form class="paper"><p>회원, 프로필, 대화, 사진, 로그인 정보, 탈퇴 후 24시간 현황, 실명·전화번호, 신고·제재·차단·동의 기록과 발급 폼 주소까지 모두 지워요. 사용자 앱은 다음 연결 때 초기화됩니다.</p>${field('key','로그인한 관리자 보안키','type="password" maxlength="256" autocomplete="current-password"')}${field('confirm','확인을 위해 ‘전체 삭제’ 입력','autocomplete="off"')}${actions(btn('전체 삭제','danger fill'))}</form>`,{back:adminHome});
   form(async f=>{await api('admin/reset',{key:f.get('key'),confirm:f.get('confirm')});note('가입 중 0명 · 탈퇴 현황 0명으로 초기화했어요.');adminLogin();});
 }
 async function boot(){
   const s=await api('state');stage=s.stage;me=s.profile;
   if(['policy','restricted','contact'].includes(stage)){limitedPage(stage);return;}
-  if(stage==='member'){await people();return;}
+  if(stage==='member'){
+    void syncPush(true);
+    if(new URLSearchParams(location.search).get('inbox')==='1'){
+      history.replaceState(null,'','/');await rooms();
+    }else await people();
+    return;
+  }
   if(stage==='verified'){await regionStep();return;}
   if(stage==='gate_ok'){draft.nick=s.nick||draft.nick;nick();return;}gate();
 }
@@ -410,6 +443,7 @@ function pulse(protect=false){
         if(status.stage==='gate'){me=null;selectedArea='';await boot();err(new Error('사용자 정보가 없거나 로그인이 종료되었어요. 다시 인증해 주세요.'));}
         else await boot();
       }
+      if(status.stage==='member')void syncPush(protect);
       veil(false);
     }catch{if(!leaving)veil(true,'서버에 연결하면 계정 상태를 다시 확인해요.');}
     finally{pulseTask=null;}
