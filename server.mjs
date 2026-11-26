@@ -15,6 +15,11 @@ import { policyVersion } from './public/rules.js';
 
 const regions=JSON.parse(readFileSync(new URL('./regions.json',import.meta.url)));
 const areas=new Set(Object.entries(regions).flatMap(([p,ds])=>ds.map(d=>p+' '+d)));
+function directoryArea(url) {
+  const area=url.searchParams.get('area');
+  if(area!==null && !areas.has(area)) reject(400,'지역을 선택해 주세요.');
+  return area;
+}
 const profileCols='id,nick,year,gender,area,memo';
 const assets=new Map(Object.entries({'/app':'index.html','/admin':'index.html','/app.js':'app.js','/theme.css':'theme.css','/icon.svg':'icon.svg','/headings.woff':'headings.woff','/rules.js':'rules.js'}));
 const type={html:'text/html',js:'text/javascript',css:'text/css',svg:'image/svg+xml',woff:'font/woff'};
@@ -391,15 +396,14 @@ export function makeServer(config, upstream=providers) {
     }
     if(!post && p==='/api/people') {
       const s=need(req,'member');
-      const area=u.searchParams.get('area');
-      if(!areas.has(area)) reject(400,'지역을 선택해 주세요.');
-      return ok(all('SELECT '+profileCols+' FROM members p WHERE area=? AND id<>? AND '+visiblePeer+' ORDER BY nick,id',area,s.member,Date.now(),s.member,s.member));
+      const area=directoryArea(u);
+      return ok(all('SELECT '+profileCols+' FROM members p WHERE (? IS NULL OR p.area=?) AND p.id<>? AND '+visiblePeer+' ORDER BY nick,id',area,area,s.member,Date.now(),s.member,s.member));
     }
     if(!post && p==='/api/rooms') {
-      const s=need(req,'member');
+      const s=need(req,'member'),area=directoryArea(u);
       return ok(all(`SELECT r.id,p.id AS peer,p.nick,p.area,MAX(m.sent) AS recent FROM rooms r
         JOIN members p ON p.id=CASE WHEN r.a=? THEN r.b ELSE r.a END
-        LEFT JOIN messages m ON m.room=r.id WHERE (r.a=? OR r.b=?) AND ${visiblePeer} GROUP BY r.id ORDER BY recent DESC`,s.member,s.member,s.member,Date.now(),s.member,s.member));
+        LEFT JOIN messages m ON m.room=r.id WHERE (r.a=? OR r.b=?) AND (? IS NULL OR p.area=?) AND ${visiblePeer} GROUP BY r.id ORDER BY recent DESC,r.id`,s.member,s.member,s.member,area,area,Date.now(),s.member,s.member));
     }
     if(post && p==='/api/room') {
       const s=need(req,'member');
@@ -498,11 +502,10 @@ export function makeServer(config, upstream=providers) {
         run("INSERT OR REPLACE INTO settings VALUES('form',?)",url.href);return ok();
       }
       if(p==='/api/admin/rooms' && !post) {
-        const area=u.searchParams.get('area');
-        if(!areas.has(area)) reject(400,'지역을 선택해 주세요.');
-        return ok(all(`SELECT r.id,x.nick AS first,y.nick AS second,MAX(m.sent) AS recent
+        const area=directoryArea(u);
+        return ok(all(`SELECT r.id,x.nick AS first,x.area AS firstArea,y.nick AS second,y.area AS secondArea,MAX(m.sent) AS recent
           FROM rooms r JOIN members x ON r.a=x.id JOIN members y ON r.b=y.id
-          LEFT JOIN messages m ON m.room=r.id WHERE x.area=? OR y.area=? GROUP BY r.id ORDER BY recent DESC`,area,area));
+          LEFT JOIN messages m ON m.room=r.id WHERE (? IS NULL OR x.area=? OR y.area=?) GROUP BY r.id ORDER BY recent DESC,r.id`,area,area,area));
       }
       if(p==='/api/admin/reset' && post) {
         transaction(db,()=>{for(const table of tables) db.exec('DELETE FROM '+table);db.exec("DELETE FROM sqlite_sequence WHERE name='messages'");run("UPDATE service_meta SET value=? WHERE key='reset'",token());});

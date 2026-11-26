@@ -232,7 +232,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
   let room,photo;
   const android={platform:'android',token:'abcd:android-token-for-test'};
   const iphone={platform:'ios-dev',token:'abcd'.repeat(16)};
-  await t.test('플랫폼별 실제 발송 설정을 확인한 뒤에만 권한 창을 요청할 수 있다',async()=>{
+  await t.test('플랫폼별 발송 설정 상태를 기기 등록과 별개로 조회한다',async()=>{
     const original=cfg.pushProvider.enabled;
     try {
       cfg.pushProvider.enabled=()=>false;
@@ -283,8 +283,23 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.equal((await c(path)).status,404);
     assert.equal((await c('/api/photos/'+photo)).status,404);
     assert.equal((await a('/api/admin/photos/'+photo)).status,401);
+    const everyone=(await a('/api/people')).body;
+    assert.deepEqual(everyone.map(p=>p.nick).sort(),['겨울','봄']);
+    assert.deepEqual((await a('/api/people?area='+encodeURIComponent(profile.area))).body.map(p=>p.id),[profile.id]);
+    assert.deepEqual((await a('/api/rooms')).body.map(r=>r.id),[room]);
+    assert.deepEqual((await a('/api/rooms?area='+encodeURIComponent(profile.area))).body.map(r=>r.id),[room]);
+    assert.deepEqual((await a('/api/rooms?area='+encodeURIComponent('인천광역시 검단구'))).body,[]);
+    const nationwide=(await admin('/api/admin/rooms')).body;
+    assert.equal(nationwide.length,1);assert.equal(nationwide[0].id,room);
+    const {first,firstArea,second,secondArea}=nationwide[0];
+    assert.deepEqual(new Map([[first,firstArea],[second,secondArea]]),new Map([['가을','경기도 이천시'],['겨울','서울특별시 중구']]));
     for(const area of ['서울특별시 중구','경기도 이천시'])
-      assert.equal((await admin('/api/admin/rooms?area='+encodeURIComponent(area))).body[0].id,room);
+      assert.deepEqual((await admin('/api/admin/rooms?area='+encodeURIComponent(area))).body,nationwide);
+    assert.equal((await a('/api/admin/rooms')).status,401);
+    assert.equal((await nobody('/api/admin/rooms')).status,401);
+    for(const [client,path] of [[a,'people'],[b,'rooms'],[admin,'admin/rooms']]){
+      assert.equal((await client('/api/'+path+'?area=x')).status,400);
+    }
     assert.deepEqual((await admin('/api/admin/rooms?area='+encodeURIComponent('인천광역시 검단구'))).body,[]);
     assert.equal((await admin('/api/admin/rooms/'+room+'/messages')).body.length,2);
     assert.equal((await admin('/api/admin/photos/'+photo)).status,200);
@@ -336,6 +351,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
       assert.equal((await user('/api/photos/'+photo)).status,404);
       assert.equal((await user('/api/rooms')).body.length,0);
       assert.equal((await user('/api/people?area='+encodeURIComponent(peer.area))).body.length,0);
+      assert.ok(!(await user('/api/people')).body.some(p=>p.id===peer.id));
     }
     assert.equal((await a('/api/blocks')).body[0].id,B.id);
     await b('/api/blocks',{peer:A.id,remove:true});assert.equal((await b('/api/photos/'+photo)).status,404);

@@ -17,7 +17,9 @@ const paths={
   arrow:'<path d="m9 5 7 7-7 7"/>',photo:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m4 17 5-6 4 4 3-3 5 5"/><circle cx="16" cy="9" r="1.5"/>'
 };
 const icon=n=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[n]||paths.mail}</svg>`;
-let me,regions,stage,activeTimer,epoch=0,selectedArea='';
+let me,regions,stage,activeTimer,epoch=0;
+const scopes={people:{},rooms:{},monitor:{}};
+function resetScopes(){for(const scope of Object.values(scopes)){scope.regional=false;scope.area='';}}
 const draft={nick:'',birthDate:'',gender:'',province:'',district:'',memo:''};
 const err=e=>{const el=$('#error');if(el)el.textContent=e.message||String(e);};
 const note=msg=>{const el=$('#notice');el.textContent=msg;setTimeout(()=>{if(el.textContent===msg)el.textContent='';},3200);};
@@ -55,7 +57,7 @@ const actions=(...parts)=>`<div class="actions">${parts.join('')}</div>`;
 const notice='<p class="error" id="error" role="alert"></p>';
 function paint(title,mark,body,{sub='',back,wide=false,nav=''}={}) {
   clearInterval(activeTimer);epoch++;main.className=wide?'wide':'';
-  main.innerHTML=`<header class="bar"><span class="brand">${icon('mail')}종이편지</span>${back?act('back','이전','textBtn'):''}</header><section class="hero"><h1>${icon(mark)}${esc(title)}</h1>${sub?`<p>${esc(sub)}</p>`:''}</section>${nav}${body}${body.includes(notice)?'':notice}`;
+  main.innerHTML=`<header class="bar"><span class="brand">${icon('mail')}종이편지</span>${back?act('back','이전','textBtn'):''}</header><section class="hero"><h1>${icon(mark)}${esc(title)}</h1>${sub?`<p>${esc(sub)}</p>`:''}</section>${nav}<div id="sections" class="screen-stack">${body}</div>${body.includes(notice)?'':notice}`;
   if(back)on('#back','click',back);
   document.title=title+' · 종이편지';
   window.scrollTo(0,0);
@@ -82,7 +84,7 @@ function recordVersion(version){
   const previous=knownVersion;knownVersion=version;
   localStorage.setItem(resetKey,version);
   if(previous && previous!==version){
-    leaving=true;clearInterval(activeTimer);epoch++;me=null;selectedArea='';stage='gate';
+    leaving=true;clearInterval(activeTimer);epoch++;me=null;resetScopes();stage='gate';
     for(const k of Object.keys(draft))draft[k]='';
     sessionStorage.clear();
     main.replaceChildren();location.replace(admin?'/admin?reset=1':'/app?reset=1');
@@ -96,7 +98,7 @@ function accountActions(){
 function limitedPage(state){
   const policy=state==='policy';
   paint(policy?'이용규칙 확인':'계정 이용 제한','book',rulesCard()+
-    (policy?`<form class="paper"><label class="check"><input required type="checkbox">이용규칙에 동의해요.</label>${actions(btn('확인하고 계속'))}</form>`:'<p>신고 검토 결과에 따라 계정 이용이 제한되었어요.</p>')+
+    (policy?`<form class="paper"><label class="check"><input required type="checkbox">이용규칙에 동의해요</label>${actions(btn('확인하고 계속'))}</form>`:'<p>신고 검토 결과에 따라 계정 이용이 제한되었어요.</p>')+
     actions(act('recovery','개인 복구코드 보기'),act('logout','로그아웃'),act('withdraw','회원탈퇴','danger')));
   if(policy)form(async()=>{await api('policy',{version:policyVersion});await boot();});
   on('#recovery','click',()=>recoveryPage(()=>limitedPage(state)));
@@ -115,11 +117,10 @@ async function blockedList(){
   rows(items,i=>modal('차단 해제',i.nick+'님의 차단을 해제할까요?','해제하기',async()=>{await api('blocks',{peer:i.id,remove:true});await blockedList();}));
 }
 function gate(){
-  paint('인증키를 입력해 주세요','key',`<div class="invite-stack">
-    <form class="paper">${field('code','발급받은 일반 인증키','autocomplete="off" maxlength="256" aria-describedby="error" placeholder="인증키 입력"')}${notice}${actions(btn('인증하고 계속'))}</form>
+  paint('인증키를 입력해 주세요','key',`<form class="paper">${field('code','발급받은 일반 인증키','autocomplete="off" maxlength="256" aria-describedby="error" placeholder="인증키 입력"')}${notice}${actions(btn('인증하고 계속'))}</form>
     ${act('existing','기존 회원 로그인','secondary')}
     <aside class="letter"><h2>${icon('mail')}인증키 발급 안내</h2><p>새로 가입할 때 한 번 쓰는 개인별 인증키예요.</p><div class="rule"></div><a class="btn forest" href="/apply">발급 신청서 열기</a></aside>
-    ${rulesCard()}</div>`);
+    ${rulesCard()}`);
   on('#existing','click',loginPage);
   form(async f=>{await api('key',{code:f.get('code')});nick();});
   if(new URLSearchParams(location.search).has('reset'))err(new Error('서버가 초기화되어 등록된 사용자 정보가 없습니다. 다시 가입해 주세요.'));
@@ -135,7 +136,7 @@ function loginPage(){
 }
 function details(){
   paint('생년월일과 성별','pen',`<form class="paper">${field('birthDate','생년월일',`type="date" autocomplete="bday" min="1900-01-01" value="${esc(draft.birthDate)}"`)}
-    <label for="gender">성별</label><select id="gender" name="gender" required><option value="">선택해 주세요</option>${[['남성','남자'],['여성','여자']].map(([v,l])=>`<option value="${v}" ${draft.gender===v?'selected':''}>${l}</option>`).join('')}</select>
+    <div class="field"><label for="gender">성별</label><select id="gender" name="gender" required><option value="">선택해 주세요</option>${[['남성','남자'],['여성','여자']].map(([v,l])=>`<option value="${v}" ${draft.gender===v?'selected':''}>${l}</option>`).join('')}</select></div>
     <p class="note">직접 입력한 생년월일로 만 19세 이상인지 확인해요. 프로필에는 출생연도와 성별만 표시돼요.</p>
     ${actions(btn('다음'))}</form>`,{back:nick});
   form(async f=>{
@@ -181,16 +182,14 @@ async function regionStep(){
   });
 }
 function memo(){
-  paint('당신의 성향을 알려주세요','leaf',rulesCard()+`<form class="paper"><label for="memo">성향 메모</label><textarea id="memo" name="memo" required maxlength="800" placeholder="나를 소개하는 글을 자유롭게 적어주세요.">${esc(draft.memo)}</textarea><div class="rule"></div><label class="check"><input type="checkbox" required><span>이용규칙에 동의해요. 지역·성향 메모는 회원에게 공개되며, 운영자는 신고 처리와 사진 검토를 위해 대화를 열람할 수 있어요.</span></label>${actions(btn('확인'))}</form>`,{back:()=>{draft.memo=$('#memo').value;return regionStep();}});
+  paint('당신의 성향을 알려주세요','leaf',rulesCard()+`<form class="paper"><label for="memo">성향 메모</label><textarea id="memo" name="memo" required maxlength="800" placeholder="나를 소개하는 글을 자유롭게 적어주세요.">${esc(draft.memo)}</textarea><div class="rule"></div><label class="check"><input type="checkbox" required><span>이용규칙에 동의해요</span></label>${actions(btn('확인'))}</form>`,{back:()=>{draft.memo=$('#memo').value;return regionStep();}});
   form(async f=>{draft.memo=f.get('memo');await api('register',{area:draft.province+' '+draft.district,memo:draft.memo,policy:policyVersion});draft.birthDate='';await boot();});
 }
 const applePush=window.webkit?.messageHandlers?.paperChatPush;
 const androidPush=/PaperChatAndroid\/2/.test(globalThis.navigator?.userAgent||'');
-const pushLabels={checking:'알림 연결 확인 중',ready:'이 기기의 채팅 알림이 연결됐어요.',denied:'휴대폰 설정에서 채팅 알림을 허용해 주세요.',server:'운영 서버의 알림 설정을 기다리고 있어요.',restart:'알림 프로젝트가 변경됐어요. 앱을 완전히 종료하고 다시 열어 주세요.',failed:'알림을 연결하지 못했어요. 네트워크를 확인하고 다시 시도해 주세요.'};
-let pushState='checking',nextPushSync=0;
-function showPush(state){
-  pushState=pushLabels[state]?state:'failed';
-  const el=$('#push-state');if(el)el.textContent=pushLabels[pushState];
+let nextPushSync=0;
+function pushResult(status){
+  if(status==='failed' || status==='checking')nextPushSync=Date.now()+15000;
 }
 async function syncPush(force=false){
   if(admin || stage!=='member' || (!applePush && !androidPush) || (!force && Date.now()<nextPushSync))return;
@@ -198,42 +197,75 @@ async function syncPush(force=false){
   try{
     if(androidPush){location.href='paperchat://push/sync';return;}
     const result=await applePush.postMessage('sync');
-    if(!result.token){showPush(result.status);return;}
+    if(!result.token){pushResult(result.status);return;}
     const binding=await api('push/device',{platform:result.platform,token:result.token});
-    showPush(binding.configured?'ready':'server');
-  }catch{showPush('failed');}
+    pushResult(binding.configured?'ready':'server');
+  }catch{pushResult('failed');}
 }
 window.addEventListener('message',e=>{
-  if(androidPush && typeof e.data==='string' && e.data.startsWith('paperchat-push:'))showPush(e.data.slice('paperchat-push:'.length));
+  if(androidPush && typeof e.data==='string' && e.data.startsWith('paperchat-push:'))pushResult(e.data.slice('paperchat-push:'.length));
 });
-async function people(){
-  regions||=await api('regions');selectedArea||=me.area;
-  paint('프로필 목록','book',`<div class="paper">${picker()}<div class="rule"></div><div class="rows" id="list"></div></div>`,{nav:tabs('people')});wireTabs();
-  const v=epoch;
-  async function refresh(){const area=selectedArea=areaOf();const items=await api('people?area='+encodeURIComponent(area));if(v!==epoch||area!==selectedArea)return;
-    $('#list').innerHTML=items.map(p=>row(p.id,p.nick,p.year+'년생 · '+p.gender)).join('')||'<p class="empty">이 지역에 다른 회원이 아직 없어요.</p>';rows(items,profile);}
-  wirePicker(selectedArea,()=>refresh().catch(err));await refresh();
+function scopeControls(scope){
+  const choice=(regional,label)=>`<button type="button" id="scope-${regional?'area':'all'}" aria-pressed="${Boolean(scope.regional)===regional}">${label}</button>`;
+  return '<div class="scope-switch" role="group" aria-label="조회 범위">'+choice(false,'전체')+choice(true,'지역별')+'</div>'+
+    (scope.regional?picker():'');
+}
+async function scopedDirectory(key,endpoint,title,mark,renderRows,open,empty,{back,sub,extra='',wireExtra,live=false}={}){
+  const scope=scopes[key];
+  paint(title,mark,extra+'<section class="paper">'+scopeControls(scope)+'<div class="rule"></div><div id="list" class="rows" aria-live="polite"></div></section>',
+    {back,sub,nav:back?'':tabs(key)});
+  if(!back)wireTabs();
+  if(wireExtra)wireExtra();
+  const current=epoch,list=$('#list');
+  const reload=()=>scopedDirectory(key,endpoint,title,mark,renderRows,open,empty,{back,sub,extra,wireExtra,live});
+  const change=regional=>{if(Boolean(scope.regional)===regional)return;scope.regional=regional;return reload();};
+  on('#scope-all','click',()=>change(false));
+  on('#scope-area','click',()=>change(true));
+  let request=0,pending=false;
+  async function refresh(fromTimer=false){
+    if(fromTimer && pending)return;
+    const id=++request;pending=true;
+    const query=scope.regional?'?area='+encodeURIComponent(scope.area):'';
+    try{
+      const items=await api(endpoint+query);
+      if(current!==epoch || id!==request)return;
+      list.innerHTML=items.map(renderRows).join('')||'<p class="empty">'+esc(empty(scope.regional))+'</p>';
+      rows(items,open);
+    }catch(e){
+      if(current!==epoch || id!==request)return;
+      list.replaceChildren();
+      if(key==='monitor' && e.status===401){adminLogin();return;}
+      err(e);
+    }finally{if(id===request)pending=false;}
+  }
+  if(scope.regional){
+    regions||=await api('regions');
+    if(current!==epoch)return;
+    wirePicker(scope.area||me?.area||'',()=>{scope.area=areaOf();list.replaceChildren();void refresh();});
+    scope.area=areaOf();
+  }
+  await refresh();
+  if(live && current===epoch)activeTimer=setInterval(()=>{if(!document.hidden)void refresh(true);},4000);
+}
+function people(){
+  return scopedDirectory('people','people','프로필 목록','book',
+    p=>row(p.id,p.nick,p.area+' · '+p.year+'년생 · '+p.gender),profile,
+    regional=>regional?'이 지역에 다른 회원이 아직 없어요.':'아직 표시할 다른 회원이 없어요.');
 }
 function profile(p){
   paint(p.nick,'book',`<article class="paper"><p class="sub">${esc(p.year)}년생 · ${esc(p.gender)} · ${esc(p.area)}</p><div class="rule"></div><h2>성향 메모</h2><p class="memo">${esc(p.memo)}</p>${actions(act('start','대화하기','primary'))}</article>`,{back:people});
-  main.insertAdjacentHTML('beforeend',actions(act('report','프로필 신고'),act('block','사용자 차단','danger')));
+  $('#sections').insertAdjacentHTML('beforeend',actions(act('report','프로필 신고'),act('block','사용자 차단','danger')));
   on('#report','click',()=>reportUI({kind:'profile',peer:p.id},()=>profile(p)));on('#block','click',()=>blockPeer(p.id,people));
-  on('#start','click',async()=>{const r=await api('room',{peer:p.id});await conversation(r.id,p.nick,false,rooms,p.id);});
+  on('#start','click',async()=>{const r=await api('room',{peer:p.id});await conversation(r.id,p.nick,false,rooms,p.id,p.area);});
 }
-async function rooms(){
-  paint('내 대화','chat','<section class="paper"><div class="rows" id="list"></div></section>',{nav:tabs('rooms')});wireTabs();const v=epoch;
-  async function refresh(){const items=await api('rooms');if(v!==epoch)return;
-    $('#list').innerHTML=items.map(r=>row(r.id,r.nick,r.area)).join('')||'<p class="empty">프로필을 열고 첫 대화를 시작해 보세요.</p>';rows(items,r=>conversation(r.id,r.nick,false,rooms,r.peer));}
-  await refresh();if(v===epoch)activeTimer=setInterval(()=>refresh().catch(err),4000);
+function rooms(){
+  return scopedDirectory('rooms','rooms','내 대화','chat',r=>row(r.id,r.nick,r.area),
+    r=>conversation(r.id,r.nick,false,rooms,r.peer,r.area),
+    regional=>regional?'선택한 지역의 회원과 나눈 대화가 없어요.':'프로필을 열고 첫 대화를 시작해 보세요.',{live:true});
 }
 function settings(){
   paint('내 설정','settings',`<div class="paper"><h2>${esc(me.nick)}</h2><p class="sub">${esc(me.year)}년생 · ${esc(me.gender)} · ${esc(me.area)}</p><div class="rule"></div><p class="memo">${esc(me.memo)}</p>${actions(act('logout','로그아웃'),act('withdraw','회원탈퇴','danger'))}</div>`,{nav:tabs('settings')});
-  main.insertAdjacentHTML('beforeend',actions(act('recovery','개인 복구코드 보기'),act('blocked','차단한 사용자'))+rulesCard());
-  if(applePush || androidPush){
-    main.insertAdjacentHTML('beforeend',`<section class="paper"><h2>채팅 알림</h2><p id="push-state">${esc(pushLabels[pushState])}</p>${actions(act('push-check','다시 연결'),act('push-settings','휴대폰 알림 설정'))}</section>`);
-    on('#push-check','click',()=>syncPush(true));
-    on('#push-settings','click',()=>{if(applePush)return applePush.postMessage('settings');location.href='paperchat://push/settings';});
-  }
+  $('#sections').insertAdjacentHTML('beforeend',actions(act('recovery','개인 복구코드 보기'),act('blocked','차단한 사용자'))+rulesCard());
   wireTabs();accountActions();on('#recovery','click',()=>recoveryPage(settings));on('#blocked','click',blockedList);
 }
 async function jpeg(file){
@@ -251,13 +283,13 @@ function message(m,isAdmin){
   const body=labels[m.visibility]||(m.expires?(m.viewable && m.expires>Date.now()?`<img draggable="false" alt="대화 사진" src="/api/${isAdmin?'admin/':''}photos/${m.id}">`:'보관 기간이 지난 사진이에요.'):esc(m.body));
   return `<article class="msg ${!isAdmin&&m.author===me?.id?'mine':''}"><span class="by">${esc(m.nick)}</span><div class="bubble msgText">${body}</div><time class="time">${esc(when)}</time>${!isAdmin&&m.author!==me?.id?`<button type="button" class="textBtn" data-report="${m.id}">신고</button>`:''}</article>`;
 }
-async function conversation(id,title,isAdmin,back,peer){
+async function conversation(id,title,isAdmin,back,peer,area=''){
   const endpoint=(isAdmin?'admin/':'')+'rooms/'+encodeURIComponent(id)+'/messages';
   const composer=`<form class="compose paper"><label for="body">메시지</label><textarea id="body" name="body" maxlength="2000" rows="2" placeholder="전하고 싶은 말을 적어주세요."></textarea><input hidden class="off" id="photo" type="file" accept="image/*">${actions(act('attach',icon('photo')+'사진 보내기','secondary'),btn('보내기'))}</form>`;
-  paint(title,'chat',`${act('older','이전 메시지','textBtn')}<div class="log" id="log"></div>${isAdmin?'':composer}`,{back,sub:isAdmin?'운영자 열람 화면':'사진은 운영자가 승인한 후 표시되며 전송 12시간 뒤 만료돼요.'});
-  const reopen=()=>conversation(id,title,isAdmin,back,peer);
+  paint(title,'chat',`${act('older','이전 메시지','textBtn')}<div class="log" id="log"></div>${isAdmin?'':composer}`,{back,sub:[area,isAdmin?'운영자 열람 화면':'사진은 운영자가 승인한 후 표시되며 전송 12시간 뒤 만료돼요.'].filter(Boolean).join(' · ')});
+  const reopen=()=>conversation(id,title,isAdmin,back,peer,area);
   if(!isAdmin){
-    main.insertAdjacentHTML('beforeend',actions(act('block','상대 차단','danger')));
+    $('#sections').insertAdjacentHTML('beforeend',actions(act('block','상대 차단','danger')));
     on('#block','click',()=>blockPeer(peer,rooms));
     on('#log','click',e=>{
       const target=e.target.closest('[data-report]');if(target)return reportUI({kind:'message',message:Number(target.dataset.report)},reopen);
@@ -370,7 +402,7 @@ async function reviewList(){
 function reviewItem(item,isPhoto){
   const picture=isPhoto?item.id:item.photo;
   const outcome=async action=>{await api('admin/review',{kind:isPhoto?'photo':'report',id:item.id,action});await reviewList();note('검토 결과를 반영했어요.');};
-  paint(isPhoto?'사진 검토':'신고 검토','mail',`<section class="paper"><h2>${esc(item.nick)}</h2><p>${isPhoto||item.message?'보낸 회원':'프로필 작성자'} · ${esc(item.area)}</p>${act('sender','가입자 정보 보기','secondary')}${isPhoto?'':act('reporter','신고자 정보 보기')}<div class="rule"></div><p>${esc(isPhoto?'사진 만료 · '+at(item.expires):item.reason)}</p>${item.excerpt?`<p class="memo">${esc(item.excerpt)}</p>`:''}${picture?act('showPhoto','검토용 사진 열기'):''}<div id="preview"></div>${isPhoto?actions('<button disabled type="button" id="approve" class="primary">사진 승인</button>',act('deny','사진 거절','danger')):actions(act('dismissReport','위반 없음'),act('remove','콘텐츠 삭제','danger'),act('suspend','삭제 및 30일 이용 제한','danger'))}</section>`,{back:reviewList});
+  paint(isPhoto?'사진 검토':'신고 검토','mail',`<section class="paper"><h2>${esc(item.nick)}</h2><p>${isPhoto||item.message?'보낸 회원':'프로필 작성자'} · ${esc(item.area)}</p>${actions(act('sender','가입자 정보 보기','secondary'),isPhoto?'':act('reporter','신고자 정보 보기'))}<div class="rule"></div><p>${esc(isPhoto?'사진 만료 · '+at(item.expires):item.reason)}</p>${item.excerpt?`<p class="memo">${esc(item.excerpt)}</p>`:''}${picture?act('showPhoto','검토용 사진 열기'):''}<div id="preview"></div>${isPhoto?actions('<button disabled type="button" id="approve" class="primary">사진 승인</button>',act('deny','사진 거절','danger')):actions(act('dismissReport','위반 없음'),act('remove','콘텐츠 삭제','danger'),act('suspend','삭제 및 30일 이용 제한','danger'))}</section>`,{back:reviewList});
   const reopen=()=>reviewItem(item,isPhoto);
   on('#sender','click',()=>memberDetail(item.sender,reopen));on('#reporter','click',()=>memberDetail(item.reporter,reopen));
   on('#showPhoto','click',()=>{
@@ -387,11 +419,11 @@ function reviewItem(item,isPhoto){
 async function adminHome(){
   try{await api('admin/settings');}catch(e){if(e.status===401){adminLogin();return;}throw e;}
   adminPrivate=true;
-  paint('운영자 관리실','settings',`<div class="grid adminGrid">${menu('url','mail','인증폼 주소','발급 신청서 연결') }${menu('monitor','chat','대화 모니터링','지역별 대화 열람')}${menu('members','book','가입자 현황','가입·탈퇴 회원 조회')}${menu('reset','bin','서버 초기화','서비스 데이터 전체 삭제','destructive')}</div>${act('out','관리자 로그아웃','textBtn')}`,{wide:true});
+  paint('운영자 관리실','settings',`<div class="grid adminGrid">${menu('url','mail','인증폼 주소','발급 신청서 연결') }${menu('monitor','chat','대화 모니터링','전체·지역별 대화 열람')}${menu('members','book','가입자 현황','가입·탈퇴 회원 조회')}${menu('reset','bin','서버 초기화','서비스 데이터 전체 삭제','destructive')}</div>${act('out','관리자 로그아웃','textBtn')}`,{wide:true});
   on('#members','click',()=>membersPage());on('#url','click',adminURL);on('#monitor','click',monitor);on('#reset','click',reset);on('#out','click',async()=>{await api('admin/logout',{});adminLogin();});
 }
 function adminLogin(){
-  adminPrivate=false;
+  adminPrivate=false;scopes.monitor={};
   paint('관리자 로그인','key',`<form class="paper">${field('key','관리자 보안키','type="password" autocomplete="current-password" maxlength="256"')}<p class="note">발급 서버에서 승인한 관리자 보안키를 입력해 주세요.</p>${actions(btn('로그인'))}</form>`);
   form(async f=>{await api('admin/login',{key:f.get('key')});await adminHome();});
 }
@@ -400,16 +432,14 @@ async function adminURL(){
   paint('인증폼 주소','mail',`<form class="paper">${field('url','발급 신청서 URL',`type="url" placeholder="https://" value="${esc(c.url)}"`)}<p class="note">저장하면 앱의 발급 신청 버튼에 바로 반영돼요.</p>${actions(btn('주소 저장'))}</form>`,{back:adminHome});
   form(async f=>{await api('admin/settings',{url:f.get('url')});note('인증폼 주소를 저장했어요.');});
 }
-let monitorArea='';
-async function monitor(){
-  regions||=await api('regions');
-  paint('지역별 대화 모니터링','pin',`<section class="paper">${picker()}<div class="rule"></div><h2>대화 목록</h2><div id="list" class="rows"></div></section>`,{back:adminHome,sub:'선택한 지역의 회원이 참여한 대화를 열람해요.'});
-  main.insertAdjacentHTML('afterbegin',actions(act('reviewQueue','사진·신고 검토','primary')));on('#reviewQueue','click',reviewList);
-  const v=epoch;
-  async function refresh(){const area=monitorArea=areaOf(), items=await api('admin/rooms?area='+encodeURIComponent(area));if(v!==epoch||area!==monitorArea)return;
-    $('#list').innerHTML=items.map(r=>row(r.id,r.first+' · '+r.second,r.recent?new Date(r.recent).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'}):'새 대화')).join('')||'<p class="empty">이 지역의 대화가 아직 없어요.</p>';
-    rows(items,r=>conversation(r.id,r.first+' · '+r.second,true,monitor));}
-  wirePicker(monitorArea,()=>refresh().catch(err));await refresh();if(v===epoch)activeTimer=setInterval(()=>refresh().catch(err),4000);
+function monitor(){
+  const participants=r=>r.first+' ('+r.firstArea+') · '+r.second+' ('+r.secondArea+')';
+  return scopedDirectory('monitor','admin/rooms','대화 모니터링','chat',
+    r=>row(r.id,participants(r),r.recent?at(r.recent):'새 대화'),
+    r=>conversation(r.id,r.first+' · '+r.second,true,monitor,null,participants(r)),
+    regional=>regional?'이 지역의 회원이 참여한 대화가 없어요.':'아직 대화가 없어요.',
+    {back:adminHome,sub:'지역별 목록에는 두 참여자 중 한 명이라도 선택한 지역에 속한 대화가 표시돼요.',
+     extra:actions(act('reviewQueue','사진·신고 검토','primary')),wireExtra:()=>on('#reviewQueue','click',reviewList),live:true});
 }
 function reset(){
   paint('서버 초기화','bin',`<form class="paper"><p>회원, 프로필, 대화, 사진, 로그인 정보, 탈퇴 후 24시간 현황, 실명·전화번호, 신고·제재·차단·동의 기록과 발급 폼 주소까지 모두 지워요. 사용자 앱은 다음 연결 때 초기화됩니다.</p>${field('key','로그인한 관리자 보안키','type="password" maxlength="256" autocomplete="current-password"')}${field('confirm','확인을 위해 ‘전체 삭제’ 입력','autocomplete="off"')}${actions(btn('전체 삭제','danger fill'))}</form>`,{back:adminHome});
@@ -451,7 +481,7 @@ function pulse(protect=false){
       if(leaving)return;
       if(admin && adminPrivate && !status.adminSignedIn){adminLogin();note('관리자 로그인이 종료됐어요.');}
       if(!admin && ['member','restricted','policy'].includes(stage) && status.stage!==stage){
-        if(status.stage==='gate'){me=null;selectedArea='';await boot();err(new Error('사용자 정보가 없거나 로그인이 종료되었어요. 다시 인증해 주세요.'));}
+        if(status.stage==='gate'){me=null;resetScopes();await boot();err(new Error('사용자 정보가 없거나 로그인이 종료되었어요. 다시 인증해 주세요.'));}
         else await boot();
       }
       if(status.stage==='member')void syncPush(protect);
