@@ -1,6 +1,7 @@
 import {policyVersion,rules,reasons} from './rules.js';
 const main=document.querySelector('#app');
 const admin=location.pathname==='/admin';
+if(admin)document.title='종이편지 · 운영자 관리실';
 const $=s=>document.querySelector(s);
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const paths={
@@ -85,13 +86,13 @@ function recordVersion(version){
     leaving=true;clearInterval(activeTimer);epoch++;me=null;selectedArea='';stage='gate';
     for(const k of Object.keys(draft))draft[k]='';
     sessionStorage.clear();
-    main.replaceChildren();location.replace(admin?'/admin?reset=1':'/?reset=1');
+    main.replaceChildren();location.replace(admin?'/admin?reset=1':'/app?reset=1');
     throw new Error('서버가 초기화되어 사용자 정보가 없어요.');
   }
 }
 function accountActions(){
-  on('#logout','click',async()=>{await api('logout',{});location.replace('/');});
-  on('#withdraw','click',()=>modal('회원탈퇴','프로필, 실명·연락처와 참여한 대화가 삭제돼요. 관리자 현황에는 닉네임과 탈퇴 시각이 24시간 표시돼요. 일반 재가입은 24시간 후, 이용 제한 중이면 제한 종료 후 가능해요.','탈퇴하기',async()=>{await api('withdraw',{confirm:true});location.replace('/');}));
+  on('#logout','click',async()=>{await api('logout',{});location.replace('/app');});
+  on('#withdraw','click',()=>modal('회원탈퇴','프로필, 실명·연락처와 참여한 대화가 삭제돼요. 관리자 현황에는 닉네임과 탈퇴 시각이 24시간 표시돼요. 일반 재가입은 24시간 후, 이용 제한 중이면 제한 종료 후 가능해요.','탈퇴하기',async()=>{await api('withdraw',{confirm:true});location.replace('/app');}));
 }
 function limitedPage(state){
   const renewal=state==='contact',policy=state==='policy';
@@ -99,7 +100,7 @@ function limitedPage(state){
     (policy?`<form class="paper"><label class="check"><input required type="checkbox">이용규칙에 동의해요.</label>${actions(btn('확인하고 계속'))}</form>`:renewal?actions(act('renew','휴대폰으로 다시 인증','primary')):'<p>신고 검토 결과에 따라 계정 이용이 제한되었어요.</p>')+
     actions(act('logout','로그아웃'),act('withdraw','회원탈퇴','danger')));
   if(policy)form(async()=>{await api('policy',{version:policyVersion});await boot();});
-  if(renewal)on('#renew','click',async()=>{await api('logout',{});location.replace('/');});
+  if(renewal)on('#renew','click',async()=>{await api('logout',{});location.replace('/app');});
   accountActions();
 }
 function reportUI(target,back){
@@ -115,7 +116,7 @@ async function blockedList(){
   rows(items,i=>modal('차단 해제',i.nick+'님의 차단을 해제할까요?','해제하기',async()=>{await api('blocks',{peer:i.id,remove:true});await blockedList();}));
 }
 function gate(){
-  paint('인증키를 입력해 주세요','key',`<form class="paper">${field('code','발급받은 인증키','autocomplete="off" maxlength="256" placeholder="인증키 입력"')}${actions(btn('인증하고 계속'))}</form><aside class="letter"><h2>${icon('mail')}인증키 발급 안내</h2><p>신청서를 작성한 뒤 발급받은 키를 입력해 주세요.</p><div class="rule"></div><a class="btn forest" href="/apply">발급 신청서 열기</a></aside>`);
+  paint('인증키를 입력해 주세요','key',`<form class="paper">${field('code','발급받은 일반 인증키','autocomplete="off" maxlength="256" placeholder="인증키 입력"')}${actions(btn('인증하고 계속'))}</form><aside class="letter"><h2>${icon('mail')}인증키 발급 안내</h2><p>신청서를 작성한 뒤 발급받은 키를 입력해 주세요.</p><div class="rule"></div><a class="btn forest" href="/apply">발급 신청서 열기</a></aside>`);
   main.insertAdjacentHTML('beforeend',rulesCard());
   form(async f=>{await api('key',{code:f.get('code')});nick();});
   if(new URLSearchParams(location.search).has('reset'))err(new Error('서버가 초기화되어 등록된 사용자 정보가 없습니다. 다시 가입해 주세요.'));
@@ -406,7 +407,7 @@ async function boot(){
   if(stage==='member'){
     void syncPush(true);
     if(new URLSearchParams(location.search).get('inbox')==='1'){
-      history.replaceState(null,'','/');await rooms();
+      history.replaceState(null,'','/app');await rooms();
     }else await people();
     return;
   }
@@ -417,7 +418,7 @@ async function start(){
   await api('status');
   if(admin){await adminHome();return;}
   if(location.pathname==='/identity-return'){
-    const q=new URLSearchParams(location.search);history.replaceState(null,'','/');
+    const q=new URLSearchParams(location.search);history.replaceState(null,'','/app');
     try{if(q.has('code'))throw new Error('본인인증이 완료되지 않았어요.');await completeIdentity(q.get('identityVerificationId'));}
     catch(e){await boot();err(e);}return;
   }
