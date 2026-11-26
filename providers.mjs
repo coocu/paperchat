@@ -18,28 +18,22 @@ export const providers = {
     const endpoint=process.env.KEY_CHECK_URL || 'https://poketserver.onrender.com/app/check';
     if (new URL(endpoint).protocol!=='https:') reject(503,'인증 서버 주소를 확인해 주세요.');
     return remote(endpoint,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({code})});
-  },
-  async verify(id,store) {
-    const secret=process.env.PORTONE_API_SECRET;
-    if (!secret) reject(503,'통신사 인증이 아직 연결되지 않았어요.');
-    const url=new URL('https://api.portone.io/identity-verifications/'+encodeURIComponent(id));
-    url.searchParams.set('storeId',store);
-    return remote(url,{
-      headers:{Authorization:'PortOne '+secret}
-    });
   }
 };
-export function adultInfo(v, today=new Date(Date.now()+9*3600000).toISOString().slice(0,10)) {
-  const c=v?.verifiedCustomer;
-  if (v?.status!=='VERIFIED' || !c?.di || !['MALE','FEMALE'].includes(c.gender))
-    reject(403,'통신사가 확인한 본인 정보가 필요해요.');
-  const birth=c.birthDate;
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(birth)) reject(403,'생년월일을 확인할 수 없어요.');
-  const date=new Date(birth+'T00:00:00Z');
-  if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0,10)!==birth)
-    reject(403,'생년월일을 확인할 수 없어요.');
-  const year=Number(birth.slice(0,4));
-  const age=Number(today.slice(0,4))-year-(today.slice(5)<birth.slice(5)?1:0);
-  if (age<19) reject(403,'만 19세 생일부터 가입할 수 있어요.');
-  return {di:c.di,year,gender:c.gender==='MALE'?'남성':'여성'};
+
+export function profileDetails(input, now=Date.now()) {
+  const birthDate = input.birthDate;
+  if (typeof birthDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(birthDate))
+    reject(400,'생년월일을 입력해 주세요.');
+  const calendarDate = new Date(birthDate + 'T00:00:00Z');
+  const today = new Date(now + 9 * 3600_000).toISOString().slice(0,10);
+  if (!Number.isFinite(calendarDate.getTime()) || calendarDate.toISOString().slice(0,10) !== birthDate ||
+      birthDate < '1900-01-01' || birthDate > today)
+    reject(400,'올바른 생년월일을 입력해 주세요.');
+  const year = calendarDate.getUTCFullYear();
+  const age = Number(today.slice(0,4)) - year - (today.slice(5) < birthDate.slice(5) ? 1 : 0);
+  if (age < 19) reject(403,'만 19세 생일부터 가입할 수 있어요.');
+  if (!['남성','여성'].includes(input.gender))
+    reject(400,'성별을 선택해 주세요.');
+  return {year, gender:input.gender};
 }

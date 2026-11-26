@@ -21,7 +21,7 @@ function browser({version,search='',fetchReply}){
     return nodes.get(k);
   }
   const storage=map=>({getItem:k=>map.get(k)||null,setItem:(k,v)=>map.set(k,v),clear:()=>map.clear()});
-  const location={pathname:'/',search,replace(url){this.redirect=url;}};
+  const location={pathname:'/app',search,replace(url){this.redirect=url;}};
   const ctx=createContext({document:{querySelector:element,querySelectorAll:()=>[],hidden:false,addEventListener(){}},
     location,window:{addEventListener(){},scrollTo(){}},setInterval:()=>42,clearInterval(){},setTimeout:()=>7,clearTimeout,AbortController,
     policyVersion,reasons,rules,sessionStorage:storage(session),localStorage:storage(local),
@@ -34,7 +34,7 @@ test('열린 앱에서 초기화를 감지하면 현재 화면과 가입 초안�
   b.element('#app').innerHTML='이전 회원의 대화';b.session.set('draft','이전 정보');
   b.run("stage='member';me={nick:'이전 회원'};draft.memo='입력중';selectedArea='경기도 이천시'");
   await b.run('pulse(true)');
-  assert.equal(b.location.redirect,'/?reset=1');assert.equal(b.element('#app').innerHTML,'');assert.equal(b.session.size,0);
+  assert.equal(b.location.redirect,'/app?reset=1');assert.equal(b.element('#app').innerHTML,'');assert.equal(b.session.size,0);
   assert.equal(b.run('me'),null);assert.equal(b.run('draft.memo'),'');assert.equal(b.local.get('paperchat.reset'),'fresh');
   const reloaded=browser({version:'fresh',search:'?reset=1',fetchReply:()=>({version:'fresh',stage:'gate'})});
   await reloaded.run('boot()');assert.match(reloaded.element('#error').textContent,/등록된 사용자 정보가 없습니다/);
@@ -56,4 +56,21 @@ test('운영자의 발신자 상세 이동은 닉네임이 같아도 선택된 �
   await b.element('#sender').handlers.click({});
   assert.deepEqual(paths,['/api/admin/members/sender-2']);
   assert.match(b.element('#app').innerHTML,/검증회원2/);assert.match(b.element('#app').innerHTML,/01000000002/);
+});
+
+test('가입키 화면의 카드 간격, 기존 회원 로그인과 직접 입력 화면을 확인한다',async()=>{
+  const requests=[];
+  const b=browser({version:'one',fetchReply:url=>{requests.push(url);return {stage:'gate',version:'one'};}});
+  await b.run('boot()');
+  const gate=b.element('#app').innerHTML;
+  assert.match(gate,/class="invite-stack"/);
+  assert.equal((gate.match(/id="error"/g)||[]).length,1);
+  assert.match(gate,/인증하고 계속[\s\S]*기존 회원 로그인[\s\S]*인증키 발급 안내[\s\S]*이용규칙/);
+  await b.element('#existing').handlers.click({});
+  assert.match(b.element('#app').innerHTML,/개인 복구코드/);
+  assert.deepEqual(requests,['/api/state']);
+  b.run("draft.nick='채팅';details()");
+  const page=b.element('#app').innerHTML;
+  assert.match(page,/생년월일/);assert.match(page,/type="date"/);assert.match(page,/남자/);assert.match(page,/여자/);
+  assert.match(page,/만 19세/);assert.doesNotMatch(page,/전화번호|통신사/);
 });

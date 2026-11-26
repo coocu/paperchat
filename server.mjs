@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
 import { openStore, hour, transaction, clean, tables } from './store.mjs';
-import { providers, reject, adultInfo, RequestError } from './providers.mjs';
+import { providers, reject, profileDetails, RequestError } from './providers.mjs';
 
 import { textVault } from './vault.mjs';
 import { contactVault } from './contacts.mjs';
@@ -16,7 +16,7 @@ import { policyVersion } from './public/rules.js';
 const regions=JSON.parse(readFileSync(new URL('./regions.json',import.meta.url)));
 const areas=new Set(Object.entries(regions).flatMap(([p,ds])=>ds.map(d=>p+' '+d)));
 const profileCols='id,nick,year,gender,area,memo';
-const assets=new Map(Object.entries({'/':'index.html','/admin':'index.html','/identity-return':'index.html','/app.js':'app.js','/theme.css':'theme.css','/icon.svg':'icon.svg','/headings.woff':'headings.woff','/rules.js':'rules.js'}));
+const assets=new Map(Object.entries({'/app':'index.html','/admin':'index.html','/app.js':'app.js','/theme.css':'theme.css','/icon.svg':'icon.svg','/headings.woff':'headings.woff','/rules.js':'rules.js'}));
 const type={html:'text/html',js:'text/javascript',css:'text/css',svg:'image/svg+xml',woff:'font/woff'};
 const token=()=>randomBytes(32).toString('hex');
 const digest=s=>createHash('sha256').update(s).digest();
@@ -89,10 +89,32 @@ export function makeServer(config, upstream=providers) {
     }
     return Boolean(get("SELECT 1 FROM sessions WHERE id=? AND kind='admin' AND expires>?",s.id,Date.now()));
   }
-  function saveContact(id,claim,isNew) {
-    run(`INSERT INTO contacts VALUES(?,?,?,?,?) ON CONFLICT(member) DO UPDATE SET
-      encrypted=excluded.encrypted,consented=excluded.consented,verified=excluded.verified`,
-      id,claim.encrypted,claim.consented,Date.now(),isNew?Date.now():null);
+  function recoveryCode(member) {
+    return h('recovery-code-v1',member).slice(0,32).toUpperCase().match(/.{4}/g).join('-');
+  }
+  function proof(code) { return h('recovery-index',code.replace(/[-\s]/g,'').toUpperCase()); }
+  const attachKey=db.prepare('INSERT INTO account_keys(member,proof,joined) VALUES(?,?,?)');
+  transaction(db,()=>{
+    for(const m of all('SELECT id FROM members WHERE id NOT IN (SELECT member FROM account_keys)'))
+      attachKey.run(m.id,proof(recoveryCode(m.id)),null);
+    if(!get("SELECT 1 FROM service_meta WHERE key='signup-birth-date'")) {
+      run("UPDATE sessions SET kind='gate_ok',year=NULL,gender=NULL WHERE kind='details'");
+      run("INSERT INTO service_meta VALUES('signup-birth-date','1')");
+    }
+    // Old in-progress carrier claims cannot complete registration in the new flow.
+    run("DELETE FROM sessions WHERE kind='verified' OR (kind='gate_ok' AND identity IS NULL)");
+  });
+  function device(req,res) {
+    if(req.installId)return req.installId;
+    let raw=(req.headers.cookie || '').split(';').map(c=>c.trim()).find(c=>c.startsWith('pc_install='))?.slice(11);
+    if(!/^[a-f0-9]{64}$/.test(raw || '')) {
+      raw=token();cookie(res,'pc_install',raw,365*24*hour);
+    }
+    req.installId=h('install',raw);return req.installId;
+  }
+  function checkSignup(identity) {
+    cooldown(identity);
+    if(safety.restricted(identity))reject(403,'이용 제한 기간에는 가입할 수 없어요.');
   }
   function throttle(key,max,window) {
     const k=h('rate',key), now=Date.now();
@@ -100,17 +122,21 @@ export function makeServer(config, upstream=providers) {
     if(get('SELECT hits FROM attempts WHERE key=?',k).hits>max) reject(429,'시도가 많아요. 잠시 후 다시 시도해 주세요.');
   }
   function cookie(res,name,value,ttl) {
-    res.setHeader('Set-Cookie',name+'='+value+'; Path=/; HttpOnly; SameSite=Lax; Max-Age='+Math.floor(ttl/1000)+(secure?'; Secure':''));
+    const previous=res.getHeader('Set-Cookie') || [];
+    res.setHeader('Set-Cookie',[...previous,name+'='+value+'; Path=/; HttpOnly; SameSite=Lax; Max-Age='+Math.floor(ttl/1000)+(secure?'; Secure':'')]);
   }
   function issue(res,kind,ttl,member=null,adminCredential=null) {
     const raw=token(),id=h('session',raw);
     run('INSERT INTO sessions(id,kind,expires,member) VALUES(?,?,?,?)',id,kind,Date.now()+ttl,member);
     if(adminCredential)run('INSERT INTO admin_session_proofs(session,sealed) VALUES(?,?)',id,adminVault.seal(adminCredential,id));
     cookie(res,kind==='admin'?'pc_admin':'pc_user',raw,ttl);
+    return id;
+  }
+  function cookieValue(req,name) {
+    return (req.headers.cookie||'').split(';').map(s=>s.trim()).find(s=>s.startsWith(name+'='))?.slice(name.length+1);
   }
   function sessions(req,admin=false) {
-    const name=admin?'pc_admin':'pc_user';
-    const v=(req.headers.cookie||'').split(';').map(s=>s.trim()).find(s=>s.startsWith(name+'='))?.slice(name.length+1);
+    const v=cookieValue(req,admin?'pc_admin':'pc_user');
     if(!v || !/^[a-f0-9]{64}$/.test(v)) return;
     const id=h('session',v), now=Date.now();
     if(admin)return get(`SELECT s.*,p.sealed AS proof FROM sessions s JOIN admin_session_proofs p ON p.session=s.id
@@ -163,6 +189,21 @@ export function makeServer(config, upstream=providers) {
     const ip=(process.env.RENDER==='true'?String(req.headers['x-forwarded-for']||'').split(',').at(-1).trim():'')||req.socket.remoteAddress;
     if(!post && req.method!=='GET') reject(405,'허용되지 않은 요청이에요.');
     const ok=(data={})=>finish(res,200,data);
+    // Select the UI only. Each data API checks its own session and permissions.
+    const ua=req.headers['user-agent'] || '';
+    const native=/\bPaperChat(?:Android|IOS)\/\d+\b/.test(ua);
+    // Support previously installed iOS shells until they adopt the app marker.
+    const oldWebView=/AppleWebKit\//.test(ua) && /Mobile\//.test(ua) && !/Safari\//.test(ua);
+    const mobile=native || oldWebView;
+    if(!post && (p==='/' || p==='/admin/' || p==='/app/' || (p==='/app' && !mobile) || p==='/identity-return')) {
+      const destination=mobile && p!=='/admin/' ? '/app'+u.search : '/admin';
+      res.writeHead(302,{Location:destination,Vary:'User-Agent'});return res.end();
+    }
+    if(!post && p==='/api/push/availability') {
+      const available=platform=>Boolean(delivery.enabled(platform));
+      return ok({android:Boolean(delivery.androidClient) && available('android'),
+        'ios-dev':available('ios-dev'),'ios-prod':available('ios-prod')});
+    }
     if(!post && assets.has(p)) {
       const file=assets.get(p);
       return finish(res,200,readFileSync(new URL('./public/'+file,import.meta.url)),type[file.split('.').at(-1)]+'; charset=utf-8');
@@ -173,7 +214,10 @@ export function makeServer(config, upstream=providers) {
     if(!post && p==='/health') return ok({ok:true});
     if(!post && p==='/apply') {
       const link=configURL();
-      if(!link) {res.writeHead(303,{Location:'/?form=unavailable'});return res.end();}
+      if(!link) {
+        if(!mobile)return finish(res,200,'아직 등록된 인증키 발급 주소가 없습니다. 앱으로 돌아가 주세요.','text/plain; charset=utf-8');
+        res.writeHead(303,{Location:'/app?form=unavailable'});return res.end();
+      }
       res.writeHead(303,{Location:link});return res.end();
     }
     const revision=resetVersion();
@@ -206,86 +250,107 @@ export function makeServer(config, upstream=providers) {
       return ok(pushes.bind(s.id,b.platform,b.token));
     }
     if(!post && p==='/api/state') {
-      const s=sessions(req);
-      const lostClaim=s?.kind==='verified' && !get('SELECT 1 FROM pending_contacts WHERE session=? AND encrypted IS NOT NULL',s.id);
-      if(lostClaim)run('DELETE FROM sessions WHERE id=?',s.id);
-      const stage=lostClaim?'gate':s?.kind==='member'?safety.memberStage(s.member):(s?.kind||'gate');
-      return ok({stage,nick:s?.nick||'',profile:stage==='member'?get('SELECT '+profileCols+' FROM members WHERE id=?',s.member):null});
+      let s=sessions(req);
+      const install=device(req,res);
+      if(!s) {
+        const held=get('SELECT proof,pending_until FROM used_invites WHERE pending_device=? AND pending_until>?',install,Date.now());
+        if(held){
+          const sid=issue(res,'gate_ok',held.pending_until-Date.now());
+          run('UPDATE sessions SET identity=? WHERE id=?',held.proof,sid);
+          s={kind:'gate_ok'};
+        }
+      }
+      const stage=s?.kind==='member'?safety.memberStage(s.member):(s?.kind||'gate');
+      let needsRecoveryCopy=false;
+      if(s?.kind==='member') {
+        run('INSERT OR IGNORE INTO account_devices VALUES(?,?)',s.member,device(req,res));
+        needsRecoveryCopy=!get('SELECT saved FROM account_keys WHERE member=?',s.member)?.saved;
+      }
+      return ok({stage,nick:s?.nick||'',year:s?.year,gender:s?.gender,needsRecoveryCopy,
+        profile:stage==='member'?get('SELECT '+profileCols+' FROM members WHERE id=?',s.member):null});
     }
     if(!post && p==='/api/regions') return ok(regions);
     if(post && p==='/api/key') {
       throttle('key:'+ip,20,hour/4);
       const code=string(b.code,1,256,'인증키');
-      if(config.keyMarker && !code.toLowerCase().includes(config.keyMarker.toLowerCase())) reject(403,'이 앱에 발급된 인증키를 입력해 주세요.');
+      const invitation=h('invite',code.normalize('NFKC').toLowerCase());
+      const install=device(req,res);
+      const unused=()=>{
+        if(get('SELECT 1 FROM used_invites WHERE proof=?',invitation))reject(409,'이미 사용한 가입 인증키예요.');
+        if(get('SELECT 1 FROM used_invites WHERE pending_device=? AND pending_until>?',install,Date.now()))
+          reject(409,'이 기기에서 진행 중인 가입을 먼저 완료해 주세요.');
+      };
+      checkSignup(install);unused();
       const v=await upstream.check(code);
       if(v?.status==='pending') reject(403,'승인 대기 중이에요.');
       if(!registryApproved(v)) reject(403,'승인된 인증키를 확인해 주세요.');
       if(revision!==resetVersion()) reject(409,'서버가 초기화됐어요.');
-      const prev=sessions(req);
-      if(prev) run('DELETE FROM sessions WHERE id=?',prev.id);
-      issue(res,'gate_ok',hour);return ok();
-    }
-    if(post && p==='/api/identity/start') {
-      const s=need(req,'gate_ok');
-      if(!config.store || !config.channel) reject(503,'관리자가 통신사 인증을 연결한 뒤 이용할 수 있어요.');
-      if(b.disclosure!==policyVersion)reject(400,'이름·전화번호 수집 및 이용 안내를 확인해 주세요.');
-      const nick=b.login?'':string(b.nick,1,24,'닉네임');
-      if(nick)checkText(nick);
-      throttle('identity:'+ip,30,hour);
-      const id=randomUUID();
       transaction(db,()=>{
-        run('UPDATE sessions SET challenge=?,nick=? WHERE id=?',id,nick,s.id);
-        run('INSERT OR REPLACE INTO pending_contacts(session,challenge,consented) VALUES(?,?,?)',s.id,id,Date.now());
+        checkSignup(install);unused();
+        const prev=sessions(req);
+        if(prev?.kind==='member')reject(409,'이미 로그인한 계정이에요.');
+        if(prev)run('DELETE FROM sessions WHERE id=?',prev.id);
+        run('UPDATE used_invites SET pending_device=NULL,pending_until=NULL WHERE pending_device=?',install);
+        run('INSERT INTO used_invites VALUES(?,?,?)',invitation,install,Date.now()+24*hour);
+        const sid=issue(res,'gate_ok',24*hour);
+        run('UPDATE sessions SET identity=? WHERE id=?',invitation,sid);
       });
-      return ok({storeId:config.store,channelKey:config.channel,identityVerificationId:id,redirectUrl:base+'/identity-return',forceRedirect:true,bypass:{danal:{AGELIMIT:19}}});
+      return ok();
     }
-    if(post && p==='/api/identity/finish') {
-      const session=need(req,'gate_ok'), id=session.challenge;
-      if(!id || id!==b.id) reject(403,'본인인증을 처음부터 다시 진행해 주세요.');
-      const result=await upstream.verify(id,config.store);
-      if(config.liveOnly && (result.channel?.type!=='LIVE' || result.channel?.key!==config.channel))
-        reject(403,'운영 채널에서 인증한 결과가 필요해요.');
-      if(result.id!==id || (result.channel?.key && result.channel.key!==config.channel)) reject(403,'인증 내역이 일치하지 않아요.');
-      const info=adultInfo(result), ident=h('DI',info.di);
-      const stage=transaction(db,()=>{
-        const s=need(req,'gate_ok');
-        if(s.challenge!==id) reject(409,'이미 처리된 인증이에요.');
-        const consent=get('SELECT consented FROM pending_contacts WHERE session=? AND challenge=?',s.id,id);
-        if(!consent)reject(403,'인증 화면에서 개인정보 안내를 다시 확인해 주세요.');
-        cooldown(ident);
-        const claim={...consent,encrypted:vault.seal(result.verifiedCustomer,ident)};
-        const member=get('SELECT id FROM members WHERE identity=?',ident);
-        if(member) {
-          saveContact(member.id,claim,false);
-          run('DELETE FROM sessions WHERE id=?',s.id); issue(res,'member',24*30*hour,member.id);
-          return 'member';
-        }
-        if(safety.restricted(ident))reject(403,'이용 제한 기간에는 가입할 수 없어요.');
-        if(!s.nick) reject(404,'가입된 계정이 없어요. 닉네임을 입력하고 가입해 주세요.');
-        run('UPDATE pending_contacts SET encrypted=? WHERE session=?',claim.encrypted,s.id);
-        run("UPDATE sessions SET kind='verified',identity=?,year=?,gender=?,challenge=NULL WHERE id=?",ident,info.year,info.gender,s.id);
-        return 'verified';
+    if(post && p==='/api/profile-details') {
+      const s=sessions(req);
+      if(!s || !['gate_ok','details'].includes(s.kind))reject(401,'먼저 일반 인증키를 입력해 주세요.');
+      checkSignup(device(req,res));
+      const nick=string(b.nick,1,24,'닉네임');
+      checkText(nick);
+      const {year,gender}=profileDetails(b);
+      run("UPDATE sessions SET kind='details',year=?,gender=?,nick=? WHERE id=?",year,gender,nick,s.id);
+      return ok({stage:'details'});
+    }
+    if(post && p==='/api/account/login') {
+      const s=sessions(req);
+      throttle('recovery:'+ip,20,hour/4);
+      const code=string(b.code,1,64,'개인 복구코드');
+      const credential=proof(code);
+      const account=get('SELECT member FROM account_keys WHERE proof=?',credential);
+      if(!account) {
+        checkSignup(credential);
+        reject(403,'개인 복구코드를 확인해 주세요.');
+      }
+      transaction(db,()=>{
+        run('INSERT OR IGNORE INTO account_devices VALUES(?,?)',account.member,device(req,res));
+        if(s)run('DELETE FROM sessions WHERE id=?',s.id);
+        issue(res,'member',24*30*hour,account.member);
       });
-      return ok({stage});
+      return ok({stage:safety.memberStage(account.member)});
+    }
+    if(p==='/api/account/recovery') {
+      const s=need(req,'member',true);
+      if(!post)return ok({code:recoveryCode(s.member)});
+      if(b.saved!==true)reject(400,'코드를 따로 보관한 뒤 확인해 주세요.');
+      run('UPDATE account_keys SET saved=1 WHERE member=?',s.member);
+      return ok();
     }
     if(post && p==='/api/register') {
-      const s=need(req,'verified');cooldown(s.identity);
+      const s=need(req,'details');
+      const install=device(req,res);
+      checkSignup(install);
       if(!areas.has(b.area)) reject(400,'지역을 선택해 주세요.');
       const memo=string(b.memo,1,800,'성향 메모');
       checkText(memo);checkText(s.nick);
       if(b.policy!==policyVersion)reject(400,'이용규칙을 확인하고 동의해 주세요.');
-      if(safety.restricted(s.identity))reject(403,'이용 제한 기간에는 가입할 수 없어요.');
       transaction(db,()=>{
-        const claim=get('SELECT encrypted,consented FROM pending_contacts WHERE session=?',s.id);
-        if(!claim?.encrypted)reject(403,'휴대폰 본인인증을 다시 진행해 주세요.');
-        let id=get('SELECT id FROM members WHERE identity=?',s.identity)?.id;
-        const isNew=!id;
-        if(!id) {
-          id=randomUUID();
-          run('INSERT INTO members VALUES(?,?,?,?,?,?,?)',id,s.identity,s.nick,s.year,s.gender,b.area,memo);
-        }
-        saveContact(id,claim,isNew);safety.accept(id,b.policy);
-        run('DELETE FROM sessions WHERE id=?',s.id);issue(res,'member',24*30*hour,id);
+        const consumed=run('UPDATE used_invites SET pending_device=NULL,pending_until=NULL WHERE proof=? AND pending_device=? AND pending_until>?',s.identity,install,Date.now());
+        if(consumed.changes!==1)reject(409,'가입 요청이 만료되었거나 이미 처리됐어요.');
+        const id=randomUUID(),credential=proof(recoveryCode(id));
+        run('INSERT INTO members VALUES(?,?,?,?,?,?,?)',id,credential,s.nick,s.year,s.gender,b.area,memo);
+        attachKey.run(id,credential,Date.now());
+        run('INSERT INTO account_devices VALUES(?,?)',id,install);
+        safety.accept(id,b.policy);
+        // Keep this already-issued secret usable if the registration response is lost.
+        const ttl=24*30*hour;
+        run("UPDATE sessions SET kind='member',member=?,identity=NULL,nick=NULL,gender=NULL,year=NULL,expires=? WHERE id=?",id,Date.now()+ttl,s.id);
+        cookie(res,'pc_user',cookieValue(req,'pc_user'),ttl);
       });
       return ok();
     }
@@ -312,7 +377,13 @@ export function makeServer(config, upstream=providers) {
         const m=get('SELECT identity,nick FROM members WHERE id=?',s.member);
         const withdrawn=Date.now(),expires=withdrawn+24*hour;
         run('INSERT INTO departures VALUES(?,?,?,?)',s.member,m.nick,withdrawn,expires);
-        run('INSERT OR REPLACE INTO cooldowns VALUES(?,?)',m.identity,expires);
+        const devices=all('SELECT device FROM account_devices WHERE member=?',s.member).map(row=>row.device);
+        const keys=new Set([m.identity,proof(recoveryCode(s.member)),device(req,res),...devices]);
+        const restrictedUntil=safety.restricted(m.identity);
+        for(const key of keys) {
+          run('INSERT INTO cooldowns VALUES(?,?) ON CONFLICT(identity) DO UPDATE SET until=MAX(until,excluded.until)',key,expires);
+          if(restrictedUntil)run('INSERT INTO restrictions VALUES(?,?) ON CONFLICT(identity) DO UPDATE SET until=MAX(until,excluded.until)',key,restrictedUntil);
+        }
         run('DELETE FROM sessions WHERE identity=?',m.identity);
         run('DELETE FROM members WHERE id=?',s.member);
       });
@@ -394,16 +465,16 @@ export function makeServer(config, upstream=providers) {
         const counts={active:get('SELECT COUNT(*) AS n FROM members').n,
           withdrawn:get('SELECT COUNT(*) AS n FROM departures WHERE expires>?',now).n};
         const members=all(`SELECT * FROM (
-          SELECT p.id,p.nick,p.area,c.joined,'active' AS status,NULL AS withdrawn,NULL AS expires
-          FROM members p LEFT JOIN contacts c ON p.id=c.member
+          SELECT p.id,p.nick,p.area,COALESCE(k.joined,c.joined) AS joined,'active' AS status,NULL AS withdrawn,NULL AS expires
+          FROM members p LEFT JOIN account_keys k ON k.member=p.id LEFT JOIN contacts c ON p.id=c.member
           UNION ALL SELECT id,nick,NULL,NULL,'withdrawn',withdrawn,expires FROM departures WHERE expires>?
         ) ORDER BY status,nick,id LIMIT 51 OFFSET ?`,now,offset);
         return ok({items:members.slice(0,50),more:members.length>50,counts});
       }
       const memberPath=p.match(/^\/api\/admin\/members\/([a-f0-9-]+)$/);
       if(memberPath && !post){
-        const m=get(`SELECT p.id,p.nick,p.year,p.gender,p.area,p.memo,p.identity,c.encrypted,c.verified,c.joined
-          FROM members p LEFT JOIN contacts c ON c.member=p.id WHERE p.id=?`,memberPath[1]);
+        const m=get(`SELECT p.id,p.nick,p.year,p.gender,p.area,p.memo,p.identity,c.encrypted,c.verified,COALESCE(k.joined,c.joined) AS joined
+          FROM members p LEFT JOIN account_keys k ON k.member=p.id LEFT JOIN contacts c ON c.member=p.id WHERE p.id=?`,memberPath[1]);
         if(!m){
           const departed=get("SELECT nick,withdrawn,expires,'withdrawn' AS status FROM departures WHERE id=? AND expires>?",memberPath[1],Date.now());
           if(departed)return ok(departed);
@@ -457,6 +528,6 @@ if(process.argv[1] && pathToFileURL(resolve(process.argv[1])).href===import.meta
   const env=process.env,port=Number(env.PORT||3000);
   const origin=env.PUBLIC_BASE_URL||env.RENDER_EXTERNAL_URL||('http://localhost:'+port);
   const server=makeServer({origin,dir:env.DATA_DIR||fileURLToPath(new URL('./data',import.meta.url)),
-    secret:env.SECRET,store:env.PORTONE_STORE_ID,channel:env.PORTONE_CHANNEL_KEY,liveOnly:env.NODE_ENV==='production',keyMarker:env.APP_KEY_MARKER});
+    secret:env.SECRET});
   server.listen(port,'0.0.0.0',()=>console.log('채팅 서버 시작 ('+port+')'));
 }

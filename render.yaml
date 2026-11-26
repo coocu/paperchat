@@ -19,12 +19,6 @@ services:
         value: /var/data
       - key: SECRET
         generateValue: true
-      - key: PORTONE_STORE_ID
-        sync: false
-      - key: PORTONE_CHANNEL_KEY
-        sync: false
-      - key: PORTONE_API_SECRET
-        sync: false
     # Add push credentials later in Environment, then save and deploy.
     # FIREBASE_ANDROID_CONFIG_JSON, FCM_SERVICE_ACCOUNT_JSON
     # APNS_TEAM_ID, APNS_KEY_ID, APNS_PRIVATE_KEY

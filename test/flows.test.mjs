@@ -9,20 +9,25 @@ import { pushQueue } from '../push-queue.mjs';
 import { moderation } from '../moderation.mjs';
 import { makeServer } from '../server.mjs';
 import { policyVersion } from '../public/rules.js';
-import { adultInfo,RequestError } from '../providers.mjs';
+import { profileDetails,RequestError } from '../providers.mjs';
 import { openStore,clean,hour,tables } from '../store.mjs';
 
-const birth=(di,date='1995-01-01')=>({status:'VERIFIED',verifiedCustomer:{di,name:'검증회원',phoneNumber:'01000000000',birthDate:date,gender:'FEMALE'}});
-test('한국 날짜로 만 19세 생일 전날과 당일을 구분한다',()=>{
-  assert.throws(()=>adultInfo(birth('one','2007-11-27'),'2026-11-26'),/만 19세/);
-  assert.equal(adultInfo(birth('one','2007-11-26'),'2026-11-26').year,2007);
-  assert.throws(()=>adultInfo(birth('one','2007-02-30')),/생년월일/);
+test('한국 날짜로 만 19세 생일 전날·당일과 실제 달력의 생년월일을 판정한다',()=>{
+  const midnight=Date.parse('2026-11-25T15:00:00Z');
+  const details={birthDate:'2007-11-26',gender:'여성'};
+  assert.throws(()=>profileDetails(details,midnight-1),/만 19세/);
+  assert.deepEqual(profileDetails(details,midnight),{year:2007,gender:'여성'});
+  assert.deepEqual(profileDetails({birthDate:'2004-02-29',gender:'남성'},midnight),{year:2004,gender:'남성'});
+  for(const birthDate of ['2007-02-29','2000-02-30','2000-13-01','1899-12-31','2030-01-01','1995','',null,1995])
+    assert.throws(()=>profileDetails({...details,birthDate},midnight),/생년월일/);
+  for(const gender of ['',null,'기타'])assert.throws(()=>profileDetails({...details,gender},midnight),/성별/);
+  assert.throws(()=>profileDetails({year:1995,adult:true,gender:'여성'},midnight),/생년월일/);
 });
 test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
   const dir=mkdtempSync(join(tmpdir(),'paperchat-test-'));
   const origin='https://paperchat.example';
   const adminKey='codenote-'+randomBytes(16).toString('hex')+'-kyh';
-  const cfg={dir,origin,secret:randomBytes(40).toString('hex'),store:'store-test',channel:'channel-test'};
+  const cfg={dir,origin,secret:randomBytes(40).toString('hex')};
   const delivered=[];
   let pushResult='sent';
   cfg.pushProvider={enabled:()=>true,async send(job,event,valid){
@@ -35,7 +40,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
   const deliveryQueue=pushQueue(db,cfg.pushProvider,moderation(db));
   t.after(()=>deliveryQueue.close());
   const original=Date.now;let now=original();Date.now=()=>now;
-  const verified=new Map();
+  const recovery=new Map();
   let unblock,started;
   const registry=new Map([[adminKey,{status:'approved',token:'registry-token'}]]);
   const registryLookups=[];
@@ -49,9 +54,8 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
       }
       if(code==='slow'){started();await new Promise(r=>{unblock=r;});return {status:'approved',token:'ok'};}
       if(code==='blank')return {status:'approved',token:'   '};
-      return {status:code==='ok'?'approved':code,token:'test-token'};
-    },
-    verify:async id=>({id,...verified.get(id)})
+      return {status:code.startsWith('invite-')?'approved':code,token:'test-token'};
+    }
   };
   let server=makeServer(cfg,providers);
   t.after(()=>{server.emit('close');Date.now=original;db.close();rmSync(dir,{recursive:true,force:true});});
@@ -60,25 +64,76 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     return async function call(path,body,options={}){
       const req=Readable.from(body===undefined?[]:[Buffer.from(JSON.stringify(body))]);
       req.method=body===undefined?'GET':'POST';req.url=path;req.socket={remoteAddress:options.ip||'test-local'};
-      req.headers={'content-type':'application/json',origin:options.origin||origin,cookie:[...cookies].map(([k,v])=>k+'='+v).join('; ')};
+      req.headers={'content-type':'application/json',origin:options.origin||origin,'user-agent':options.userAgent||'test-browser',cookie:[...cookies].map(([k,v])=>k+'='+v).join('; ')};
       const result=await new Promise((done,reject)=>{
         const headers={};
-        const res={status:200,setHeader(k,v){headers[k.toLowerCase()]=v;},writeHead(n,h){this.status=n;Object.entries(h||{}).forEach(([k,v])=>this.setHeader(k,v));},
-          end(bytes){const sc=headers['set-cookie'];if(sc){const [k,v]=sc.split(';')[0].split('=');cookies.set(k,v);}
+        const res={status:200,getHeader(k){return headers[k.toLowerCase()];},setHeader(k,v){headers[k.toLowerCase()]=v;},writeHead(n,h){this.status=n;Object.entries(h||{}).forEach(([k,v])=>this.setHeader(k,v));},
+          end(bytes){const sc=headers['set-cookie'];for(const entry of sc||[]){const [k,v]=entry.split(';')[0].split('=');cookies.set(k,v);}
             const json=headers['content-type']?.startsWith('application/json');done({status:this.status,headers,body:json?JSON.parse(bytes):bytes});}};
         try{server.emit('request',req,res);}catch(e){reject(e);}
       });
       return result;
     };
   }
-  async function pass(c,nick,di,date){
-    assert.equal((await c('/api/key',{code:'ok'})).status,200);
-    const start=await c('/api/identity/start',{nick,login:!nick,disclosure:policyVersion});
-    assert.equal(start.status,200);
-    const id=start.body.identityVerificationId;verified.set(id,birth(di,date));
-    return c('/api/identity/finish',{id});
+  async function pass(c,nick,account,date){
+    if(!nick)return c('/api/account/login',{code:recovery.get(account)},{ip:'login-'+account});
+    if((await c('/api/state')).body.stage==='gate'){
+      const key=await c('/api/key',{code:'invite-'+randomBytes(12).toString('hex')},{ip:'key-'+account});
+      if(key.status!==200)return key;
+    }
+    return c('/api/profile-details',{nick,birthDate:date||'1995-01-03',gender:'여성'});
   }
   const a=client(),b=client(),c=client(),admin=client(),nobody=client();
+  await t.test('앱은 승인된 일반키를 받아 가입 단계만 열고 관리자 로그인은 별도로 검증한다',async()=>{
+    for(const prefix of ['invite', 'codenote', 'kyh', 'kyh-codenote']){
+      const key=prefix+'-'+randomBytes(12).toString('hex');
+      const member=client();
+      registry.set(key,{status:'approved',token:'issued'});
+      try {
+        assert.equal((await member('/api/key',{code:key},{ip:'member-gate'})).status,200);
+        assert.equal((await member('/api/state')).body.stage,'gate_ok');
+        assert.equal((await member('/api/status')).body.adminSignedIn,false);
+        assert.equal((await member('/api/admin/members')).status,401);
+        if(prefix!=='kyh-codenote'){
+          assert.equal((await member('/api/admin/login',{key},{ip:'member-gate'})).status,403);
+          assert.equal((await member('/api/admin/members')).status,401);
+        }
+      } finally {registry.delete(key);}
+    }
+  });
+  await t.test('일회용 키 동시 사용을 차단하고, 가입 응답을 놓친 기기에서만 중단한 가입을 이어간다',async()=>{
+    const code='invite-race', first=client(),second=client();
+    await first('/api/state');await second('/api/state');
+    let pending=[];
+    registry.set(code,()=>new Promise(resolve=>pending.push(resolve)));
+    const attempts=[first('/api/key',{code}),second('/api/key',{code})];
+    while(pending.length<2)await new Promise(r=>setImmediate(r));
+    for(const release of pending)release({status:'approved',token:'once'});
+    const result=await Promise.all(attempts);
+    assert.deepEqual(result.map(r=>r.status).sort(),[200,409]);
+    const winner=result[0].status===200?first:second;
+    const loser=winner===first?second:first;
+    await winner('/api/logout',{});
+    assert.equal((await winner('/api/state')).body.stage,'gate_ok');
+    assert.equal((await loser('/api/state')).body.stage,'gate');
+    assert.equal((await loser('/api/key',{code})).status,409);
+    registry.delete(code);
+  });
+  await t.test('서버 첫 화면과 모바일 진입점, 승인 전 운영자 자료 접근을 구분한다',async()=>{
+    for(const path of ['/','/admin/','/?inbox=1','/app','/app/','/identity-return']) {
+      const r=await nobody(path);assert.equal(r.status,302);assert.equal(r.headers.location,'/admin');
+    }
+    assert.equal((await nobody('/admin')).status,200);
+    for(const userAgent of ['Mobile PaperChatIOS/3','WebView PaperChatAndroid/2','iPhone AppleWebKit/605.1 Mobile/15']){
+      assert.equal((await nobody('/app',undefined,{userAgent})).status,200);
+      assert.equal((await nobody('/identity-return',undefined,{userAgent})).headers.location,'/app');
+      assert.equal((await nobody('/app/?inbox=1',undefined,{userAgent})).headers.location,'/app?inbox=1');
+    }
+    assert.equal((await nobody('/?inbox=1',undefined,{userAgent:'WebView PaperChatAndroid/2'})).headers.location,'/app?inbox=1');
+    for(const path of ['/api/admin/members','/api/admin/review','/api/admin/rooms?area=x','/api/admin/photos/1'])
+      assert.equal((await nobody(path,undefined,{userAgent:'WebView PaperChatAndroid/2'})).status,401);
+    assert.equal((await nobody('/health')).body.ok,true);
+  });
   await t.test('미승인, 대기, 토큰 누락과 미성년을 거부한다',async()=>{
     assert.equal((await a('/api/register',{area:'경기도 이천시',memo:'x'})).status,401);
     for(const code of ['pending','invalid','blank'])assert.equal((await a('/api/key',{code})).status,403);
@@ -86,22 +141,11 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.equal((await c('/api/state')).body.stage,'gate_ok');
     assert.equal((await c('/api/people?area=x')).status,401);
   });
-  await t.test('운영 모드에서 지정한 채널의 라이브 인증만 수락한다',async()=>{
-    cfg.liveOnly=true;
-    const isolated=makeServer(cfg,providers),originalServer=server;
-    server=isolated;
-    try{
-      const attempt=client();
-      await attempt('/api/key',{code:'ok'});
-      const {body:start}=await attempt('/api/identity/start',{nick:'채널 확인',disclosure:policyVersion});
-      const id=start.identityVerificationId;
-      for(const channel of [undefined,{type:'TEST',key:cfg.channel},{type:'LIVE',key:'other'}]){
-        verified.set(id,{...birth('live-check'),channel});
-        assert.equal((await attempt('/api/identity/finish',{id})).status,403);
-      }
-      verified.set(id,{...birth('live-check'),channel:{type:'LIVE',key:cfg.channel}});
-      assert.equal((await attempt('/api/identity/finish',{id})).body.stage,'verified');
-    }finally{isolated.emit('close');server=originalServer;cfg.liveOnly=false;}
+  await t.test('이전 통신사 요청은 계정이나 세션을 만들지 않는다',async()=>{
+    for(const path of ['identity/start','identity/finish']){
+      assert.equal((await nobody('/api/'+path,{})).status,404);
+    }
+    assert.equal((await nobody('/api/profile-details',{nick:'회원',birthDate:'1995-01-03',gender:'여성'})).status,401);
   });
   await t.test('키워드 조합만으로 관리자 로그인 불가, 발급 주소 변경 즉시 반영',async()=>{
     assert.equal((await nobody('/api/admin/settings')).status,401);
@@ -158,35 +202,47 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.equal((await admin('/api/admin/settings')).body.url,'https://two.example/apply');
     registry.delete(key);
   });
-  await t.test('실명정보 동의와 인증기관의 이름·전화번호가 모두 필요하다',async()=>{
-    const guest=client();await guest('/api/key',{code:'ok'});
-    assert.equal((await guest('/api/identity/start',{nick:'검증'})).status,400);
-    const {body:start}=await guest('/api/identity/start',{nick:'검증',disclosure:policyVersion});
-    for(const field of ['name','phoneNumber']){
-      const v=birth('not-a-member');delete v.verifiedCustomer[field];verified.set(start.identityVerificationId,v);
-      assert.equal((await guest('/api/identity/finish',{id:start.identityVerificationId,name:'임의',phoneNumber:'01012340000'})).status,422);
-    }
+  await t.test('동명이인과 같은 일반키가 계정 복구에 쓰이지 않는다',async()=>{
+    const guest=client();
+    assert.equal((await guest('/api/account/login',{code:'ok'})).status,403);
+    assert.equal((await guest('/api/account/login',{code:'가을-1995-여성'})).status,403);
+    await guest('/api/key',{code:'invite-nick-test'});
+    assert.equal((await guest('/api/profile-details',{nick:'조건만남구함',birthDate:'1995-01-03',gender:'여성'})).status,422);
     assert.equal((await guest('/api/state')).body.stage,'gate_ok');
-    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM contacts').get().n,0);
-    assert.equal((await guest('/api/identity/start',{nick:'조건만남구함',disclosure:policyVersion})).status,422);
   });
   await t.test('지역과 메모를 등록하고 재인증해도 기존 프로필이 유지된다',async()=>{
     for(const [client,nick,id,area] of [[a,'가을','DI-A','경기도 이천시'],[b,'겨울','DI-B','서울특별시 중구'],[c,'봄','DI-C','인천광역시 검단구']]){
-      assert.equal((await pass(client,nick,id)).body.stage,'verified');
+      assert.equal((await pass(client,nick,id)).body.stage,'details');
       assert.equal((await client('/api/register',{area:'잘못된 지역',policy:policyVersion,memo:'산책'})).status,400);
       assert.equal((await client('/api/register',{area,memo:'산책'})).status,400);
       assert.equal((await client('/api/register',{area,policy:policyVersion,memo:'누드 사진 보내'})).status,422);
       assert.equal((await client('/api/register',{area,policy:policyVersion,memo:'산책'})).status,200);
+      const code=(await client('/api/account/recovery')).body.code;
+      assert.match(code,/^([A-F0-9]{4}-){7}[A-F0-9]{4}$/);recovery.set(id,code);
+      assert.equal((await client('/api/state')).body.needsRecoveryCopy,true);
+      assert.equal((await client('/api/account/recovery',{saved:true})).status,200);
+      assert.equal((await client('/api/state')).body.needsRecoveryCopy,false);
     }
     const old=(await a('/api/state')).body.profile;
     await a('/api/logout',{});
     assert.equal((await a('/api/state')).body.stage,'gate');
-    assert.equal((await pass(a,'새 이름','DI-A')).body.stage,'member');
+    assert.equal((await pass(a,'','DI-A')).body.stage,'member');
     assert.deepEqual((await a('/api/state')).body.profile,old);
   });
   let room,photo;
   const android={platform:'android',token:'abcd:android-token-for-test'};
   const iphone={platform:'ios-dev',token:'abcd'.repeat(16)};
+  await t.test('플랫폼별 실제 발송 설정을 확인한 뒤에만 권한 창을 요청할 수 있다',async()=>{
+    const original=cfg.pushProvider.enabled;
+    try {
+      cfg.pushProvider.enabled=()=>false;
+      assert.deepEqual((await nobody('/api/push/availability')).body,{android:false,'ios-dev':false,'ios-prod':false});
+      cfg.pushProvider.enabled=p=>p!=='ios-prod';
+      assert.deepEqual((await nobody('/api/push/availability')).body,{android:false,'ios-dev':true,'ios-prod':false});
+      cfg.pushProvider.androidClient={appId:'test'};
+      assert.deepEqual((await nobody('/api/push/availability')).body,{android:true,'ios-dev':true,'ios-prod':false});
+    }finally{cfg.pushProvider.enabled=original;delete cfg.pushProvider.androidClient;}
+  });
   await t.test('Android 초기 설정은 로그인 전에 조회되며 배포 상태에 맞는 공개 설정만 반환한다',async()=>{
     assert.deepEqual((await nobody('/api/push/android-config')).body,{config:null});
     const clientConfig={projectId:'qa',senderId:'123',appId:'1:123:android:qa',apiKey:'client-key'};
@@ -233,18 +289,18 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.equal((await admin('/api/admin/rooms/'+room+'/messages')).body.length,2);
     assert.equal((await admin('/api/admin/photos/'+photo)).status,200);
   });
-  await t.test('가입자 실명과 전화번호는 서버 인증 결과로만 저장하고 관리자 상세에서만 표시한다',async()=>{
+  await t.test('관리자는 직접 입력한 회원 정보를 보고 신규 회원의 연락처는 수집하지 않는다',async()=>{
     const id=(await b('/api/state')).body.profile.id;
     const listing=await admin('/api/admin/members');assert.equal(listing.body.items.length,3);
     const path='/api/admin/members/'+id;
     assert.equal((await a(path)).status,401);assert.equal((await nobody(path)).status,401);
     const detail=(await admin(path)).body;
-    assert.deepEqual(detail.contact,{name:'검증회원',phone:'01000000000'});assert.equal(detail.id,id);
+    assert.equal(detail.contact,null);assert.equal(detail.year,1995);assert.equal(detail.gender,'여성');assert.equal(detail.id,id);
     assert.equal(detail.identity,undefined);assert.equal(detail.encrypted,undefined);
     for(const res of [listing,await a('/api/state'),await a('/api/rooms'),await a('/api/people?area='+encodeURIComponent('서울특별시 중구')),await a('/api/rooms/'+room+'/messages')])
       assert.doesNotMatch(JSON.stringify(res.body),/검증회원|01000000000|phoneNumber|encrypted/);
     const saved=db.prepare('SELECT encrypted FROM contacts WHERE member=?').get(id);
-    assert.doesNotMatch(Buffer.from(saved.encrypted).toString(),/검증회원|01000000000/);
+    assert.equal(saved,undefined);
   });
   await t.test('신고한 콘텐츠는 즉시 숨기고 발신자·신고자를 회원 ID로 구분한다',async()=>{
     const idB=(await b('/api/state')).body.profile.id,idA=(await a('/api/state')).body.profile.id;
@@ -328,14 +384,15 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     clean(db,now);assert.equal(db.prepare('SELECT photo FROM messages WHERE id=?').get(photo).photo,null);
     assert.equal((await a('/api/rooms/'+room+'/messages')).body[0].body,'반가워요');
   });
-  await t.test('이전 버전 회원·사진은 재인증·규칙 동의·사진 검토로 안전하게 전환된다',async()=>{
+  await t.test('이전 버전 회원 세션은 복구코드를 받을 수 있고 대화와 사진 검토는 유지된다',async()=>{
     const C=(await c('/api/state')).body.profile, A=(await a('/api/state')).body.profile;
-    db.prepare('DELETE FROM contacts WHERE member=?').run(C.id);
+    db.prepare('DELETE FROM account_keys WHERE member=?').run(C.id);
     db.prepare('DELETE FROM acceptances WHERE member=?').run(C.id);
-    assert.equal((await c('/api/state')).body.stage,'contact');
-    assert.equal((await c('/api/people?area='+encodeURIComponent(C.area))).status,403);
-    assert.equal((await pass(c,'','DI-C')).status,200);
+    server.emit('close');server=makeServer(cfg,providers);
     assert.equal((await c('/api/state')).body.stage,'policy');
+    assert.equal((await c('/api/state')).body.needsRecoveryCopy,true);
+    assert.equal((await c('/api/account/recovery')).body.code,recovery.get('DI-C'));
+    assert.equal((await c('/api/people?area='+encodeURIComponent(C.area))).status,403);
     assert.equal((await c('/api/policy',{version:policyVersion})).status,200);
     assert.deepEqual((await c('/api/state')).body.profile,C);
     const old=db.prepare('INSERT INTO messages(room,author,sent,photo,expires) VALUES(?,?,?,?,?)').run(room,A.id,now,Buffer.from([255,216,255,217]),now+12*hour);
@@ -359,10 +416,13 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     now+=24*hour-1;await admin('/api/admin/login',{key:adminKey});
     assert.equal((await admin('/api/admin/members/'+old)).status,200);
     assert.equal((await pass(a,'새 이름','DI-A')).status,403);
+    const reinstall=client();
+    assert.equal((await reinstall('/api/account/login',{code:recovery.get('DI-A')})).status,403);
+    assert.equal((await pass(other,'다른 닉네임','new-alias')).status,403);
     now+=1;
     assert.equal((await admin('/api/admin/members/'+old)).status,404);
     assert.deepEqual((await admin('/api/admin/members')).body.counts,{active:2,withdrawn:0});
-    assert.equal((await pass(a,'새 이름','DI-A')).body.stage,'verified');
+    assert.equal((await pass(a,'새 이름','DI-A')).body.stage,'details');
     assert.equal((await a('/api/register',{area:'경기도 이천시',policy:policyVersion,memo:'새 메모'})).status,200);
     assert.notEqual((await a('/api/state')).body.profile.id,old);
     clean(db,now);assert.equal(db.prepare('SELECT COUNT(*) AS n FROM cooldowns').get().n,0);
@@ -378,7 +438,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     await pass(c,'','DI-C');assert.equal((await c('/api/state')).body.stage,'restricted');
     assert.equal((await c('/api/withdraw',{confirm:true})).status,200);
     now+=25*hour;assert.equal((await pass(c,'다시','DI-C')).status,403);
-    now+=30*24*hour;assert.equal((await pass(c,'다시','DI-C')).body.stage,'verified');
+    now+=30*24*hour;assert.equal((await pass(c,'다시','DI-C')).body.stage,'details');
     await c('/api/register',{area:C.area,memo:'취미',policy:policyVersion});
   });
   await t.test('초기화 시 진행 중 인증·세션·설정·서비스 데이터까지 제거한다',async()=>{
@@ -418,6 +478,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.equal((await admin('/api/admin/members/'+oldMember)).status,404);
     assert.deepEqual((await admin('/api/admin/members')).body,{items:[],more:false,counts:{active:0,withdrawn:0}});
     assert.deepEqual((await admin('/api/admin/review')).body,{photos:[],reports:[]});
-    assert.match((await nobody('/apply')).headers.location,/unavailable/);
+    assert.match(String((await nobody('/apply')).body),/발급 주소/);
+    assert.match((await nobody('/apply',undefined,{userAgent:'WebView PaperChatAndroid/2'})).headers.location,/unavailable/);
   });
 });

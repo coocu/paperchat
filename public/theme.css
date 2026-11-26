@@ -8,3 +8,14 @@
 .details{display:grid;grid-template-columns:max-content 1fr;gap:10px 18px;margin:0}.details dt{color:var(--sub)}.details dd{margin:0;overflow-wrap:anywhere}
 .letter li+li{margin-top:8px}.letter ul{padding-inline-start:20px}
 @media(min-width:760px){.adminGrid{grid-template-columns:repeat(2,1fr)}}
+
+
+/* Keep distinct actions separated even when the keyboard shortens the viewport. */
+.invite-stack {
+  --invite-space: clamp(24px, 6vw, 32px);
+  display: grid;
+  gap: var(--invite-space);
+  align-items: start;
+}
+.invite-stack > * { margin-block: 0; min-width: 0; }
+.invite-stack .field + .actions { margin-top: 20px; }

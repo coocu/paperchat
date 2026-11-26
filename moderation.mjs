@@ -29,7 +29,6 @@ export function moderation(db) {
     const m=get('SELECT identity FROM members WHERE id=?',id);
     if(!m) return 'gate';
     if(restricted(m.identity))return 'restricted';
-    if(!get('SELECT 1 FROM contacts WHERE member=?',id))return 'contact';
     return get('SELECT 1 FROM acceptances WHERE member=? AND version=?',id,policyVersion)?'member':'policy';
   }
   function accept(id,version) {

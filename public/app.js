@@ -1,6 +1,7 @@
 import {policyVersion,rules,reasons} from './rules.js';
 const main=document.querySelector('#app');
 const admin=location.pathname==='/admin';
+if(admin)document.title='종이편지 · 운영자 관리실';
 const $=s=>document.querySelector(s);
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const paths={
@@ -17,7 +18,7 @@ const paths={
 };
 const icon=n=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[n]||paths.mail}</svg>`;
 let me,regions,stage,activeTimer,epoch=0,selectedArea='';
-const draft={nick:'',province:'',district:'',memo:''};
+const draft={nick:'',birthDate:'',gender:'',province:'',district:'',memo:''};
 const err=e=>{const el=$('#error');if(el)el.textContent=e.message||String(e);};
 const note=msg=>{const el=$('#notice');el.textContent=msg;setTimeout(()=>{if(el.textContent===msg)el.textContent='';},3200);};
 async function api(path,body) {
@@ -54,7 +55,7 @@ const actions=(...parts)=>`<div class="actions">${parts.join('')}</div>`;
 const notice='<p class="error" id="error" role="alert"></p>';
 function paint(title,mark,body,{sub='',back,wide=false,nav=''}={}) {
   clearInterval(activeTimer);epoch++;main.className=wide?'wide':'';
-  main.innerHTML=`<header class="bar"><span class="brand">${icon('mail')}종이편지</span>${back?act('back','이전','textBtn'):''}</header><section class="hero"><h1>${icon(mark)}${esc(title)}</h1>${sub?`<p>${esc(sub)}</p>`:''}</section>${nav}${body}${notice}`;
+  main.innerHTML=`<header class="bar"><span class="brand">${icon('mail')}종이편지</span>${back?act('back','이전','textBtn'):''}</header><section class="hero"><h1>${icon(mark)}${esc(title)}</h1>${sub?`<p>${esc(sub)}</p>`:''}</section>${nav}${body}${body.includes(notice)?'':notice}`;
   if(back)on('#back','click',back);
   document.title=title+' · 종이편지';
   window.scrollTo(0,0);
@@ -74,7 +75,6 @@ function modal(title,desc,label,fn){
   d.querySelector('#dismiss').onclick=()=>d.close();d.querySelector('#proceed').onclick=async()=>{d.close();try{await fn();}catch(e){err(e);}};
 }
 const rulesCard=()=>`<aside class="letter"><h2>${icon('book')}이용규칙</h2><ul>${rules.map(r=>'<li>'+esc(r)+'</li>').join('')}</ul></aside>`;
-const consentText='본인 확인과 위반 신고 처리를 위해 인증된 이름·휴대폰번호를 수집하며, 관리자만 열람합니다. 가입 완료 전에는 인증 세션 만료 시, 가입 후에는 탈퇴 또는 서버 초기화 시 삭제합니다. 동의를 거부할 수 있으며 거부하면 가입·본인인증 로그인을 진행할 수 없습니다. 탈퇴하면 관리자 현황에 닉네임과 탈퇴·삭제 예정 시각만 24시간 남습니다.';
 const resetKey='paperchat.reset';
 let leaving=false,knownVersion=localStorage.getItem(resetKey);
 function recordVersion(version){
@@ -85,21 +85,21 @@ function recordVersion(version){
     leaving=true;clearInterval(activeTimer);epoch++;me=null;selectedArea='';stage='gate';
     for(const k of Object.keys(draft))draft[k]='';
     sessionStorage.clear();
-    main.replaceChildren();location.replace(admin?'/admin?reset=1':'/?reset=1');
+    main.replaceChildren();location.replace(admin?'/admin?reset=1':'/app?reset=1');
     throw new Error('서버가 초기화되어 사용자 정보가 없어요.');
   }
 }
 function accountActions(){
-  on('#logout','click',async()=>{await api('logout',{});location.replace('/');});
-  on('#withdraw','click',()=>modal('회원탈퇴','프로필, 실명·연락처와 참여한 대화가 삭제돼요. 관리자 현황에는 닉네임과 탈퇴 시각이 24시간 표시돼요. 일반 재가입은 24시간 후, 이용 제한 중이면 제한 종료 후 가능해요.','탈퇴하기',async()=>{await api('withdraw',{confirm:true});location.replace('/');}));
+  on('#logout','click',async()=>{await api('logout',{});location.replace('/app');});
+  on('#withdraw','click',()=>modal('회원탈퇴','프로필과 참여한 대화가 삭제돼요. 관리자 현황에는 닉네임과 탈퇴 시각이 24시간 표시돼요. 일반 재가입은 24시간 후, 이용 제한 중이면 제한 종료 후 가능해요.','탈퇴하기',async()=>{await api('withdraw',{confirm:true});location.replace('/app');}));
 }
 function limitedPage(state){
-  const renewal=state==='contact',policy=state==='policy';
-  paint(policy?'이용규칙 확인':renewal?'가입 정보 확인':'계정 이용 제한','book',rulesCard()+
-    (policy?`<form class="paper"><label class="check"><input required type="checkbox">이용규칙에 동의해요.</label>${actions(btn('확인하고 계속'))}</form>`:renewal?actions(act('renew','휴대폰으로 다시 인증','primary')):'<p>신고 검토 결과에 따라 계정 이용이 제한되었어요.</p>')+
-    actions(act('logout','로그아웃'),act('withdraw','회원탈퇴','danger')));
+  const policy=state==='policy';
+  paint(policy?'이용규칙 확인':'계정 이용 제한','book',rulesCard()+
+    (policy?`<form class="paper"><label class="check"><input required type="checkbox">이용규칙에 동의해요.</label>${actions(btn('확인하고 계속'))}</form>`:'<p>신고 검토 결과에 따라 계정 이용이 제한되었어요.</p>')+
+    actions(act('recovery','개인 복구코드 보기'),act('logout','로그아웃'),act('withdraw','회원탈퇴','danger')));
   if(policy)form(async()=>{await api('policy',{version:policyVersion});await boot();});
-  if(renewal)on('#renew','click',async()=>{await api('logout',{});location.replace('/');});
+  on('#recovery','click',()=>recoveryPage(()=>limitedPage(state)));
   accountActions();
 }
 function reportUI(target,back){
@@ -115,31 +115,45 @@ async function blockedList(){
   rows(items,i=>modal('차단 해제',i.nick+'님의 차단을 해제할까요?','해제하기',async()=>{await api('blocks',{peer:i.id,remove:true});await blockedList();}));
 }
 function gate(){
-  paint('인증키를 입력해 주세요','key',`<form class="paper">${field('code','발급받은 인증키','autocomplete="off" maxlength="256" placeholder="인증키 입력"')}${actions(btn('인증하고 계속'))}</form><aside class="letter"><h2>${icon('mail')}인증키 발급 안내</h2><p>신청서를 작성한 뒤 발급받은 키를 입력해 주세요.</p><div class="rule"></div><a class="btn forest" href="/apply">발급 신청서 열기</a></aside>`);
-  main.insertAdjacentHTML('beforeend',rulesCard());
+  paint('인증키를 입력해 주세요','key',`<div class="invite-stack">
+    <form class="paper">${field('code','발급받은 일반 인증키','autocomplete="off" maxlength="256" aria-describedby="error" placeholder="인증키 입력"')}${notice}${actions(btn('인증하고 계속'))}</form>
+    ${act('existing','기존 회원 로그인','secondary')}
+    <aside class="letter"><h2>${icon('mail')}인증키 발급 안내</h2><p>새로 가입할 때 한 번 쓰는 개인별 인증키예요.</p><div class="rule"></div><a class="btn forest" href="/apply">발급 신청서 열기</a></aside>
+    ${rulesCard()}</div>`);
+  on('#existing','click',loginPage);
   form(async f=>{await api('key',{code:f.get('code')});nick();});
   if(new URLSearchParams(location.search).has('reset'))err(new Error('서버가 초기화되어 등록된 사용자 정보가 없습니다. 다시 가입해 주세요.'));
   if(new URLSearchParams(location.search).has('form'))err(new Error('등록된 발급 주소가 없어요.'));
 }
 function nick(){
-  paint('어떻게 불러드릴까요?','pen',`<form class="paper">${field('nick','닉네임',`value="${esc(draft.nick)}" maxlength="24" placeholder="대화에서 사용할 이름"`)}${actions(btn('다음'))}</form>${act('existing','이미 가입했어요','textBtn')}`);
-  form(f=>{draft.nick=f.get('nick').trim();identity(false);});on('#existing','click',()=>identity(true));
+  paint('어떻게 불러드릴까요?','pen',`<form class="paper">${field('nick','닉네임',`value="${esc(draft.nick)}" maxlength="24" placeholder="대화에서 사용할 이름"`)}${actions(btn('다음'))}</form>`);
+  form(f=>{draft.nick=f.get('nick').trim();details();});
 }
-let sdk;
-function loadSDK(){
-  if(window.PortOne)return Promise.resolve();
-  if(!sdk)sdk=new Promise((resolve,reject)=>{const s=document.createElement('script');s.src='https://cdn.portone.io/v2/browser-sdk.js';s.onload=resolve;s.onerror=()=>{s.remove();sdk=null;reject(new Error('본인인증 화면을 불러오지 못했어요.'));};document.head.append(s);});return sdk;
+function loginPage(){
+  paint('다시 로그인','key',`<form class="paper">${field('recovery','개인 복구코드','type="password" autocomplete="off" spellcheck="false" maxlength="64"')}<p class="note">가입할 때 보관한 개인 복구코드를 입력하면 내 프로필과 대화가 열려요.</p>${actions(btn('로그인'))}</form>`,{back:gate});
+  form(async f=>{await api('account/login',{code:f.get('recovery')});await boot();});
 }
-function identity(login){
-  paint(login?'다시 만나서 반가워요':'휴대폰 본인인증','key',`<form class="paper"><p>만 19세 생일부터 이용할 수 있어요. 본인 명의의 휴대폰으로 인증해 주세요.</p><div class="rule"></div><p class="note">${esc(consentText)}</p><label class="check"><input type="checkbox" required>이름·전화번호 수집 및 이용에 동의해요.</label>${actions(btn(login?'인증하고 로그인':'통신사 인증하기'))}</form>`,{back:nick});
-  form(async()=>{await loadSDK();const request=await api('identity/start',{nick:draft.nick,login,disclosure:policyVersion});const answer=await window.PortOne.requestIdentityVerification(request);
-    if(answer?.code)throw new Error(answer.message||'본인인증을 취소했어요.');
-    if(answer)await completeIdentity(request.identityVerificationId);
+function details(){
+  paint('생년월일과 성별','pen',`<form class="paper">${field('birthDate','생년월일',`type="date" autocomplete="bday" min="1900-01-01" value="${esc(draft.birthDate)}"`)}
+    <label for="gender">성별</label><select id="gender" name="gender" required><option value="">선택해 주세요</option>${[['남성','남자'],['여성','여자']].map(([v,l])=>`<option value="${v}" ${draft.gender===v?'selected':''}>${l}</option>`).join('')}</select>
+    <p class="note">직접 입력한 생년월일로 만 19세 이상인지 확인해요. 프로필에는 출생연도와 성별만 표시돼요.</p>
+    ${actions(btn('다음'))}</form>`,{back:nick});
+  form(async f=>{
+    draft.birthDate=f.get('birthDate');draft.gender=f.get('gender');
+    await api('profile-details',{nick:draft.nick,birthDate:draft.birthDate,gender:draft.gender});
+    await regionStep();
   });
 }
-async function completeIdentity(id){
-  const r=await api('identity/finish',{id});
-  if(r.stage==='member')await boot();else regionStep();
+async function recoveryPage(back){
+  const {code}=await api('account/recovery');
+  paint('개인 복구코드','key',`<form class="paper"><p>로그아웃하거나 휴대폰을 바꾸면 이 코드로 내 대화를 다시 열 수 있어요. 비밀번호처럼 따로 보관해 주세요.</p>
+    <label for="personalCode">내 복구코드</label><input id="personalCode" readonly value="${esc(code)}">
+    ${actions(act('copy','코드 복사','secondary'))}<label class="check"><input type="checkbox" required>복구코드를 보관했어요.</label>${actions(btn('확인'))}</form>`,{back});
+  on('#copy','click',async()=>{
+    try{await navigator.clipboard.writeText(code);note('복구코드를 복사했어요.');}
+    catch{const input=$('#personalCode');input.focus();input.select();note('선택된 코드를 길게 눌러 복사해 주세요.');}
+  });
+  form(async()=>{await api('account/recovery',{saved:true});if(back)await back();else await boot();});
 }
 function picker(){return '<div class="split"><div><label for="province">시·도</label><select id="province"></select></div><div><label for="district">시·군·구</label><select id="district"></select></div></div>';}
 function areaOf(){return $('#province').value+' '+$('#district').value;}
@@ -159,7 +173,7 @@ function wirePicker(area='',changed=()=>{},requireChoice=false){
 }
 async function regionStep(){
   regions||=await api('regions');
-  paint('어느 지역에 계세요?','pin',`<form class="paper">${picker()}${actions(btn('다음'))}</form>`,{sub:'프로필에 표시할 시·군·구를 선택해 주세요.'});
+  paint('어느 지역에 계세요?','pin',`<form class="paper">${picker()}${actions(btn('다음'))}</form>`,{back:details,sub:'프로필에 표시할 시·군·구를 선택해 주세요.'});
   wirePicker(draft.province+' '+draft.district,()=>{},true);
   form(()=>{
     if(!$('#province').value || !$('#district').value)throw new Error('시·도와 시·군·구를 선택해 주세요.');
@@ -168,7 +182,7 @@ async function regionStep(){
 }
 function memo(){
   paint('당신의 성향을 알려주세요','leaf',rulesCard()+`<form class="paper"><label for="memo">성향 메모</label><textarea id="memo" name="memo" required maxlength="800" placeholder="나를 소개하는 글을 자유롭게 적어주세요.">${esc(draft.memo)}</textarea><div class="rule"></div><label class="check"><input type="checkbox" required><span>이용규칙에 동의해요. 지역·성향 메모는 회원에게 공개되며, 운영자는 신고 처리와 사진 검토를 위해 대화를 열람할 수 있어요.</span></label>${actions(btn('확인'))}</form>`,{back:()=>{draft.memo=$('#memo').value;return regionStep();}});
-  form(async f=>{draft.memo=f.get('memo');await api('register',{area:draft.province+' '+draft.district,memo:draft.memo,policy:policyVersion});await boot();});
+  form(async f=>{draft.memo=f.get('memo');await api('register',{area:draft.province+' '+draft.district,memo:draft.memo,policy:policyVersion});draft.birthDate='';await boot();});
 }
 const applePush=window.webkit?.messageHandlers?.paperChatPush;
 const androidPush=/PaperChatAndroid\/2/.test(globalThis.navigator?.userAgent||'');
@@ -214,13 +228,13 @@ async function rooms(){
 }
 function settings(){
   paint('내 설정','settings',`<div class="paper"><h2>${esc(me.nick)}</h2><p class="sub">${esc(me.year)}년생 · ${esc(me.gender)} · ${esc(me.area)}</p><div class="rule"></div><p class="memo">${esc(me.memo)}</p>${actions(act('logout','로그아웃'),act('withdraw','회원탈퇴','danger'))}</div>`,{nav:tabs('settings')});
-  main.insertAdjacentHTML('beforeend',actions(act('blocked','차단한 사용자'))+rulesCard());
+  main.insertAdjacentHTML('beforeend',actions(act('recovery','개인 복구코드 보기'),act('blocked','차단한 사용자'))+rulesCard());
   if(applePush || androidPush){
     main.insertAdjacentHTML('beforeend',`<section class="paper"><h2>채팅 알림</h2><p id="push-state">${esc(pushLabels[pushState])}</p>${actions(act('push-check','다시 연결'),act('push-settings','휴대폰 알림 설정'))}</section>`);
     on('#push-check','click',()=>syncPush(true));
     on('#push-settings','click',()=>{if(applePush)return applePush.postMessage('settings');location.href='paperchat://push/settings';});
   }
-  wireTabs();accountActions();on('#blocked','click',blockedList);
+  wireTabs();accountActions();on('#recovery','click',()=>recoveryPage(settings));on('#blocked','click',blockedList);
 }
 async function jpeg(file){
   if(!file || file.size>24*1024*1024)throw new Error('24MB 이하의 사진을 선택해 주세요.');
@@ -323,7 +337,7 @@ async function membersPage(offset=0,page=null){
   const path='admin/members?offset='+offset;
   page??=await api(path);
   const itemLabel=m=>m.status==='withdrawn'?'탈퇴 · '+at(m.expires)+' 삭제 예정':m.area;
-  paint('가입자 현황','book',`<p class="counts">가입 중 <strong>${page.counts.active}명</strong> · 탈퇴 후 24시간 이내 <strong>${page.counts.withdrawn}명</strong></p><section class="paper"><div class="rows">${page.items.map(m=>row(m.id,m.nick,itemLabel(m))).join('')||'가입자가 없어요.'}</div></section>${actions(offset?act('prevPage','이전 목록'):'',page.more?act('nextPage','다음 목록'):'')}`,{back:adminHome,sub:'회원을 선택하면 본인인증으로 확인한 이름과 전화번호를 볼 수 있어요.'});
+  paint('가입자 현황','book',`<p class="counts">가입 중 <strong>${page.counts.active}명</strong> · 탈퇴 후 24시간 이내 <strong>${page.counts.withdrawn}명</strong></p><section class="paper"><div class="rows">${page.items.map(m=>row(m.id,m.nick,itemLabel(m))).join('')||'가입자가 없어요.'}</div></section>${actions(offset?act('prevPage','이전 목록'):'',page.more?act('nextPage','다음 목록'):'')}`,{back:adminHome,sub:'회원을 선택하면 출생연도, 성별, 지역과 성향 메모를 볼 수 있어요.'});
   watchDirectory(path,page,next=>membersPage(offset,next),Math.min(...page.items.filter(i=>i.expires).map(i=>i.expires)));
   rows(page.items,m=>memberDetail(m.id,()=>membersPage(offset)));
   on('#prevPage','click',()=>membersPage(Math.max(0,offset-50)));on('#nextPage','click',()=>membersPage(offset+50));
@@ -336,7 +350,8 @@ async function memberDetail(id,back,m=null){
     watchDirectory(path,m,next=>memberDetail(id,back,next),m.expires);
     return;
   }
-  const fields=[['닉네임',m.nick],['인증된 이름',m.contact?.name||'재인증 전'],['인증된 전화번호',m.contact?.phone||'재인증 전'],['인증 확인 일시',at(m.verified)],['지역',m.area],['회원 ID',m.id]];
+  const fields=[['닉네임',m.nick],['출생연도',m.year],['성별',m.gender],['지역',m.area],['성향 메모',m.memo],['회원 ID',m.id]];
+  if(m.contact)fields.push(['이전 인증 이름',m.contact.name],['이전 인증 전화번호',m.contact.phone],['이전 인증 일시',at(m.verified)]);
   if(m.restrictedUntil)fields.push(['이용 제한 종료',at(m.restrictedUntil)]);
   paint('가입자 상세','book',`<section class="paper"><dl class="details">${fields.map(([k,v])=>`<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl></section>`,{back});
   watchDirectory(path,m,next=>memberDetail(id,back,next));
@@ -402,25 +417,21 @@ function reset(){
 }
 async function boot(){
   const s=await api('state');stage=s.stage;me=s.profile;
-  if(['policy','restricted','contact'].includes(stage)){limitedPage(stage);return;}
+  if(['policy','restricted'].includes(stage)){limitedPage(stage);return;}
   if(stage==='member'){
+    if(s.needsRecoveryCopy){await recoveryPage();return;}
     void syncPush(true);
     if(new URLSearchParams(location.search).get('inbox')==='1'){
-      history.replaceState(null,'','/');await rooms();
+      history.replaceState(null,'','/app');await rooms();
     }else await people();
     return;
   }
-  if(stage==='verified'){await regionStep();return;}
+  if(stage==='details'){Object.assign(draft,{nick:s.nick,gender:s.gender});await regionStep();return;}
   if(stage==='gate_ok'){draft.nick=s.nick||draft.nick;nick();return;}gate();
 }
 async function start(){
   await api('status');
   if(admin){await adminHome();return;}
-  if(location.pathname==='/identity-return'){
-    const q=new URLSearchParams(location.search);history.replaceState(null,'','/');
-    try{if(q.has('code'))throw new Error('본인인증이 완료되지 않았어요.');await completeIdentity(q.get('identityVerificationId'));}
-    catch(e){await boot();err(e);}return;
-  }
   main.innerHTML=`<div class="splash"><div class="stamp">${icon('leaf')}</div><h1>당신의 성향을 존중합니다</h1></div>`;
   await new Promise(r=>setTimeout(r,matchMedia('(prefers-reduced-motion: reduce)').matches?100:1300));await boot();
 }
@@ -439,7 +450,7 @@ function pulse(protect=false){
       const status=await api('status');
       if(leaving)return;
       if(admin && adminPrivate && !status.adminSignedIn){adminLogin();note('관리자 로그인이 종료됐어요.');}
-      if(!admin && ['member','restricted','policy','contact'].includes(stage) && status.stage!==stage){
+      if(!admin && ['member','restricted','policy'].includes(stage) && status.stage!==stage){
         if(status.stage==='gate'){me=null;selectedArea='';await boot();err(new Error('사용자 정보가 없거나 로그인이 종료되었어요. 다시 인증해 주세요.'));}
         else await boot();
       }
