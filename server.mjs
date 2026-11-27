@@ -10,6 +10,7 @@ import { textVault } from './vault.mjs';
 import { contactVault } from './contacts.mjs';
 import { pushProvider } from './push-provider.mjs';
 import { pushQueue } from './push-queue.mjs';
+import { webPushProvider } from './web-push.mjs';
 import { moderation, checkText } from './moderation.mjs';
 import { policyVersion } from './public/rules.js';
 import { renderPrivacyPage } from './privacy.mjs';
@@ -24,6 +25,7 @@ function directoryArea(url) {
 }
 const profileCols='id,nick,year,gender,area,memo';
 const assets=new Map(Object.entries({'/':'index.html','/app':'index.html','/codenotekyh':'index.html','/support':'support.html','/app.js':'app.js','/theme.css':'theme.css','/icon.svg':'icon.svg','/headings.woff':'headings.woff','/rules.js':'rules.js','/privacy.js':'privacy.js'}));
+assets.set('/web-push-worker.js','web-push-worker.js');
 const type={html:'text/html',js:'text/javascript',css:'text/css',svg:'image/svg+xml',woff:'font/woff'};
 const token=()=>randomBytes(32).toString('hex');
 const digest=s=>createHash('sha256').update(s).digest();
@@ -58,7 +60,11 @@ export function makeServer(config, upstream=providers) {
   const db=openStore(config.dir), h=(scope,v)=>createHmac('sha256',secret).update(scope+'|'+v).digest('hex');
   const safety=moderation(db);
   const delivery=config.pushProvider || pushProvider();
-  const pushes=pushQueue(db,delivery,safety);
+  const webDelivery=config.webPushProvider || webPushProvider(db,secret);
+  const pushes=pushQueue(db,{
+    enabled:platform=>(platform==='web'?webDelivery:delivery).enabled(platform),
+    send:(job,...args)=>(job.platform==='web'?webDelivery:delivery).send(job,...args)
+  },safety);
   // Both directory listings and room listings join the other member as p.
   const visiblePeer=`p.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM restrictions x WHERE x.identity=p.identity AND x.until>?)
     AND NOT EXISTS(SELECT 1 FROM blocks x WHERE (x.owner=? AND x.peer=p.id) OR (x.owner=p.id AND x.peer=?))`;
@@ -298,6 +304,7 @@ export function makeServer(config, upstream=providers) {
       return ok({android:Boolean(delivery.androidClient) && available('android'),
         'ios-dev':available('ios-dev'),'ios-prod':available('ios-prod')});
     }
+    if(!post && p==='/api/push/web-config')return ok({publicKey:webDelivery.publicKey});
     if(!post && p==='/api/public-info') {
       const email=String(process.env.SUPPORT_EMAIL || 'code_note95@naver.com').trim();
       let supportUrl='';
@@ -369,7 +376,18 @@ export function makeServer(config, upstream=providers) {
     }
     if(post && p==='/api/push/device') {
       const s=need(req,'member');
+      if(b.platform==='web')reject(400,'브라우저 알림 등록 경로를 사용해 주세요.');
       return ok(pushes.bind(s.id,b.platform,b.token));
+    }
+    if(post && p==='/api/push/web') {
+      const s=need(req,'member');
+      if(b.subscription===null){pushes.unbind(s.id);return ok();}
+      return ok(pushes.bind(s.id,'web',b.subscription));
+    }
+    if(!post && p==='/api/push/web/check') {
+      const s=sessions(req),message=Number(u.searchParams.get('message')),device=u.searchParams.get('device')||'';
+      return ok({notify:Boolean(s?.kind==='member' && Number.isSafeInteger(message) && message>0 &&
+        /^[a-f0-9-]{36}$/.test(device) && pushes.mayNotify(s.id,device,message))});
     }
     if(post && p==='/api/presence') {
       const s=need(req,'member',true);

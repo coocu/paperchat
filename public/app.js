@@ -68,7 +68,7 @@ async function api(path,body,{keepalive=false}={}) {
   const expectedMember=!admin&&memberId&&!path.startsWith('admin/')&&!['status','key','account/login'].includes(path)?memberId:null;
   const headers=body===undefined?{}:{'Content-Type':'application/json'};
   if(expectedMember)headers['X-PaperChat-Member']=expectedMember;
-  const background=['status','presence','unread','push/device'].includes(path);
+  const background=['status','presence','unread','push/device','push/web','push/web-config'].includes(path);
   const controller=['status','presence'].includes(path)?new AbortController():null;
   const timer=controller?setTimeout(()=>controller.abort(),8000):null;
   let res;
@@ -316,7 +316,7 @@ function nick(){
 }
 function loginPage(){
   paint('다시 로그인','key',`<form class="paper">${field('recovery','개인 복구코드','type="password" autocomplete="off" spellcheck="false" maxlength="64"')}<p class="note">가입할 때 보관한 개인 복구코드를 입력하면 내 프로필과 대화가 열려요.</p>${actions(btn('로그인'))}</form>`,{back:gate});
-  form(async f=>{await api('account/login',{code:f.get('recovery')});await boot();});
+  form(async f=>{requestWebPushPermission(true);await api('account/login',{code:f.get('recovery')});await boot();});
 }
 function details(){
   paint('생년월일과 성별','pen',`<form class="paper">${field('birthDate','생년월일',`type="date" autocomplete="bday" min="1900-01-01" value="${esc(draft.birthDate)}"`)}
@@ -369,15 +369,65 @@ async function regionStep(){
 }
 function memo(){
   paint('당신은 어떤 사람인가요?','leaf',rulesCard()+`<form class="paper"><label for="memo">당신을 표현해주세요</label><textarea id="memo" name="memo" required maxlength="800" placeholder="나를 소개하는 글을 자유롭게 적어주세요.">${esc(draft.memo)}</textarea><div class="rule"></div><label class="check"><input type="checkbox" required><span>이용규칙에 동의해요</span></label>${actions(btn('확인'))}</form>`,{back:()=>{draft.memo=$('#memo').value;return regionStep();}});
-  form(async f=>{draft.memo=f.get('memo');await api('register',{area:draft.province+' '+draft.district,memo:draft.memo,policy:policyVersion});draft.birthDate='';await boot();});
+  form(async f=>{requestWebPushPermission(true);draft.memo=f.get('memo');await api('register',{area:draft.province+' '+draft.district,memo:draft.memo,policy:policyVersion});draft.birthDate='';await boot();});
 }
 const applePush=window.webkit?.messageHandlers?.paperChatPush;
 const androidPush=/PaperChatAndroid\/\d+/.test(globalThis.navigator?.userAgent||'');
+let webPermissionPending=false,webAutoPrompted=false,webGesturePrompted=false,webPushSync=null,nextWebPushSync=0;
+function supportsWebPush(){
+  return !admin && !applePush && !androidPush && !/PaperChatIOS\/\d+/.test(navigator.userAgent||'')
+    && typeof window.paperChatNativeForeground!=='boolean' && window.isSecureContext===true
+    && typeof window.Notification?.requestPermission==='function' && typeof window.PushManager==='function'
+    && typeof navigator.serviceWorker?.register==='function';
+}
+function requestWebPushPermission(gesture=false){
+  if(!supportsWebPush() || window.Notification.permission!=='default' || webPermissionPending)return;
+  if(gesture?webGesturePrompted:webAutoPrompted)return;
+  if(gesture)webGesturePrompted=true;
+  webAutoPrompted=true;
+  webPermissionPending=true;
+  // Request synchronously in the existing login/signup gesture, before HTTP.
+  // A browser may use a quiet prompt or require the next actual user gesture.
+  try{Promise.resolve(window.Notification.requestPermission()).then(async()=>{
+    if(webPushSync)await webPushSync;
+    await syncWebPush(true);
+  }).catch(()=>{}).finally(()=>{webPermissionPending=false;});}
+  catch{webPermissionPending=false;}
+}
+for(const event of ['click','keydown'])document.addEventListener(event,e=>{
+  if(e.isTrusted && stage==='member' && foregroundVisible())requestWebPushPermission(true);
+},{capture:true});
+async function syncWebPush(force=false){
+  if(!supportsWebPush() || stage!=='member' || !foregroundVisible() || leaving || webPushSync || (!force && Date.now()<nextWebPushSync))return;
+  const revision=accountRevision,member=currentMemberId();
+  const current=()=>revision===accountRevision && member===currentMemberId() && stage==='member' && !leaving;
+  nextWebPushSync=Date.now()+180000;
+  webPushSync=(async()=>{
+    if(window.Notification.permission!=='granted'){
+      await api('push/web',{subscription:null});return;
+    }
+    const config=await api('push/web-config');if(!current())return;
+    if(typeof config.publicKey!=='string' || !/^[\w-]{87}$/.test(config.publicKey))throw Error('Web push key');
+    const key=Uint8Array.from(atob(config.publicKey.replace(/-/g,'+').replace(/_/g,'/')),c=>c.charCodeAt(0));
+    await navigator.serviceWorker.register('/web-push-worker.js',{scope:'/',updateViaCache:'none'});
+    const registration=await navigator.serviceWorker.ready;if(!current())return;
+    let subscription=await registration.pushManager.getSubscription();if(!current())return;
+    if(subscription){
+      const previous=new Uint8Array(subscription.options?.applicationServerKey||[]);
+      if(previous.length!==key.length || previous.some((v,i)=>v!==key[i])){await subscription.unsubscribe();subscription=null;}
+    }
+    if(!current())return;
+    if(!subscription)subscription=await registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:key});
+    if(current() && window.Notification.permission==='granted')await api('push/web',{subscription:subscription.toJSON()});
+  })().catch(()=>{if(current())nextWebPushSync=Date.now()+15000;}).finally(()=>{webPushSync=null;});
+  return webPushSync;
+}
 let nextPushSync=0;
 function pushResult(status){
   if(status==='failed' || status==='checking')nextPushSync=Date.now()+15000;
 }
 async function syncPush(force=false){
+  if(!applePush && !androidPush){await syncWebPush(force);return;}
   if(admin || stage!=='member' || !foregroundVisible() || (!applePush && !androidPush) || (!force && Date.now()<nextPushSync))return;
   const revision=accountRevision;
   nextPushSync=Date.now()+180000;
@@ -761,6 +811,7 @@ async function boot(){
   stage=s.stage;me=s.profile;accountState=s;updatePresence(true);
   if(['policy','restricted'].includes(stage)){limitedPage(stage);return;}
   if(stage==='member'){
+    requestWebPushPermission();void syncWebPush(true);
     await syncUnread();
     if(revision!==accountRevision||serial!==bootSerial||stage!=='member')return;
     if(s.needsRecoveryCopy){await recoveryPage();return;}

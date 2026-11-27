@@ -37,7 +37,7 @@ function browser({version,search='',userAgent='',pathname='/app',EventSource,ins
     policyVersion,reasons,rules,privacyEffectiveDate,privacyIntro,privacySections,sessionStorage:storage(session),localStorage:storage(local),
     Option:class { constructor(text,value){this.text=text;this.value=value;} },
     FormData:class { constructor(form){this.form=form;}get(key){return this.form.values?.[key]??'';} },
-    URL,URLSearchParams,fetch:async(url,options)=>{const r=await fetchReply(url,options),status=r?.$status||200;return {ok:status>=200&&status<300,status,headers:{get:k=>k==='X-Service-Version'?r?.version:k==='X-Room-Version'?r?.$roomVersion:null},json:async()=>r?.$body??r};}});
+    URL,URLSearchParams,atob,fetch:async(url,options)=>{const r=await fetchReply(url,options),status=r?.$status||200;return {ok:status>=200&&status<300,status,headers:{get:k=>k==='X-Service-Version'?r?.version:k==='X-Room-Version'?r?.$roomVersion:null},json:async()=>r?.$body??r};}});
   runInContext(script,ctx);
   return {run:code=>runInContext(code,ctx),element,local,location,history,session,intervals,events};
 }
@@ -762,4 +762,79 @@ test('관리자는 다운로드 주소 두 개를 각각 비워 저장할 수 �
   await form.handlers.submit({preventDefault(){},currentTarget:form});assert.deepEqual(writes,[{androidUrl:'',iosUrl:'https://download.example/ios'}]);
   form.values={androidUrl:'javascript:alert(1)',iosUrl:''};await form.handlers.submit({preventDefault(){},currentTarget:form});assert.equal(writes.length,1);assert.match(b.element('#error').textContent,/https:/);
   for(const value of ['https://user:secret@download.example/app','https://download.example/\napp'])assert.throws(()=>b.run(`downloadURL(${JSON.stringify(value)})`));
+});
+
+function webPushFixture({permission='granted',requestPermission,registration,publicKey=Buffer.alloc(65,4).toString('base64url')}={}){
+  const calls=[],notifier={permission,requestPermission:requestPermission||(()=>{calls.push('permission');return Promise.resolve(notifier.permission);})};
+  const sub={options:{applicationServerKey:Buffer.from(publicKey,'base64url')},toJSON:()=>({endpoint:'https://fcm.googleapis.com/fcm/send/fixture',keys:{p256dh:'fixture',auth:'fixture'}})};
+  const ready=registration||{pushManager:{getSubscription:async()=>sub,subscribe:async()=>{calls.push('subscribe');return sub;}}};
+  return {calls,notifier,publicKey,sub,windowProps:{isSecureContext:true,Notification:notifier,PushManager:function(){}},navigatorProps:{serviceWorker:{register:async path=>{calls.push(path);return ready;},ready:Promise.resolve(ready)}}};
+}
+const webReply=url=>url==='/api/people'?[]:url==='/api/unread'?{total:0}:{stage:'member',profile:{id:'web-self',nick:'회원',area:'서울 동부'}};
+
+test('PC·Chrome Android·삼성인터넷 로그인 동작에서 HTTP보다 먼저 권한을 요청하고 별도 활성화 버튼을 넣지 않는다',async()=>{
+  for(const userAgent of ['Mozilla/5.0 Macintosh Chrome/145','Mozilla/5.0 Android Mobile Chrome/145','Mozilla/5.0 Android SamsungBrowser/29 Mobile']){
+    const events=[];const w=webPushFixture({permission:'default',requestPermission:()=>{events.push('permission');return new Promise(()=>{});}});
+    const b=browser({...w,userAgent,pathname:'/',fetchReply:url=>{events.push(url);return webReply(url);}});
+    b.run('loginPage()');b.element('form').values={recovery:'fixture'};
+    await b.element('form').handlers.submit({preventDefault(){},currentTarget:b.element('form')});
+    assert.deepEqual(events.slice(0,2),['permission','/api/account/login']);
+    assert.equal(events.filter(v=>v==='permission').length,1);
+    assert.doesNotMatch(b.element('#app').innerHTML,/알림 활성화/);
+    assert.match(b.element('#app').innerHTML,/프로필 목록/);
+  }
+});
+
+test('이미 허용된 웹 알림은 자동 로그인 시 서비스워커 구독을 현재 회원에 연결한다',async()=>{
+  const w=webPushFixture(),posts=[];
+  const b=browser({...w,pathname:'/',fetchReply:(url,options)=>{
+    if(url==='/api/push/web-config')return {publicKey:w.publicKey};
+    if(url==='/api/push/web'){posts.push(options);return {configured:true};}
+    return webReply(url);
+  }});
+  await b.run('boot()');await b.run('webPushSync');
+  assert.equal(w.calls.includes('permission'),false);
+  assert.ok(w.calls.includes('/web-push-worker.js'));
+  assert.equal(posts.length,1);
+  assert.equal(posts[0].headers['X-PaperChat-Member'],'web-self');
+  assert.deepEqual(JSON.parse(posts[0].body),{subscription:w.sub.toJSON()});
+});
+
+test('차단된 알림은 재요청 없이 서버 연결만 해제하고 로그인과 대화 이용은 유지한다',async()=>{
+  const w=webPushFixture({permission:'denied'}),posts=[];
+  const b=browser({...w,fetchReply:(url,options)=>{if(url==='/api/push/web')posts.push(JSON.parse(options.body));return webReply(url);}});
+  await b.run('boot()');await b.run('webPushSync');b.run('requestWebPushPermission(true)');
+  assert.deepEqual(w.calls,[]);assert.deepEqual(posts,[{subscription:null}]);
+  assert.match(b.element('#app').innerHTML,/프로필 목록/);
+});
+
+test('권한 미결정 자동 로그인은 자동 요청 후 다음 사용자 동작에서 한 번만 재시도한다',async()=>{
+  const w=webPushFixture({permission:'default'});
+  const b=browser({...w,fetchReply:()=>({})});b.run("stage='member';me={id:'self'};requestWebPushPermission()");
+  await new Promise(r=>setImmediate(r));
+  await b.events.get('click')({isTrusted:true});await new Promise(r=>setImmediate(r));
+  await b.events.get('click')({isTrusted:true});await b.events.get('keydown')({isTrusted:true});
+  assert.equal(w.calls.filter(c=>c==='permission').length,2);
+});
+
+test('로그아웃이나 계정 변경 후 늦게 완료된 브라우저 구독은 다른 계정에 등록하지 않는다',async()=>{
+  let release;const ready=new Promise(r=>release=r),w=webPushFixture(),requests=[];
+  w.navigatorProps.serviceWorker.ready=ready;
+  const b=browser({...w,fetchReply:url=>{requests.push(url);return {publicKey:w.publicKey};}});
+  b.run("stage='member';me={id:'old'};void syncWebPush(true)");
+  await new Promise(r=>setImmediate(r));
+  b.run("accountRevision++;stage='member';me={id:'new'}");
+  release({pushManager:{getSubscription:async()=>w.sub}});await b.run('webPushSync');
+  assert.equal(requests.includes('/api/push/web'),false);
+});
+
+test('웹 알림은 네이티브 앱·관리자·보안 연결이 아닌 화면에서 실행하지 않는다',async()=>{
+  for(const variant of [{userAgent:'PaperChatAndroid/3'},{userAgent:'PaperChatIOS/4'},{pathname:'/codenotekyh'},{native:true},{insecure:true}]){
+    const w=webPushFixture({permission:'default'}),requests=[];
+    if(variant.native)w.windowProps.paperChatNativeForeground=true;
+    if(variant.insecure)w.windowProps.isSecureContext=false;
+    const b=browser({...w,...variant,fetchReply:url=>{requests.push(url);return {};}});
+    b.run("stage='member';me={id:'self'};requestWebPushPermission(true)");await b.run('syncWebPush(true)');
+    assert.deepEqual(w.calls,[]);assert.deepEqual(requests,[]);
+  }
 });

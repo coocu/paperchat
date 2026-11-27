@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { transaction } from './store.mjs';
 import { reject } from './providers.mjs';
+import { webSubscription } from './web-push.mjs';
 
 export function pushQueue(db, provider, safety) {
   db.exec(`
@@ -18,15 +19,34 @@ export function pushQueue(db, provider, safety) {
   let running, closed = false;
 
   function bind(session, platform, token) {
+    let subscription;
+    if(platform==='web') {
+      subscription=webSubscription(token);
+      token=JSON.stringify(subscription);
+    }
     const valid = platform==='android' ? /^[\w:-]{20,4096}$/ : /^(?:[\da-f]{2}){16,256}$/;
-    if (!['android','ios-dev','ios-prod'].includes(platform) || typeof token!=='string' || !valid.test(token))
+    if (!['android','ios-dev','ios-prod','web'].includes(platform) || typeof token!=='string' || (platform!=='web' && !valid.test(token)))
       reject(400,'알림 기기 정보를 확인해 주세요.');
     transaction(db,()=>{
       if (get('SELECT 1 FROM push_devices WHERE session=? AND platform=? AND token=?',session,platform,token)) return;
+      if(subscription)run("DELETE FROM push_devices WHERE platform='web' AND json_extract(token,'$.endpoint')=?",subscription.endpoint);
       run('DELETE FROM push_devices WHERE platform=? AND (session=? OR token=?)',platform,session,token);
       run('INSERT INTO push_devices VALUES(?,?,?,?)',randomUUID(),session,platform,token);
     });
     return {configured:provider.enabled(platform)};
+  }
+  function mayNotify(session,device,message) {
+    const now=Date.now();
+    const row=get(`SELECT s.member,m.author FROM push_devices d JOIN sessions s ON s.id=d.session
+      JOIN messages m ON m.id=? JOIN rooms r ON r.id=m.room LEFT JOIN reviews v ON v.message=m.id
+      WHERE d.id=? AND d.session=? AND d.platform='web' AND s.kind='member' AND s.expires>?
+      AND s.member=CASE WHEN r.a=m.author THEN r.b ELSE r.a END
+      AND r.closed_at IS NULL AND m.deleted_at IS NULL
+      AND m.id>COALESCE((SELECT through FROM room_reads WHERE room=r.id AND member=s.member),0)
+      AND ((m.body IS NOT NULL AND v.state IS NULL) OR (v.state='approved' AND m.photo IS NOT NULL AND m.expires>?))
+      AND NOT EXISTS(SELECT 1 FROM reports WHERE message=m.id AND status='open')`,message,device,session,now,now);
+    if(!row || safety.memberStage(row.member)!=='member' || safety.memberStage(row.author)!=='member')return false;
+    try{safety.pairAllowed(row.member,row.author);return true;}catch{return false;}
   }
   function enqueue(message) {
     const now=Date.now();
@@ -51,7 +71,8 @@ export function pushQueue(db, provider, safety) {
   async function deliver(job) {
     try {
       const valid=()=>deliverable(job.id);
-      const result=valid() && provider.enabled(job.platform) ? await provider.send(job,job.id,valid) : 'skip';
+      const allowed=()=>valid() && (job.platform!=='web' || mayNotify(job.session,job.device,job.message));
+      const result=allowed() && provider.enabled(job.platform) ? await provider.send(job,job.id,allowed) : 'skip';
       if (closed) return;
       if (result==='invalid') run('DELETE FROM push_devices WHERE id=?',job.device);
       run('DELETE FROM push_jobs WHERE id=?',job.id);
@@ -64,7 +85,7 @@ export function pushQueue(db, provider, safety) {
   async function drain() {
     if (closed) return;
     run('DELETE FROM push_jobs WHERE expires<=?',Date.now());
-    const jobs=db.prepare(`SELECT j.*,d.token,d.platform FROM push_jobs j JOIN push_devices d ON d.id=j.device
+    const jobs=db.prepare(`SELECT j.*,d.token,d.platform,d.session FROM push_jobs j JOIN push_devices d ON d.id=j.device
       WHERE j.due<=? ORDER BY j.due,j.rowid LIMIT 12`).all(Date.now());
     await Promise.all(jobs.map(deliver));
   }
@@ -72,5 +93,5 @@ export function pushQueue(db, provider, safety) {
     running ||= drain().finally(()=>{running=null;});
     return running;
   }
-  return {bind,enqueue,flush,close(){closed=true;}};
+  return {bind,enqueue,flush,mayNotify,unbind(session){run("DELETE FROM push_devices WHERE session=? AND platform='web'",session);},close(){closed=true;}};
 }
