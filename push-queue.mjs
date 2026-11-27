@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { transaction, openMessageReportSQL } from './store.mjs';
+import { transaction, openMessageReportSQL, messageLiveSQL } from './store.mjs';
 import { reject } from './providers.mjs';
 import { webSubscription } from './web-push.mjs';
 
@@ -43,7 +43,7 @@ export function pushQueue(db, provider, safety) {
       AND s.member=CASE WHEN r.a=m.author THEN r.b ELSE r.a END
       AND r.closed_at IS NULL AND m.deleted_at IS NULL
       AND m.id>COALESCE((SELECT through FROM room_reads WHERE room=r.id AND member=s.member),0)
-      AND ((m.body IS NOT NULL AND v.state IS NULL) OR (v.state='approved' AND m.photo IS NOT NULL AND m.expires>?))
+      AND ${messageLiveSQL()} AND ((m.body IS NOT NULL AND v.state IS NULL) OR (v.state='approved' AND m.photo IS NOT NULL))
       AND NOT ${openMessageReportSQL('m.id')}`,message,device,session,now,now);
     if(!row || safety.memberStage(row.member)!=='member' || safety.memberStage(row.author)!=='member')return false;
     try{safety.pairAllowed(row.member,row.author);return true;}catch{return false;}
@@ -52,7 +52,7 @@ export function pushQueue(db, provider, safety) {
     const now=Date.now();
     const devices=db.prepare(`SELECT d.id FROM messages m JOIN rooms r ON r.id=m.room
       JOIN sessions s ON s.member=CASE WHEN r.a=m.author THEN r.b ELSE r.a END
-      JOIN push_devices d ON d.session=s.id WHERE m.id=? AND s.expires>? AND r.closed_at IS NULL AND m.deleted_at IS NULL`).all(message,now);
+      JOIN push_devices d ON d.session=s.id WHERE m.id=? AND s.expires>? AND ${messageLiveSQL()} AND r.closed_at IS NULL AND m.deleted_at IS NULL`).all(message,now,now);
     for(const d of devices) run('INSERT OR IGNORE INTO push_jobs(id,message,device,due,expires) VALUES(?,?,?,?,?)',
       randomUUID(),message,d.id,now,now+600000);
   }
@@ -63,7 +63,7 @@ export function pushQueue(db, provider, safety) {
       JOIN sessions s ON s.id=d.session JOIN messages m ON m.id=j.message JOIN rooms r ON r.id=m.room
       LEFT JOIN reviews v ON v.message=m.id WHERE j.id=? AND j.expires>? AND s.expires>?
       AND m.deleted_at IS NULL AND r.closed_at IS NULL
-      AND ((m.body IS NOT NULL AND v.state IS NULL) OR (v.state='approved' AND m.photo IS NOT NULL AND m.expires>?))
+      AND ${messageLiveSQL()} AND ((m.body IS NOT NULL AND v.state IS NULL) OR (v.state='approved' AND m.photo IS NOT NULL))
       AND NOT ${openMessageReportSQL('m.id')}`,id,now,now,now);
     if (!row || safety.memberStage(row.member)!=='member' || safety.memberStage(row.author)!=='member') return false;
     try { safety.pairAllowed(row.member,row.author); return true; } catch { return false; }

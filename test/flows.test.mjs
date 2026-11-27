@@ -545,7 +545,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     await a(path,{photo:Buffer.from([255,216,255,217]).toString('base64')});
     photo=(await b(path)).body.at(-1).id;
   });
-  await t.test('재시작 후에도 세션·폼·대화가 유지되고 12시간에 사진 열람 및 정리가 적용된다',async()=>{
+  await t.test('재시작 후 세션·폼·유효 대화는 유지되고 전송 24시간에 글과 사진 원문이 함께 사라진다',async()=>{
     const version=(await a('/api/status')).body.version;
     const oldId=randomBytes(32).toString('hex');
     db.prepare('INSERT INTO sessions(id,kind,expires) VALUES(?,?,?)').run(oldId,'admin',now+hour);
@@ -557,12 +557,19 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.equal((await a('/api/unread')).body.total,0);
     assert.equal((await nobody('/apply')).headers.location,'https://two.example/apply');
     const stamp=db.prepare('SELECT expires FROM messages WHERE id=?').get(photo).expires;
+    assert.equal(stamp,now+24*hour);
+    assert.equal((await a('/api/rooms/'+room+'/messages',{body:'24시간 경계 텍스트'})).status,200);
+    const text=(await b('/api/rooms/'+room+'/messages')).body.at(-1);
+    assert.equal(text.expires,null);assert.equal(text.expiresAt,stamp);
     now=stamp-1;assert.equal((await b('/api/photos/'+photo)).status,200);
+    assert.equal((await b('/api/rooms/'+room+'/messages')).body.find(m=>m.id===text.id).body,'24시간 경계 텍스트');
     now=stamp;assert.equal((await b('/api/photos/'+photo)).status,410);
-    clean(db,now);assert.equal(db.prepare('SELECT photo FROM messages WHERE id=?').get(photo).photo,null);
-    assert.equal((await a('/api/rooms/'+room+'/messages')).body[0].visibility,'deleted');
+    assert.deepEqual((await a('/api/rooms/'+room+'/messages')).body,[]);
     await admin('/api/admin/login',{key:adminKey});
-    assert.equal((await admin('/api/admin/rooms/'+room+'/messages')).body[0].body,'반가워요');
+    assert.deepEqual((await admin('/api/admin/rooms/'+room+'/messages')).body,[]);
+    assert.deepEqual((await admin('/api/admin/rooms/'+room+'/messages?q='+encodeURIComponent('24시간 경계'))).body,[]);
+    clean(db,now);assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages WHERE room=?').get(room).n,0);
+    assert.equal((await b('/api/photos/'+photo)).status,404);
   });
   await t.test('이전 버전 회원 세션과 대화는 유지되고 검토 이력이 없는 사진은 즉시 표시한다',async()=>{
     const C=(await c('/api/state')).body.profile, A=(await a('/api/state')).body.profile;
@@ -582,6 +589,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     server.emit('close');server=makeServer(cfg,providers);
     assert.equal((await b('/api/photos/'+old.lastInsertRowid)).status,200);
     assert.equal(db.prepare('SELECT state FROM reviews WHERE message=?').get(old.lastInsertRowid).state,'approved');
+    assert.equal(db.prepare('SELECT expires FROM messages WHERE id=?').get(old.lastInsertRowid).expires,now+24*hour);
   });
   await t.test('탈퇴하면 전 기기 세션이 종료되고 24시간 뒤 새 계정으로 가입한다',async()=>{
     const other=client();assert.equal((await pass(other,'','DI-A')).body.stage,'member');

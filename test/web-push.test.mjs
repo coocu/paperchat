@@ -237,15 +237,18 @@ test('reports, author deletion, leaving and blocking suppress pending and alread
   await f.queue.flush();assert.equal(f.delivered.length,0);
 });
 
-test('photo confirmation stops exactly at original twelve-hour expiry, including notifications already sent',async t=>{
-  const f=fixture(t),a=await f.member('사진 발신'),b=await f.member('사진 수신');
-  const room=await f.room(a,b),device=await f.bind(b),message=await f.send(a,room,{photo});
+for(const kind of ['text','photo'])test(kind+' confirmation stops exactly twenty-four hours after sending, including notifications already sent',async t=>{
+  const f=fixture(t),a=await f.member('발신 회원'),b=await f.member('수신 회원');
+  const room=await f.room(a,b),device=await f.bind(b),message=await f.send(a,room,kind==='photo'?{photo}:{body:'24시간 후 삭제할 개인 대화'});
   assert.equal(await f.check(b.call,device.id,message),true);await f.queue.flush();assert.equal(f.delivered.length,1);
   assert.deepEqual(Object.keys(f.delivered[0]).sort(),['device','event','kind','message']);
-  f.advance(12*hour-1);assert.equal(await f.check(b.call,device.id,message),true);
+  const listed=(await b.call('/api/rooms/'+room+'/messages')).body.find(item=>item.id===message);
+  assert.equal(listed.expiresAt,f.now()+24*hour);assert.equal(listed.expires,kind==='photo'?listed.expiresAt:null);
+  f.advance(24*hour-1);assert.equal(await f.check(b.call,device.id,message),true);
   f.advance(1);assert.equal(await f.check(b.call,device.id,message),false);
+  assert.equal((await b.call('/api/rooms/'+room+'/messages')).body.some(item=>item.id===message),false);
   f.queue.enqueue(message);await f.queue.flush();assert.equal(f.delivered.length,1);
-  clean(f.db,f.now());assert.equal(f.db.prepare('SELECT photo FROM messages WHERE id=?').get(message).photo,null);
+  clean(f.db,f.now());assert.equal(f.db.prepare('SELECT 1 FROM messages WHERE id=?').get(message),undefined);
 });
 
 test('expired sessions, policy changes, restrictions, logout and account removal suppress delayed notifications',async t=>{

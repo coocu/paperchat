@@ -87,9 +87,14 @@ test('monitor profiles group every participating room and separate profile-regio
   assert.equal(nameMatches.find(profile=>profile.id===a.id).matchedRoomCount,3);
   for(const member of [b,c,d])assert.equal(nameMatches.find(profile=>profile.id===member.id).matchedRoomCount,1);
   assert.equal((await admin('/api/admin/members/'+b.id+'/delete',{confirm:true})).status,200);
-  const tombstone=(await admin(profiles)).body.find(profile=>profile.id===b.id);
-  assert.equal(tombstone.deletedAt,f.now());assert.equal(tombstone.roomCount,2);
-  assert.equal((await admin(rooms+'?member='+b.id)).body.length,2);
+  const remaining=(await admin(profiles)).body;
+  assert.equal(remaining.some(profile=>profile.id===b.id),false);
+  assert.equal(remaining.find(profile=>profile.id===a.id).roomCount,2);
+  assert.equal(remaining.find(profile=>profile.id===c.id).roomCount,1);
+  assert.equal((await admin(rooms+'?member='+b.id)).status,404);
+  assert.deepEqual((await admin(rooms)).body.map(room=>room.id).sort(),[ac,ad].sort());
+  for(const deletedRoom of [ab,bc])assert.equal((await admin(rooms+'/'+deletedRoom+'/messages')).status,404);
+  assert.deepEqual((await admin(profiles+'?q='+query('Beta'))).body,[]);
 });
 
 test('literal Unicode text search counts rooms and produces a short snippet around the latest matching message',async t=>{
@@ -126,8 +131,10 @@ test('search retains administrator-readable deletion and report originals but ex
   f.db.prepare("INSERT INTO reviews VALUES(?,'removed')").run(removed);
   assert.equal((await b.call('/api/report',{kind:'message',message:reported,reason:'괴롭힘·기타 위반'})).status,200);
   const expired=f.db.prepare('INSERT INTO messages(room,author,sent,body,photo,expires) VALUES(?,?,?,?,?,?)')
-    .run(room,a.id,f.now()-12*hour,'공통검색 EXPIRED_SECRET',Buffer.from([255,216,255,217]),f.now()).lastInsertRowid;
+    .run(room,a.id,f.now()-24*hour,'공통검색 EXPIRED_SECRET',Buffer.from([255,216,255,217]),f.now()).lastInsertRowid;
   f.db.prepare("INSERT INTO reviews VALUES(?,'approved')").run(expired);
+  f.db.prepare('INSERT INTO messages(room,author,sent,body) VALUES(?,?,?,?)')
+    .run(room,b.id,f.now()-24*hour,'공통검색 EXPIRED_TEXT_SECRET');
   assert.equal((await b.call('/api/rooms/'+room+'/leave',{confirm:true})).status,200);
   const results=(await admin(rooms+'/'+room+'/messages?q='+query('공통검색'))).body;
   assert.deepEqual(results.map(message=>message.id),[retained,reported]);
@@ -135,7 +142,7 @@ test('search retains administrator-readable deletion and report originals but ex
   const roomResult=(await admin(rooms+'?q='+query('공통검색'))).body[0];
   assert.equal(roomResult.matchingMessages,2);assert.ok(roomResult.matchSnippet.includes('신고 검토 원문'));
   assert.equal(roomResult.closedReason,'left');
-  for(const secret of ['REMOVED_SECRET','EXPIRED_SECRET']){
+  for(const secret of ['REMOVED_SECRET','EXPIRED_SECRET','EXPIRED_TEXT_SECRET']){
     assert.deepEqual((await admin(profiles+'?q='+secret)).body,[]);
     assert.deepEqual((await admin(rooms+'?q='+secret)).body,[]);
     assert.deepEqual((await admin(rooms+'/'+room+'/messages?q='+secret)).body,[]);
@@ -174,7 +181,7 @@ test('monitor and message search preserve administrator authentication and rejec
   for(const path of [profiles+'?q='+query('a'.repeat(201)),rooms+'?q='+query('a'.repeat(201)),rooms+'/'+room+'/messages?q='+query('a'.repeat(201)),
     profiles+'?area=unknown',rooms+'?area=unknown',rooms+'?member=',rooms+'?member=not-a-uuid',rooms+'/'+room+'/messages?q=test&before=bad'])
     assert.equal((await admin(path)).status,400,path);
-  assert.deepEqual((await admin(rooms+'?member='+randomUUID())).body,[]);
+  assert.equal((await admin(rooms+'?member='+randomUUID())).status,404);
   assert.deepEqual((await admin(profiles+'?q=%20%20')).body,(await admin(profiles)).body);
   assert.equal((await a.call('/api/rooms/'+room+'/messages?q='+query('권한'))).status,400);
   const stranger=await f.member('권한 없는 회원');assert.equal((await stranger.call('/api/rooms/'+room+'/messages?q='+query('권한'))).status,404);

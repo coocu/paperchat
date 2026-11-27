@@ -3,7 +3,7 @@ import { createHmac, createHash, randomBytes, randomUUID, timingSafeEqual } from
 import { readFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
-import { openStore, hour, transaction, clean, closeRoom, tables, openMessageReportSQL } from './store.mjs';
+import { openStore, hour, messageTTL, messageLiveSQL, transaction, clean, closeRoom, tables, openMessageReportSQL, withdrawMember } from './store.mjs';
 import { providers, reject, profileDetails, RequestError } from './providers.mjs';
 
 import { textVault } from './vault.mjs';
@@ -100,10 +100,10 @@ export function makeServer(config, upstream=providers) {
   }
   function endStream(stream) {streams.delete(stream);if(!stream.res.writableEnded)stream.res.end();}
   function closeStreams(predicate=()=>true) {for(const stream of [...streams])if(predicate(stream))endStream(stream);}
-  function notifyRoom(room,change) {
-    const members=get('SELECT a,b,closed_at FROM rooms WHERE id=?',room);
+  function notifyRoom(room,change,removedRoom=null) {
+    const members=removedRoom||get('SELECT a,b,closed_at FROM rooms WHERE id=?',room);
     if(!members)return;
-    const data=JSON.stringify({room,...change,version:roomVersion(room),...(change.closed?{closedAt:members.closed_at}:{})});
+    const data=JSON.stringify({room,...change,version:removedRoom?.version??roomVersion(room),...(change.closed?{closedAt:members.closed_at}:{})});
     for(const stream of [...streams]) {
       if(!streamValid(stream)){endStream(stream);continue;}
       if(stream.member!==members.a && stream.member!==members.b)continue;
@@ -154,6 +154,10 @@ export function makeServer(config, upstream=providers) {
   function proof(code) { return h('recovery-index',code.replace(/[-\s]/g,'').toUpperCase()); }
   const attachKey=db.prepare('INSERT INTO account_keys(member,proof,joined) VALUES(?,?,?)');
   transaction(db,()=>{
+    // Previous administrator deletions left tombstones. Preserve their original
+    // withdrawal time, and use only surviving recorded device associations.
+    for(const m of all('SELECT id,deleted_at FROM members WHERE deleted_at IS NOT NULL'))
+      withdrawMember(db,m.id,{at:m.deleted_at,recoveryProof:proof(recoveryCode(m.id))});
     for(const m of all('SELECT id FROM members WHERE deleted_at IS NULL AND id NOT IN (SELECT member FROM account_keys)'))
       attachKey.run(m.id,proof(recoveryCode(m.id)),null);
     if(!get("SELECT 1 FROM service_meta WHERE key='signup-birth-date'")) {
@@ -179,6 +183,11 @@ export function makeServer(config, upstream=providers) {
     const grant=get('SELECT proof FROM signup_gates WHERE device=?',install);
     if(grant)run("DELETE FROM sessions WHERE identity=? AND kind IN ('gate_ok','details')",grant.proof);
     run('DELETE FROM signup_gates WHERE device=?',install);
+  }
+  function finishWithdrawal(result) {
+    for(const install of result.devices)signupEpochs.set(install,token());
+    closeStreams(stream=>stream.member===result.id);
+    for(const room of result.rooms)notifyRoom(room.id,{closed:true,reason:'withdrawn'},{...room,closed_at:result.withdrawn});
   }
   function throttle(key,max,window) {
     const k=h('rate',key), now=Date.now();
@@ -233,7 +242,7 @@ export function makeServer(config, upstream=providers) {
     return room;
   }
   const visibleMessage=`m.deleted_at IS NULL AND (v.state IS NULL OR v.state='approved')
-    AND ((m.expires IS NULL AND m.body IS NOT NULL) OR (m.photo IS NOT NULL AND m.expires>?))
+    AND ${messageLiveSQL()} AND ((m.expires IS NULL AND m.body IS NOT NULL) OR m.photo IS NOT NULL)
     AND NOT ${openMessageReportSQL('m.id')}`;
   function unread(member,room) {
     return get(`SELECT COUNT(*) AS n FROM messages m LEFT JOIN reviews v ON v.message=m.id
@@ -243,8 +252,8 @@ export function makeServer(config, upstream=providers) {
   function roomList(member,area=null) {
     return all(`SELECT r.id,p.id AS peer,p.nick,p.area,MAX(m.sent) AS recent FROM rooms r
       JOIN members p ON p.id=CASE WHEN r.a=? THEN r.b ELSE r.a END
-      LEFT JOIN messages m ON m.room=r.id WHERE (r.a=? OR r.b=?) AND r.closed_at IS NULL AND (? IS NULL OR p.area=?) AND ${visiblePeer}
-      GROUP BY r.id ORDER BY recent DESC,r.id`,member,member,member,area,area,Date.now(),member,member)
+      LEFT JOIN messages m ON m.room=r.id AND m.sent+${messageTTL}>? WHERE (r.a=? OR r.b=?) AND r.closed_at IS NULL AND (? IS NULL OR p.area=?) AND ${visiblePeer}
+      GROUP BY r.id ORDER BY recent DESC,r.id`,member,Date.now(),member,member,area,area,Date.now(),member,member)
       .map(room=>({...room,...activity(room.peer),unread:unread(member,room.id),version:roomVersion(room.id)}));
   }
   function peopleList(member,area=null,peer=null) {
@@ -252,13 +261,13 @@ export function makeServer(config, upstream=providers) {
       ' ORDER BY (SELECT last_seen FROM member_activity WHERE member=p.id) DESC,p.id',area,area,peer,peer,member,Date.now(),member,member)
       .map(profile=>({...profile,...activity(profile.id),profileVersion:safety.profileContent(profile.id)}));
   }
-  const messageColumns=`m.id,m.room,m.author,p.nick,p.area,m.sent,m.body,m.expires,m.deleted_at AS deletedAt,
+  const messageColumns=`m.id,m.room,m.author,p.nick,p.area,m.sent,m.body,m.expires,m.sent+${messageTTL} AS expiresAt,m.deleted_at AS deletedAt,
     v.state,
-    (m.photo IS NOT NULL AND m.expires>?) AS live,
+    (m.photo IS NOT NULL AND ${messageLiveSQL()}) AS live,
     ${openMessageReportSQL('m.id')} AS reported`;
   const messageJoins=`FROM messages m JOIN members p ON m.author=p.id LEFT JOIN reviews v ON v.message=m.id`;
   const adminSearchVisible=`m.body IS NOT NULL AND (v.state IS NULL OR v.state!='removed')
-    AND (m.expires IS NULL OR (m.photo IS NOT NULL AND m.expires>?))`;
+    AND ${messageLiveSQL()} AND (m.expires IS NULL OR m.photo IS NOT NULL)`;
   const matchingMessages=`SELECT m.id,m.room,m.body,m.sent,m.deleted_at FROM messages m LEFT JOIN reviews v ON v.message=m.id
     WHERE ? IS NOT NULL AND paperchat_contains(m.body,?) AND ${adminSearchVisible}`;
   function searchQuery(url) {
@@ -285,11 +294,11 @@ export function makeServer(config, upstream=providers) {
       SELECT p.id,p.nick,p.year,p.gender,p.area,p.memo,p.deleted_at AS deletedAt,COUNT(r.id) AS roomCount,
         SUM(CASE WHEN ? IS NULL OR paperchat_contains(p.nick,?) OR paperchat_contains(peer.nick,?) OR EXISTS(SELECT 1 FROM matching WHERE room=r.id)
           THEN 1 ELSE 0 END) AS matchedRoomCount,
-        MAX((SELECT MAX(sent) FROM messages WHERE room=r.id)) AS recent
+        MAX((SELECT MAX(sent) FROM messages WHERE room=r.id AND sent+${messageTTL}>?)) AS recent
       FROM members p JOIN rooms r ON r.a=p.id OR r.b=p.id
       JOIN members peer ON peer.id=CASE WHEN r.a=p.id THEN r.b ELSE r.a END
       WHERE (? IS NULL OR p.area=?) GROUP BY p.id HAVING matchedRoomCount>0
-      ORDER BY recent DESC,p.nick,p.id`,query,query,Date.now(),query,query,query,area,area);
+      ORDER BY recent DESC,p.nick,p.id`,query,query,Date.now(),query,query,query,Date.now(),area,area);
   }
   function monitorRooms(area,member,query) {
     return all(`WITH matching AS (${matchingMessages})
@@ -299,10 +308,10 @@ export function makeServer(config, upstream=providers) {
         (SELECT body FROM matching WHERE room=r.id ORDER BY id DESC LIMIT 1) AS matchBody,
         (SELECT deleted_at FROM matching WHERE room=r.id ORDER BY id DESC LIMIT 1) AS matchDeletedAt,
         (SELECT sent FROM matching WHERE room=r.id ORDER BY id DESC LIMIT 1) AS matchSent
-      FROM rooms r JOIN members x ON r.a=x.id JOIN members y ON r.b=y.id LEFT JOIN messages m ON m.room=r.id
+      FROM rooms r JOIN members x ON r.a=x.id JOIN members y ON r.b=y.id LEFT JOIN messages m ON m.room=r.id AND m.sent+${messageTTL}>?
       WHERE (? IS NULL OR r.a=? OR r.b=?) AND (? IS NULL OR x.area=? OR y.area=?)
         AND (? IS NULL OR paperchat_contains(x.nick,?) OR paperchat_contains(y.nick,?) OR EXISTS(SELECT 1 FROM matching WHERE room=r.id))
-      GROUP BY r.id ORDER BY recent DESC,r.id`,query,query,Date.now(),member,member,member,area,area,area,query,query,query)
+      GROUP BY r.id ORDER BY recent DESC,r.id`,query,query,Date.now(),Date.now(),member,member,member,area,area,area,query,query,query)
       .map(({matchBody,...room})=>({...room,matchSnippet:matchSnippet(matchBody,query)}));
   }
   function presentMessage({state,live,reported,...m},admin) {
@@ -323,8 +332,8 @@ export function makeServer(config, upstream=providers) {
     const before=u.searchParams.get('before');
     if(before && !/^\d+$/.test(before)) reject(400,'조회 범위를 확인해 주세요.');
     const data=all(`SELECT ${messageColumns} ${messageJoins}
-      WHERE m.room=? AND m.id<? AND (? IS NULL OR (paperchat_contains(m.body,?) AND ${adminSearchVisible}))
-      ORDER BY m.id DESC LIMIT 60`,Date.now(),room,before?Number(before):Number.MAX_SAFE_INTEGER,query,query,Date.now());
+      WHERE m.room=? AND m.id<? AND m.sent+${messageTTL}>? AND (? IS NULL OR (paperchat_contains(m.body,?) AND ${adminSearchVisible}))
+      ORDER BY m.id DESC LIMIT 60`,Date.now(),room,before?Number(before):Number.MAX_SAFE_INTEGER,Date.now(),query,query,Date.now());
     return data.reverse().map(m=>presentMessage(m,admin));
   }
   function configURL(){return get("SELECT value FROM settings WHERE name='form'")?.value||'';}
@@ -645,21 +654,8 @@ export function makeServer(config, upstream=providers) {
     if(post && p==='/api/withdraw') {
       const s=need(req,'member',true);
       if(b.confirm!==true) reject(400,'회원탈퇴를 확인해 주세요.');
-      transaction(db,()=>{
-        const m=get('SELECT identity,nick FROM members WHERE id=?',s.member);
-        const withdrawn=Date.now(),expires=withdrawn+24*hour;
-        run('INSERT INTO departures VALUES(?,?,?,?)',s.member,m.nick,withdrawn,expires);
-        const devices=all('SELECT device FROM account_devices WHERE member=?',s.member).map(row=>row.device);
-        const keys=new Set([m.identity,proof(recoveryCode(s.member)),device(req,res),...devices]);
-        const restrictedUntil=safety.restricted(m.identity);
-        for(const key of keys) {
-          run('INSERT INTO cooldowns VALUES(?,?) ON CONFLICT(identity) DO UPDATE SET until=MAX(until,excluded.until)',key,expires);
-          if(restrictedUntil)run('INSERT INTO restrictions VALUES(?,?) ON CONFLICT(identity) DO UPDATE SET until=MAX(until,excluded.until)',key,restrictedUntil);
-        }
-        run('DELETE FROM sessions WHERE identity=?',m.identity);
-        run('DELETE FROM members WHERE id=?',s.member);
-      });
-      closeStreams(stream=>stream.member===s.member);
+      const result=transaction(db,()=>withdrawMember(db,s.member,{recoveryProof:proof(recoveryCode(s.member)),devices:[device(req,res)]}));
+      finishWithdrawal(result);
       cookie(res,'pc_user','',0);return ok();
     }
     if(!post && p==='/api/people') {
@@ -754,7 +750,7 @@ export function makeServer(config, upstream=providers) {
           reject(400,'1.5MB 이하 JPEG 사진을 보내 주세요.');
       } else {body=string(b.body,1,2000,'메시지');checkText(body);}
       transaction(db,()=>{
-        const entry=run('INSERT INTO messages(room,author,sent,body,photo,expires) VALUES(?,?,?,?,?,?)',room.id,s.member,now,body,photo,photo?now+12*hour:null);
+        const entry=run('INSERT INTO messages(room,author,sent,body,photo,expires) VALUES(?,?,?,?,?,?)',room.id,s.member,now,body,photo,photo?now+messageTTL:null);
         if(photo)run("INSERT INTO reviews VALUES(?,'approved')",entry.lastInsertRowid);
         pushes.enqueue(entry.lastInsertRowid);
         touch(s.member,null);
@@ -771,7 +767,7 @@ export function makeServer(config, upstream=providers) {
         AND NOT ${openMessageReportSQL('v.message')}`,media[2]))
         reject(403,'열람할 수 없는 사진이에요.');
       const m=get(`SELECT m.photo FROM messages m LEFT JOIN reviews v ON v.message=m.id
-        WHERE m.id=? AND m.expires>? AND m.photo IS NOT NULL AND (v.state IS NULL OR v.state!='removed')`,media[2],Date.now());
+        WHERE m.id=? AND ${messageLiveSQL()} AND m.photo IS NOT NULL AND (v.state IS NULL OR v.state!='removed')`,media[2],Date.now());
       if(!m?.photo) reject(410,'보관 기간이 지났거나 삭제된 사진이에요.');
       return finish(res,200,Buffer.from(m.photo),'image/jpeg');
     }
@@ -813,23 +809,9 @@ export function makeServer(config, upstream=providers) {
       if(deletingMember && post) {
         if(b.confirm!==true)reject(400,'회원 삭제를 확인해 주세요.');
         const target=deletingMember[1];
-        const devices=transaction(db,()=>{
-          const m=get('SELECT deleted_at FROM members WHERE id=?',target);
-          if(!m)reject(404,'가입자 정보가 없어요.');
-          if(m.deleted_at!==null)return [];
-          const linked=all('SELECT device FROM account_devices WHERE member=?',target).map(d=>d.device);
-          for(const device of linked)clearSignup(device);
-          run('DELETE FROM push_jobs WHERE message IN (SELECT id FROM messages WHERE author=?)',target);
-          run('DELETE FROM sessions WHERE member=?',target);
-          for(const table of ['account_keys','account_devices','contacts','acceptances','room_reads'])
-            run('DELETE FROM '+table+' WHERE member=?',target);
-          run('DELETE FROM blocks WHERE owner=? OR peer=?',target,target);
-          run('UPDATE members SET deleted_at=? WHERE id=?',Date.now(),target);
-          for(const room of all('SELECT id FROM rooms WHERE a=? OR b=?',target,target))bumpRoom(room.id);
-          return linked;
-        });
-        for(const device of devices)signupEpochs.set(device,token());
-        closeStreams(stream=>stream.member===target);
+        const result=transaction(db,()=>withdrawMember(db,target,{recoveryProof:proof(recoveryCode(target))}));
+        if(!result)reject(404,'가입자 정보가 없어요.');
+        finishWithdrawal(result);
         return ok({deleted:true,id:target});
       }
       const memberPath=p.match(/^\/api\/admin\/members\/([a-f0-9-]+)$/);
@@ -911,7 +893,11 @@ export function makeServer(config, upstream=providers) {
         run("INSERT OR REPLACE INTO settings VALUES('form',?)",url.href);return ok();
       }
       if(p==='/api/admin/monitor/profiles' && !post)return ok(monitorProfiles(directoryArea(u),searchQuery(u)));
-      if(p==='/api/admin/rooms' && !post)return ok(monitorRooms(directoryArea(u),monitorMember(u),searchQuery(u)));
+      if(p==='/api/admin/rooms' && !post) {
+        const member=monitorMember(u);
+        if(member!==null && !get('SELECT 1 FROM members WHERE id=?',member))reject(404,'가입자 정보가 없어요.');
+        return ok(monitorRooms(directoryArea(u),member,searchQuery(u)));
+      }
       if(p==='/api/admin/reset' && post) {
         transaction(db,()=>{for(const table of tables) db.exec('DELETE FROM '+table);db.exec("DELETE FROM sqlite_sequence WHERE name='messages'");run("UPDATE service_meta SET value=? WHERE key='reset'",token());});
         closeStreams();
@@ -927,7 +913,9 @@ export function makeServer(config, upstream=providers) {
     else res.end();
   }));
   clean(db);
-  const timer=setInterval(()=>clean(db),30000);timer.unref();
+  const timer=setInterval(()=>{
+    for(const {room,previousVersion} of clean(db))notifyRoom(room,{expired:true,previousVersion,refresh:true});
+  },30000);timer.unref();
   const pushTimer=setInterval(()=>pushes.flush().catch(()=>console.error('알림 대기열 처리 오류')),1000);
   pushTimer.unref();
   const eventTimer=setInterval(()=>{

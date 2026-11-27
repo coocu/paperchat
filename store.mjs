@@ -5,6 +5,10 @@ import { createHash, randomBytes } from 'node:crypto';
 import { migrateMemberAreas } from './regions.mjs';
 
 export const hour = 3600_000;
+export const messageTTL = 24*hour;
+export function messageLiveSQL(alias='m') {
+  return `MIN(COALESCE(${alias}.expires,${alias}.sent+${messageTTL}),${alias}.sent+${messageTTL})>?`;
+}
 export const tables = ['signup_gates','used_invites','account_devices','account_keys','push_jobs','push_devices','session_presence','member_activity','admin_session_proofs','departures','pending_contacts','contacts','report_messages','reports','penalty_contents','penalty_events','reviews','room_reads','room_changes','blocks','acceptances','restrictions','messages','rooms','sessions','members','cooldowns','settings','attempts'];
 // Only pass a source-controlled SQL column expression, never request input.
 export function openMessageReportSQL(message) {
@@ -42,6 +46,7 @@ export function openStore(dir) {
       body TEXT, photo BLOB, expires INTEGER
     );
     CREATE INDEX IF NOT EXISTS messages_by_room ON messages(room,id);
+    CREATE INDEX IF NOT EXISTS messages_by_sent ON messages(sent);
     CREATE INDEX IF NOT EXISTS photo_expiry ON messages(expires) WHERE photo IS NOT NULL;
     CREATE TABLE IF NOT EXISTS attempts (key TEXT PRIMARY KEY, hits INTEGER NOT NULL, until INTEGER NOT NULL);
   `);
@@ -96,10 +101,9 @@ export function openStore(dir) {
     const roomColumns=db.prepare('PRAGMA table_info(rooms)').all();
     if(!roomColumns.some(c=>c.name==='closed_at'))db.exec('ALTER TABLE rooms ADD COLUMN closed_at INTEGER');
     if(!roomColumns.some(c=>c.name==='closed_reason'))db.exec('ALTER TABLE rooms ADD COLUMN closed_reason TEXT');
-    db.prepare('UPDATE messages SET expires=MIN(expires,sent+?) WHERE expires IS NOT NULL').run(12*hour);
     if(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='deleted_messages'").get()) {
       // Merge legacy copies back into their original messages. A confirmed
-      // moderation removal wins over every copy, and photo expiry never moves.
+      // moderation removal wins over every copy; the original sent time stays.
       db.exec(`INSERT OR REPLACE INTO reviews SELECT message,'removed' FROM reports
         WHERE message IS NOT NULL AND status IN ('accept','remove','suspend')`);
       db.prepare(`UPDATE messages SET
@@ -109,7 +113,7 @@ export function openStore(dir) {
         photo=CASE WHEN expires IS NULL OR expires<=? OR sent+?<=?
           OR EXISTS(SELECT 1 FROM reviews WHERE message=messages.id AND state='removed') THEN NULL
           ELSE COALESCE(photo,(SELECT photo FROM deleted_messages WHERE message=messages.id)) END
-        WHERE id IN (SELECT message FROM deleted_messages)`).run(Date.now(),12*hour,Date.now());
+        WHERE id IN (SELECT message FROM deleted_messages)`).run(Date.now(),messageTTL,Date.now());
       db.exec('DROP TABLE deleted_messages');
     }
     // Existing blocks must not resurrect a previous conversation when unblocked.
@@ -134,6 +138,16 @@ export function openStore(dir) {
       CREATE TABLE IF NOT EXISTS penalty_contents(content TEXT PRIMARY KEY,
         event TEXT NOT NULL REFERENCES penalty_events(content) ON DELETE CASCADE);
       INSERT OR IGNORE INTO penalty_contents SELECT content,content FROM penalty_events;`);
+    if(!reportColumns.some(c=>c.name==='photo_count')) {
+      db.exec('ALTER TABLE reports ADD COLUMN photo_count INTEGER NOT NULL DEFAULT 0');
+      db.exec('UPDATE reports SET photo_count=(SELECT COUNT(*) FROM report_messages WHERE report=reports.id) WHERE room IS NOT NULL');
+    }
+    // Extend only bytes that were still available under the previous policy.
+    // Already expired, removed, or purged photos can never be made public again.
+    db.prepare(`UPDATE messages SET photo=NULL WHERE photo IS NOT NULL AND
+      (expires<=? OR sent+?<=? OR EXISTS(SELECT 1 FROM reviews WHERE message=messages.id AND state='removed'))`).run(Date.now(),messageTTL,Date.now());
+    db.prepare(`UPDATE messages SET expires=sent+? WHERE photo IS NOT NULL AND expires>?
+      AND sent+?>?`).run(messageTTL,Date.now(),messageTTL,Date.now());
     db.exec("UPDATE reports SET content='message:'||message WHERE content IS NULL AND message IS NOT NULL");
     // Only backfill an unreviewed profile when its recorded content hash still
     // matches. A changed current profile is not evidence of an earlier report.
@@ -149,6 +163,7 @@ export function openStore(dir) {
     db.prepare(`UPDATE reviews SET state='approved' WHERE state='pending'
       AND message IN (SELECT id FROM messages WHERE photo IS NOT NULL AND expires>?)
       AND NOT ${openMessageReportSQL('reviews.message')}`).run(Date.now());
+    expireMessages(db,Date.now());
   });
   return db;
 }
@@ -156,6 +171,38 @@ export function transaction(db, fn) {
   db.exec('BEGIN IMMEDIATE');
   try { const result=fn(); db.exec('COMMIT'); return result; }
   catch (e) { db.exec('ROLLBACK'); throw e; }
+}
+// Both self-withdrawal and administrator withdrawal call this inside one
+// transaction. Only recorded account devices (plus the self-withdrawing device)
+// are included; an administrator's unrelated installation is never inferred.
+export function withdrawMember(db,id,{at=Date.now(),now=Date.now(),recoveryProof=null,devices:extraDevices=[]}={}) {
+  const get=(sql,...args)=>db.prepare(sql).get(...args);
+  const run=(sql,...args)=>db.prepare(sql).run(...args);
+  const all=(sql,...args)=>db.prepare(sql).all(...args);
+  const member=get('SELECT identity,nick,deleted_at FROM members WHERE id=?',id);
+  const departed=get('SELECT withdrawn,expires FROM departures WHERE id=?',id);
+  if(!member)return departed?.expires>now?{id,...departed,devices:[],rooms:[],alreadyWithdrawn:true}:null;
+  const withdrawn=departed?.withdrawn??member.deleted_at??at,expires=departed?.expires??(withdrawn+24*hour);
+  const devices=[...new Set([...all('SELECT device FROM account_devices WHERE member=?',id).map(d=>d.device),...extraDevices])];
+  const keys=new Set([member.identity,recoveryProof,get('SELECT proof FROM account_keys WHERE member=?',id)?.proof,...devices].filter(Boolean));
+  const restrictedUntil=get('SELECT until FROM restrictions WHERE identity=? AND until>?',member.identity,now)?.until||0;
+  if(expires>now)run('INSERT OR IGNORE INTO departures VALUES(?,?,?,?)',id,member.nick,withdrawn,expires);
+  else run('DELETE FROM departures WHERE id=?',id);
+  for(const key of keys) {
+    if(expires>now)run('INSERT INTO cooldowns VALUES(?,?) ON CONFLICT(identity) DO UPDATE SET until=MAX(until,excluded.until)',key,expires);
+    if(restrictedUntil)run('INSERT INTO restrictions VALUES(?,?) ON CONFLICT(identity) DO UPDATE SET until=MAX(until,excluded.until)',key,restrictedUntil);
+  }
+  for(const install of devices) {
+    run("DELETE FROM sessions WHERE kind IN ('gate_ok','details') AND identity IN (SELECT proof FROM signup_gates WHERE device=?)",install);
+    run('DELETE FROM signup_gates WHERE device=?',install);
+    run("DELETE FROM sessions WHERE kind IN ('gate_ok','details') AND identity IN (SELECT proof FROM used_invites WHERE pending_device=?)",install);
+    run('UPDATE used_invites SET pending_device=NULL,pending_until=NULL WHERE pending_device=?',install);
+  }
+  const rooms=all(`SELECT r.id,r.a,r.b,COALESCE(c.version,0)+1 AS version FROM rooms r
+    LEFT JOIN room_changes c ON c.room=r.id WHERE r.a=? OR r.b=?`,id,id);
+  run("DELETE FROM sessions WHERE identity=? AND kind!='admin'",member.identity);
+  run('DELETE FROM members WHERE id=?',id);
+  return {id,withdrawn,expires,devices,rooms,alreadyWithdrawn:false};
 }
 // Call inside the surrounding leave/block transaction.
 export function closeRoom(db,id,reason,now=Date.now()) {
@@ -168,12 +215,24 @@ export function closeRoom(db,id,reason,now=Date.now()) {
   return true;
 }
 export function clean(db, now=Date.now()) {
-  transaction(db, () => {
+  return transaction(db, () => {
     db.prepare('UPDATE used_invites SET pending_device=NULL,pending_until=NULL WHERE pending_until<=?').run(now);
     db.prepare("DELETE FROM sessions WHERE kind IN ('gate_ok','details') AND identity IN (SELECT proof FROM signup_gates WHERE expires<=?)").run(now);
     db.prepare('DELETE FROM signup_gates WHERE expires<=?').run(now);
     db.prepare('UPDATE messages SET photo=NULL WHERE expires<=? AND photo IS NOT NULL').run(now);
     for (const [table,field] of [['sessions','expires'],['cooldowns','until'],['attempts','until'],['restrictions','until'],['departures','expires']])
       db.prepare('DELETE FROM '+table+' WHERE '+field+'<=?').run(now);
+    return expireMessages(db,now);
   });
+}
+// Caller owns the transaction, so snapshot copies and FK cleanup commit together.
+function expireMessages(db,now) {
+  const rooms=db.prepare(`SELECT DISTINCT m.room,COALESCE(c.version,0) AS previousVersion FROM messages m
+    LEFT JOIN room_changes c ON c.room=m.room WHERE m.sent<=?`).all(now-messageTTL);
+  db.prepare(`UPDATE reports SET conversation_excerpt=NULL WHERE room IS NOT NULL AND
+    (context_message IS NULL OR context_message IN (SELECT id FROM messages WHERE sent<=?))`).run(now-messageTTL);
+  for(const {room} of rooms)
+    db.prepare('INSERT INTO room_changes VALUES(?,1) ON CONFLICT(room) DO UPDATE SET version=version+1').run(room);
+  db.prepare('DELETE FROM messages WHERE sent<=?').run(now-messageTTL);
+  return rooms;
 }

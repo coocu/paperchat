@@ -1,5 +1,5 @@
 import { reject } from './providers.mjs';
-import { hour, transaction, closeRoom } from './store.mjs';
+import { hour, messageTTL, messageLiveSQL, transaction, closeRoom } from './store.mjs';
 import { policyVersion, reasons } from './public/rules.js';
 import { createHash } from 'node:crypto';
 
@@ -73,20 +73,22 @@ export function moderation(db) {
       if(get('SELECT 1 FROM reports WHERE reporter=? AND target=? AND content=?',reporter,peer,content))return null;
       const context=get(`SELECT m.id,m.body FROM messages m LEFT JOIN reviews v ON v.message=m.id
         WHERE m.room=? AND m.author=? AND m.deleted_at IS NULL AND m.expires IS NULL AND m.body IS NOT NULL
-          AND (v.state IS NULL OR v.state='approved') ORDER BY m.id DESC LIMIT 1`,room.id,peer);
+          AND m.sent+${messageTTL}>? AND (v.state IS NULL OR v.state='approved') ORDER BY m.id DESC LIMIT 1`,room.id,peer,Date.now());
       const inserted=run(`INSERT INTO reports(reporter,target,message,reason,created,content,room,context_message,conversation_excerpt)
         VALUES(?,?,NULL,?,?,?,?,?,?)`,reporter,peer,b.reason,Date.now(),content,room.id,context?.id??null,context?.body??null);
       // The fixed mapping is deliberately not extended when new photos arrive.
       run(`INSERT INTO report_messages(report,message) SELECT ?,m.id FROM messages m LEFT JOIN reviews v ON v.message=m.id
         WHERE m.room=? AND m.author=? AND m.deleted_at IS NULL AND m.photo IS NOT NULL
           AND m.expires>? AND m.sent+?>? AND (v.state IS NULL OR v.state IN ('approved','pending'))`,
-        inserted.lastInsertRowid,room.id,peer,Date.now(),12*hour,Date.now());
+        inserted.lastInsertRowid,room.id,peer,Date.now(),messageTTL,Date.now());
+      run('UPDATE reports SET photo_count=(SELECT COUNT(*) FROM report_messages WHERE report=?) WHERE id=?',inserted.lastInsertRowid,inserted.lastInsertRowid);
       bump(room.id);return room.id;
     });
     let peer,room=null,message=null;
     if(b.kind==='message'){
       if(!Number.isSafeInteger(b.message))reject(400,'신고할 메시지를 선택해 주세요.');
-      const m=get('SELECT m.id,m.author,m.room,r.a,r.b FROM messages m JOIN rooms r ON m.room=r.id JOIN members p ON p.id=m.author WHERE m.id=? AND p.deleted_at IS NULL AND r.closed_at IS NULL',b.message);
+      const m=get(`SELECT m.id,m.author,m.room,r.a,r.b FROM messages m JOIN rooms r ON m.room=r.id JOIN members p ON p.id=m.author
+        WHERE m.id=? AND p.deleted_at IS NULL AND r.closed_at IS NULL AND m.sent+${messageTTL}>?`,b.message,Date.now());
       if(!m || (m.a!==reporter && m.b!==reporter) || m.author===reporter)reject(404,'신고할 메시지를 찾을 수 없어요.');
       peer=m.author;room=m.room;message=m.id;
     } else if(b.kind==='profile') {
@@ -121,24 +123,29 @@ export function moderation(db) {
         reject(409,'신고 당시 소개글 원문을 확인할 수 없어 승인할 수 없어요.');
       const content=r.content || (r.message==null?profileContent(r.target):'message:'+r.message);
       const photos=r.room===null?[]:all('SELECT message FROM report_messages WHERE report=? ORDER BY message',id).map(m=>m.message);
-      if(action==='accept' && r.room!==null && photos.length===0 && r.context_message===null)
-        reject(409,'신고 당시 확인할 수 있는 상대의 대화 내용이 없어 승인할 수 없어요.');
+      const currentPhotos=r.room===null?[]:all(`SELECT m.id FROM report_messages rm JOIN messages m ON m.id=rm.message
+        WHERE rm.report=? AND ${messageLiveSQL()} AND (m.photo IS NOT NULL OR EXISTS(
+          SELECT 1 FROM penalty_contents WHERE content='message:'||m.id))`,id,Date.now()).map(m=>m.id);
+      const contextCurrent=r.context_message!==null && Boolean(get(`SELECT 1 FROM messages m WHERE m.id=? AND m.sent+${messageTTL}>?`,r.context_message,Date.now()));
+      if(action==='accept' && (r.message!==null && !get(`SELECT 1 FROM messages m WHERE m.id=? AND m.sent+${messageTTL}>?`,r.message,Date.now()) ||
+        r.room!==null && (r.photo_count>0?currentPhotos.length===0:!contextCurrent)))
+        reject(409,'보관 기간이 지났거나 확인할 수 있는 신고 원문이 없어 승인할 수 없어요.');
       if(action==='accept'){
         // An accepted group counts once, even if it contains many photos. An
         // individual report and overlapping groups share the same evidence keys.
-        const evidence=r.room===null?[content]:photos.length?photos.map(message=>'message:'+message):
+        const evidence=r.room===null?[content]:r.photo_count>0?currentPhotos.map(message=>'message:'+message):
           [r.context_message===null?content:'message:'+r.context_message];
         if(evidence.some(key=>!get('SELECT 1 FROM penalty_contents WHERE content=?',key))) {
           const added=run('INSERT OR IGNORE INTO penalty_events VALUES(?,?,?)',content,r.identity,Date.now());
           if(added.changes) {
-            for(const key of [...evidence,...(r.room!==null && r.context_message!==null?['message:'+r.context_message]:[])])
+            for(const key of [...evidence,...(r.room!==null && contextCurrent?['message:'+r.context_message]:[])])
               run('INSERT OR IGNORE INTO penalty_contents VALUES(?,?)',key,content);
             if(penalty(r.identity).totalStrikes%3===0)
               run('INSERT INTO restrictions VALUES(?,?) ON CONFLICT(identity) DO UPDATE SET until=excluded.until',r.identity,Math.max(Date.now(),restricted(r.identity))+24*hour);
           }
         }
         if(r.room!==null || r.message!==null) {
-          const removedMessages=r.room===null?[r.message]:photos.length?photos:[r.context_message];
+          const removedMessages=r.room===null?[r.message]:r.photo_count>0?photos:[r.context_message];
           for(const message of removedMessages) {
             run("INSERT OR REPLACE INTO reviews VALUES(?,'removed')",message);
             run('UPDATE messages SET photo=NULL,body=NULL WHERE id=?',message);
@@ -163,18 +170,21 @@ export function moderation(db) {
   function queue() {
     return {
       photos:[],
-      reports:all(`SELECT r.id,r.reason,r.created,r.message,r.reporter,r.profile_snapshot,r.room AS conversationRoom,r.conversation_excerpt,u.id AS sender,u.nick,u.area,
+      reports:all(`SELECT r.id,r.reason,r.created,r.message,r.reporter,r.profile_snapshot,r.room AS conversationRoom,r.photo_count,
+        CASE WHEN ctx.sent+${messageTTL}>? THEN r.conversation_excerpt END AS conversation_excerpt,
+        CASE WHEN r.room IS NULL THEN m.sent+${messageTTL} ELSE ctx.sent+${messageTTL} END AS excerptExpiresAt,
+        m.sent+${messageTTL} AS expiresAt,u.id AS sender,u.nick,u.area,
         m.body AS excerpt,
-        CASE WHEN m.photo IS NOT NULL AND m.expires>? AND NOT EXISTS(SELECT 1 FROM reviews v WHERE v.message=m.id AND v.state='removed') THEN m.id END AS photo,
+        CASE WHEN m.photo IS NOT NULL AND ${messageLiveSQL()} AND NOT EXISTS(SELECT 1 FROM reviews v WHERE v.message=m.id AND v.state='removed') THEN m.id END AS photo,
         m.deleted_at AS deletedAt
-        FROM reports r JOIN members u ON r.target=u.id LEFT JOIN messages m ON r.message=m.id
-        WHERE r.status='open' ORDER BY r.created,r.id LIMIT 100`,Date.now()).map(({profile_snapshot,conversation_excerpt,...report})=>{
+        FROM reports r JOIN members u ON r.target=u.id LEFT JOIN messages m ON r.message=m.id LEFT JOIN messages ctx ON ctx.id=r.context_message
+        WHERE r.status='open' AND (r.message IS NULL OR m.sent+${messageTTL}>?) ORDER BY r.created,r.id LIMIT 100`,Date.now(),Date.now(),Date.now()).map(({profile_snapshot,conversation_excerpt,photo_count,...report})=>{
           if(report.conversationRoom!==null) {
-            const photos=all(`SELECT m.id,m.expires,m.deleted_at AS deletedAt,
-              (m.photo IS NOT NULL AND m.expires>? AND m.sent+?>? AND (v.state IS NULL OR v.state!='removed')) AS viewable
+            const photos=all(`SELECT m.id,m.sent+${messageTTL} AS expires,m.deleted_at AS deletedAt,
+              (m.photo IS NOT NULL AND ${messageLiveSQL()} AND (v.state IS NULL OR v.state!='removed')) AS viewable
               FROM report_messages rm JOIN messages m ON m.id=rm.message LEFT JOIN reviews v ON v.message=m.id
-              WHERE rm.report=? ORDER BY m.id`,Date.now(),12*hour,Date.now(),report.id);
-            return {...report,excerpt:conversation_excerpt,photos,photoCount:photos.length};
+              WHERE rm.report=? ORDER BY m.id`,Date.now(),report.id);
+            return {...report,excerpt:conversation_excerpt,photos,photoCount:photo_count};
           }
           if(report.message!==null)return report;
           const snapshot=profile_snapshot?JSON.parse(profile_snapshot):null;

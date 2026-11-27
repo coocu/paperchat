@@ -100,8 +100,12 @@ test('region filtering precedes fifty-row pagination and administrator deletion 
   const after=(await admin(url)).body;
   assert.deepEqual(after.counts,{active:53,inactive:52,withdrawn:0});assert.equal(after.items.some(member=>member.id===seoul[0]),false);
   assert.deepEqual((await admin(path+'?'+region('부산 전체'))).body.counts,{active:15,inactive:15,withdrawn:0});
-  assert.deepEqual((await admin(path)).body.counts,{active:68,inactive:67,withdrawn:0});
-  assert.equal((await admin(path+'/'+seoul[0])).body.status,'deleted');
+  assert.deepEqual((await admin(path)).body.counts,{active:68,inactive:67,withdrawn:1});
+  const departed=(await admin(path+'/'+seoul[0])).body;
+  assert.deepEqual(departed,{nick:'서울00',withdrawn:f.now(),expires:f.now()+day,status:'withdrawn'});
+  assert.equal(f.db.prepare('SELECT 1 FROM members WHERE id=?').get(seoul[0]),undefined);
+  assert.deepEqual((await admin(path+'?filter=withdrawn')).body.items.map(member=>member.id),[seoul[0]]);
+  assert.deepEqual((await admin(url+'&filter=withdrawn')).body.items,[]);
   assert.equal((await admin(path+'/'+seoul[0]+'/delete',{confirm:true})).status,200);
   assert.deepEqual((await admin(url)).body.counts,after.counts);
   assert.deepEqual((await admin(url+'&offset=1000')).body,{items:[],more:false,counts:after.counts});

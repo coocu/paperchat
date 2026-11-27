@@ -197,7 +197,7 @@ test('프로필 편집은 본인 지역·소개글만 검증해 저장하고 모
   f.db.prepare('DELETE FROM restrictions').run();assert.deepEqual((await a.call('/api/state')).body.profile,saved);
   await admin('/api/admin/members/'+a.id+'/delete',{confirm:true});
   assert.equal((await a.call('/api/profile',{area:'부산 전체',memo:'삭제 뒤 변경'})).status,401);
-  assert.equal(f.db.prepare('SELECT memo FROM members WHERE id=?').get(a.id).memo,saved.memo);
+  assert.equal(f.db.prepare('SELECT memo FROM members WHERE id=?').get(a.id),undefined);
 });
 
 test('프로필 신고는 화면의 버전을 검증하고 수정 전 원문으로 심사하며 새 소개글은 보존한다',async t=>{
@@ -471,7 +471,7 @@ test('본인 메시지 삭제는 양쪽에서 원문을 차단하고 관리자 �
   assert.equal(f.db.prepare("SELECT 1 FROM sqlite_master WHERE name='deleted_messages'").get(),undefined);
 });
 
-test('삭제 사진도 원래 12시간 만료를 지키고 신고 인정 시 원문을 완전히 제거한다',async t=>{
+test('삭제 사진도 전송 24시간에 메시지 행까지 만료되고 신고 인정 시 원문을 즉시 제거한다',async t=>{
   const f=fixture(t),a=await f.register('발신자'),b=await f.register('수신자'),c=await f.register('외부회원'),admin=await f.admin();
   const room=await f.room(a,b),path='/api/rooms/'+room+'/messages';
   const live=await f.send(a,room,{photo:photo.toString('base64')});
@@ -493,12 +493,14 @@ test('삭제 사진도 원래 12시간 만료를 지키고 신고 인정 시 원
   assert.equal((await b.call(path)).body.find(m=>m.id===dismissed).visibility,'deleted');
   assert.deepEqual((await admin('/api/admin/photos/'+dismissed)).body,photo);
   const sent=f.db.prepare('SELECT sent FROM messages WHERE id=?').get(dismissed).sent;
-  f.advance(12*hour-1);await f.admin(admin);
-  assert.equal(f.now(),sent+12*hour-1);assert.equal((await admin('/api/admin/photos/'+dismissed)).status,200);
+  f.advance(24*hour-1);await f.admin(admin);
+  assert.equal(f.now(),sent+24*hour-1);assert.equal((await admin('/api/admin/photos/'+dismissed)).status,200);
   f.advance(1);
   assert.equal((await admin('/api/admin/photos/'+dismissed)).status,410);
-  assert.equal((await admin('/api/admin/rooms/'+room+'/messages')).body.find(m=>m.id===dismissed).viewable,0);
-  clean(f.db,f.now());assert.equal(f.db.prepare('SELECT photo FROM messages WHERE id=?').get(dismissed).photo,null);
+  assert.equal((await admin('/api/admin/rooms/'+room+'/messages')).body.some(m=>m.id===dismissed),false);
+  assert.equal((await b.call(path)).body.some(m=>m.id===dismissed),false);
+  clean(f.db,f.now());assert.equal(f.db.prepare('SELECT 1 FROM messages WHERE id=?').get(dismissed),undefined);
+  assert.equal((await admin('/api/admin/photos/'+dismissed)).status,404);
   const expired=await f.send(a,room,{photo:photo.toString('base64')});
   f.db.prepare('UPDATE messages SET expires=? WHERE id=?').run(f.now(),expired);
   await a.call('/api/messages/'+expired+'/delete',{confirm:true});
@@ -512,7 +514,7 @@ test('삭제 사진도 원래 12시간 만료를 지키고 신고 인정 시 원
   assert.equal(f.db.prepare('SELECT photo FROM messages WHERE id=?').get(removed).photo,null);
 });
 
-test('관리자 회원 삭제는 모든 인증·푸시·가입예약을 폐기하고 보존된 관리기록이나 다른 회원 세션은 건드리지 않는다',async t=>{
+test('관리자 회원 삭제는 직접 탈퇴처럼 계정과 양쪽 대화를 지우고 24시간 재가입을 제한하며 다른 회원은 보존한다',async t=>{
   const f=fixture(t),a=await f.register('삭제회원'),b=await f.register('유지회원'),c=await f.register('다른회원'),admin=await f.admin();
   const ab=await f.room(a,b),bc=await f.room(b,c);
   const a2=f.client(),a3=f.client();
@@ -520,8 +522,9 @@ test('관리자 회원 삭제는 모든 인증·푸시·가입예약을 폐기�
   await f.admin(a.call); // A member deletion must not revoke this separate administrator session.
   for(const [call,token] of [[a.call,'target-first-device-token'],[a2,'target-second-device-token'],[b.call,'recipient-device-token-123'],[c.call,'unrelated-device-token-123']])
     await call('/api/push/device',{platform:'android',token});
-  const archived=await f.send(a,ab,{body:'관리자 보존 원문'});await a.call('/api/messages/'+archived+'/delete',{confirm:true});
+  const archived=await f.send(a,ab,{body:'회원 삭제 전까지만 보관한 원문'});await a.call('/api/messages/'+archived+'/delete',{confirm:true});
   const image=await f.send(a,ab,{photo:photo.toString('base64')});
+  const reply=await f.send(b,ab,{body:'상대가 보낸 원문도 회원 삭제 때 제거'});
   const unrelated=await f.send(b,bc,{body:'다른 회원 알림'});
   await a2('/api/logout',{});await a2('/api/key',{code:'pending-key'});
   const independent=f.client();await independent('/api/key',{code:'pending-key'});
@@ -551,30 +554,42 @@ test('관리자 회원 삭제는 모든 인증·푸시·가입예약을 폐기�
   assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM signup_gates').get().n,1);
   assert.ok(f.db.prepare('SELECT 1 FROM signup_gates WHERE proof=?').get(independentProof));
   assert.equal((await independent('/api/state')).body.stage,'details');
-  assert.ok(f.db.prepare('SELECT deleted_at FROM members WHERE id=?').get(a.id).deleted_at);
+  assert.equal(f.db.prepare('SELECT 1 FROM members WHERE id=?').get(a.id),undefined);
   const listing=(await admin('/api/admin/members')).body;
-  assert.equal(listing.counts.active,2);assert.ok(!listing.items.some(m=>m.id===a.id));
-  assert.equal((await admin('/api/admin/members/'+a.id)).body.status,'deleted');
+  assert.deepEqual(listing.counts,{active:2,inactive:0,withdrawn:1});
+  assert.equal(listing.items.find(m=>m.id===a.id).status,'withdrawn');
+  assert.deepEqual((await admin('/api/admin/members/'+a.id)).body,
+    {nick:'삭제회원',withdrawn:f.now(),expires:f.now()+day,status:'withdrawn'});
   assert.ok(!(await b.call('/api/people')).body.some(m=>m.id===a.id));
   assert.deepEqual((await b.call('/api/rooms')).body.map(r=>r.id),[bc]);
   assert.equal((await b.call('/api/room',{peer:a.id})).status,404);
   assert.equal((await b.call('/api/photos/'+image)).status,404);
-  assert.equal((await admin('/api/admin/rooms')).body.length,2);
-  assert.equal((await admin('/api/admin/rooms/'+ab+'/messages')).body[0].body,'관리자 보존 원문');
-  assert.deepEqual((await admin('/api/admin/photos/'+image)).body,photo);
+  assert.deepEqual((await admin('/api/admin/rooms')).body.map(room=>room.id),[bc]);
+  assert.equal((await admin('/api/admin/rooms/'+ab+'/messages')).status,404);
+  assert.equal((await admin('/api/admin/photos/'+image)).status,404);
+  for(const id of [archived,image,reply])assert.equal(f.db.prepare('SELECT 1 FROM messages WHERE id=?').get(id),undefined);
+  assert.equal(f.db.prepare('SELECT 1 FROM rooms WHERE id=?').get(ab),undefined);
+  assert.equal(f.db.prepare('SELECT body FROM messages WHERE id=?').get(unrelated).body,'다른 회원 알림');
   assert.equal((await b.call('/api/state')).body.stage,'member');assert.equal((await c.call('/api/state')).body.stage,'member');
   await f.queue.flush();assert.deepEqual(f.delivered,[unrelated]);
   f.restart();
   assert.equal((await independent('/api/state')).body.stage,'details');
   assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM account_keys WHERE member=?').get(a.id).n,0);
   assert.equal((await a.call('/api/account/login',{code:a.code})).status,403);
-  assert.equal((await admin('/api/admin/rooms/'+ab+'/messages')).body[0].body,'관리자 보존 원문');
+  assert.equal((await admin('/api/admin/rooms/'+ab+'/messages')).status,404);
+  for(const user of [a.call,a2,a3])assert.equal((await user('/api/key',{code:'new-approved-key'})).status,403);
+  f.advance(day-1);await f.admin(admin);
+  assert.equal((await admin('/api/admin/members/'+a.id)).status,200);
+  assert.equal((await a.call('/api/key',{code:'new-approved-key'})).status,403);
+  f.advance(1);clean(f.db,f.now());
+  assert.equal((await admin('/api/admin/members/'+a.id)).status,404);
+  assert.equal((await a.call('/api/account/login',{code:a.code})).status,403);
   const replacement=await f.register('새 가입',area,a.call);assert.notEqual(replacement.id,a.id);
   assert.equal((await replacement.call('/api/rooms/'+ab+'/messages')).status,404);
-  // Existing self-withdrawal still hard-deletes its rooms and messages.
+  // The same departure behavior leaves no participant's messages behind.
   await b.call('/api/withdraw',{confirm:true});
-  assert.equal(f.db.prepare('SELECT 1 FROM messages WHERE id=?').get(archived),undefined);
-  assert.equal((await admin('/api/admin/rooms/'+ab+'/messages')).status,404);
+  assert.equal(f.db.prepare('SELECT 1 FROM messages WHERE id=?').get(unrelated),undefined);
+  assert.equal((await admin('/api/admin/rooms/'+bc+'/messages')).status,404);
   await admin('/api/admin/reset',{key:'codenote-test-kyh',confirm:'전체 삭제'});
   for(const table of tables)assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM '+table).get().n,0);
 });
@@ -639,7 +654,7 @@ test('구형 DB에 열을 추가할 때 기존 메시지·회원은 보존하고
     CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,room TEXT NOT NULL REFERENCES rooms ON DELETE CASCADE,author TEXT NOT NULL REFERENCES members ON DELETE CASCADE,sent INTEGER NOT NULL,body TEXT,photo BLOB,expires INTEGER);`);
   for(const id of ['one','two'])db.prepare('INSERT INTO members VALUES(?,?,?,?,?,?,?)').run(id,id,id,1995,'여성',area,'소개');
   db.prepare('INSERT INTO rooms VALUES(?,?,?)').run('room','one','two');
-  db.prepare('INSERT INTO messages(room,author,sent,body) VALUES(?,?,?,?)').run('room','one',1,'기존 대화');
+  db.prepare('INSERT INTO messages(room,author,sent,body) VALUES(?,?,?,?)').run('room','one',Date.now()-hour,'기존 대화');
   db.close();const before=Date.now();db=openStore(dir);
   const seen=db.prepare('SELECT last_seen FROM member_activity WHERE member=?').get('one').last_seen;
   assert.ok(seen>=before);assert.equal(db.prepare('SELECT body,deleted_at FROM messages').get().body,'기존 대화');
@@ -670,8 +685,8 @@ test('레거시 삭제 보관함은 원래 메시지로 한 번만 합치고 만
   const row=name=>db.prepare('SELECT * FROM messages WHERE id=?').get(ids[name]);
   assert.equal(db.prepare("SELECT 1 FROM sqlite_master WHERE name='deleted_messages'").get(),undefined);
   assert.equal(row('text').body,'삭제한 원문');assert.equal(row('text').deleted_at,deleted);
-  assert.deepEqual(Buffer.from(row('live').photo),photo);assert.equal(row('live').expires,sent+12*hour);
-  assert.equal(row('overlong').expires,sent+12*hour);assert.equal(row('shorter').expires,now+hour);
+  assert.deepEqual(Buffer.from(row('live').photo),photo);assert.equal(row('live').expires,sent+24*hour);
+  assert.equal(row('overlong').expires,sent+24*hour);assert.equal(row('shorter').expires,sent+24*hour);
   for(const name of ['expired','removed','accepted'])assert.equal(row(name).photo,null);
   assert.equal(row('acceptedText').body,null);
   assert.equal(db.prepare('SELECT state FROM reviews WHERE message=?').get(ids.accepted).state,'removed');
@@ -682,6 +697,8 @@ test('레거시 삭제 보관함은 원래 메시지로 한 번만 합치고 만
   assert.equal(row('text').body,'삭제한 원문');assert.equal(row('text').deleted_at,deleted);
   assert.deepEqual(db.prepare('SELECT closed_at,closed_reason FROM rooms WHERE id=?').get('room'),closed);
   assert.equal(db.prepare('SELECT version FROM room_changes WHERE room=?').get('room').version,1);
-  clean(db,sent+12*hour);
-  assert.ok(db.prepare('SELECT photo FROM messages').all().every(m=>m.photo===null));
+  clean(db,sent+24*hour);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages').get().n,0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM reviews').get().n,0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM reports').get().n,0);
 });

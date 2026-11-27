@@ -80,7 +80,7 @@ const photoStatus=async(member,id)=>(await member.call('/api/photos/'+id)).statu
 test('방 참가자만 상대의 현재 사진을 고정 신고하며 본인·다른 방·새 사진은 숨기지 않는다',async t=>{
   const f=fixture(t),a=await f.register('상대'),b=await f.register('신고자'),c=await f.register('다른 회원'),admin=await f.admin();
   const room=await f.room(a,b),elsewhere=await f.room(a,c);
-  const expired=await photograph(f,a,room);f.advance(12*hour+1);
+  const expired=await photograph(f,a,room);f.advance(24*hour+1);
   const first=await photograph(f,a,room),second=await photograph(f,a,room),own=await photograph(f,b,room);
   const other=await photograph(f,a,elsewhere),deleted=await photograph(f,a,room),removed=await photograph(f,a,room);
   await a.call('/api/messages/'+deleted+'/delete',{confirm:true});
@@ -99,7 +99,7 @@ test('방 참가자만 상대의 현재 사진을 고정 신고하며 본인·�
   assert.equal(group.conversationRoom,room);assert.equal(group.sender,a.id);assert.equal(group.reporter,b.id);
   assert.equal(group.photoCount,2);assert.equal(group.excerpt,'신고 당시 상대의 마지막 대화');
   assert.deepEqual(group.photos.map(p=>p.id),[first,second]);
-  assert.ok(group.photos.every(p=>p.viewable===1 && p.deletedAt===null && p.expires===f.now()+12*hour));
+  assert.ok(group.photos.every(p=>p.viewable===1 && p.deletedAt===null && p.expires===f.now()+24*hour));
   const version=f.db.prepare('SELECT version FROM room_changes WHERE room=?').get(room).version;
   await reportRoom(b,room);assert.equal((await queue(admin)).length,1);
   assert.equal(f.db.prepare('SELECT version FROM room_changes WHERE room=?').get(room).version,version);
@@ -113,7 +113,7 @@ test('방 참가자만 상대의 현재 사진을 고정 신고하며 본인·�
     assert.equal(shown.find(m=>m.id===text).body,'신고 당시 상대의 마지막 대화');
     assert.equal(await photoStatus(member,own),200);
     assert.equal(shown.find(m=>m.id===deleted).visibility,'deleted');
-    assert.equal(shown.find(m=>m.id===expired).visibility,'expired');
+    assert.equal(shown.some(m=>m.id===expired),false);
   }
   assert.equal((await b.call('/api/unread')).body.total,1);
   assert.equal((await b.call('/api/rooms/'+room+'/read',{through:first})).status,400);
@@ -152,21 +152,21 @@ test('거부해도 삭제·만료·이용규칙 삭제된 사진을 복원하거
   await a.call('/api/messages/'+deleted+'/delete',{confirm:true});
   await reportMessage(b,removed);const single=(await queue(admin)).find(r=>r.message===removed);
   await decide(admin,single.id,'accept');
-  f.advance(11*hour+1);clean(f.db,f.now());
+  f.advance(23*hour+1);clean(f.db,f.now());
   await f.admin(admin);
   const pending=(await queue(admin))[0];assert.equal(pending.photoCount,4);
-  assert.deepEqual(pending.photos.map(p=>[p.id,p.viewable]),[[expires,0],[deleted,1],[removed,0],[live,1]]);
+  assert.deepEqual(pending.photos.map(p=>[p.id,p.viewable]),[[deleted,1],[removed,0],[live,1]]);
   await decide(admin,group.id,'dismiss');
   const shown=await messages(b,room);
-  assert.equal(shown.find(m=>m.id===expires).visibility,'expired');
+  assert.equal(shown.some(m=>m.id===expires),false);
   assert.equal(shown.find(m=>m.id===deleted).visibility,'deleted');
   assert.equal(shown.find(m=>m.id===removed).visibility,'removed');
   assert.equal(await photoStatus(b,live),200);
-  assert.equal((await admin('/api/admin/photos/'+expires)).status,410);
+  assert.equal((await admin('/api/admin/photos/'+expires)).status,404);
   assert.equal((await admin('/api/admin/photos/'+removed)).status,410);
-  assert.equal(f.db.prepare('SELECT photo FROM messages WHERE id=?').get(expires).photo,null);
+  assert.equal(f.db.prepare('SELECT 1 FROM messages WHERE id=?').get(expires),undefined);
   assert.equal(f.db.prepare('SELECT expires FROM messages WHERE id=?').get(live).expires,group.photos.find(p=>p.id===live).expires);
-  f.advance(hour);clean(f.db,f.now());assert.equal((await admin('/api/admin/photos/'+deleted)).status,410);
+  f.advance(hour);clean(f.db,f.now());assert.equal((await admin('/api/admin/photos/'+deleted)).status,404);
 });
 
 test('여러 사진의 그룹 승인은 1회이고 중복 개별·그룹 승인에는 같은 사진 벌점을 다시 주지 않는다',async t=>{

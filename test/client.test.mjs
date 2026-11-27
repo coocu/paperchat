@@ -9,8 +9,8 @@ import { privacyEffectiveDate,privacyIntro,privacySections } from '../public/pri
 // The real native shells use the same controller.
 const script=readFileSync(new URL('../public/app.js',import.meta.url),'utf8')
   .replace(/^import [^\n]+\n/gm,'').replace('start().catch(', 'Promise.resolve().catch(');
-function browser({version,search='',userAgent='',pathname='/app',EventSource,instantSplash=false,navigatorProps={},windowProps={},urgentReply,fetchReply}){
-  const nodes=new Map(),local=new Map(),session=new Map(),intervals=new Map(),events=new Map();let timerId=0,dialogId=0;
+function browser({version,search='',userAgent='',pathname='/app',EventSource,instantSplash=false,navigatorProps={},windowProps={},urgentReply,clockNow,fetchReply}){
+  const nodes=new Map(),local=new Map(),session=new Map(),intervals=new Map(),events=new Map(),timeouts=new Map();let timerId=0,dialogId=0;
   if(version)local.set('paperchat.reset',version);
   function element(k){
     if(!nodes.has(k))nodes.set(k,{
@@ -32,14 +32,14 @@ function browser({version,search='',userAgent='',pathname='/app',EventSource,ins
   const storage=map=>({getItem:k=>map.get(k)||null,setItem:(k,v)=>map.set(k,v),clear:()=>map.clear()});
   const location={pathname,search,replacements:[],replace(url){this.redirect=url;this.replacements.push(url);}};
   const history={replaceState(state,title,url){this.replaced=url;}};
-  const ctx=createContext({document:{body:element('body'),querySelector:s=>s==='dialog[open]'?[...nodes.values()].find(el=>el.open)||null:element(s),querySelectorAll:s=>s==='dialog[open]'?[...nodes.values()].filter(el=>el.open):[],createElement:tag=>element(tag+ ++dialogId),hidden:false,addEventListener:(name,fn)=>events.set(name,fn)},navigator:{userAgent,...navigatorProps},
-    location,history,matchMedia:()=>({matches:true}),window:{EventSource,addEventListener:(name,fn)=>events.set(name,fn),scrollTo(){},...windowProps},setInterval:(fn,ms)=>{const id=++timerId;intervals.set(id,{fn,ms});return id;},clearInterval:id=>intervals.delete(id),setTimeout:(fn,ms)=>{if(instantSplash&&ms<=1300)queueMicrotask(fn);return 7;},clearTimeout,AbortController,
+  const ctx=createContext({Date:clockNow?class extends Date {static now(){return clockNow();}}:Date,document:{body:element('body'),querySelector:s=>s==='dialog[open]'?[...nodes.values()].find(el=>el.open)||null:element(s),querySelectorAll:s=>s==='dialog[open]'?[...nodes.values()].filter(el=>el.open):[],createElement:tag=>element(tag+ ++dialogId),hidden:false,addEventListener:(name,fn)=>events.set(name,fn)},navigator:{userAgent,...navigatorProps},
+    location,history,matchMedia:()=>({matches:true}),window:{EventSource,addEventListener:(name,fn)=>events.set(name,fn),scrollTo(){},...windowProps},setInterval:(fn,ms)=>{const id=++timerId;intervals.set(id,{fn,ms});return id;},clearInterval:id=>intervals.delete(id),setTimeout:(fn,ms)=>{const id=++timerId;timeouts.set(id,{fn,ms});if(instantSplash&&ms<=1300)queueMicrotask(fn);return id;},clearTimeout:id=>timeouts.delete(id),AbortController,
     policyVersion,reasons,rules,privacyEffectiveDate,privacyIntro,privacySections,sessionStorage:storage(session),localStorage:storage(local),
     Option:class { constructor(text,value){this.text=text;this.value=value;} },
     FormData:class { constructor(form){this.form=form;}get(key){return this.form.values?.[key]??'';} },
     URL,URLSearchParams,atob,fetch:async(url,options)=>{const r=await (url==='/api/urgent-announcement'?(typeof urgentReply==='function'?urgentReply(url,options):urgentReply??{enabled:false,title:'긴급공지',body:'',revision:null,publishedAt:null}):fetchReply(url,options)),status=r?.$status||200;return {ok:status>=200&&status<300,status,headers:{get:k=>k==='X-Service-Version'?r?.version:k==='X-Room-Version'?r?.$roomVersion:null},json:async()=>r?.$body??r};}});
   runInContext(script,ctx);
-  return {run:code=>runInContext(code,ctx),element,local,location,history,session,intervals,events};
+  return {run:code=>runInContext(code,ctx),element,local,location,history,session,intervals,events,timeouts};
 }
 test('열린 앱에서 초기화를 감지하면 현재 화면과 가입 초안을 지우고 사용자 정보 없음 안내로 이동한다',async()=>{
   const b=browser({version:'old',fetchReply:()=>({version:'fresh',stage:'gate'})});
@@ -502,7 +502,7 @@ test('내 메시지 삭제는 양쪽에서 사라짐을 확인하고 즉시 제�
   b.run("stage='member';me={id:'a'}");await b.run("conversation('r','대화',false,rooms,'b')");
   assert.match(b.element('#log').innerHTML,/data-delete-message="1"/);
   await b.element('#log').handlers.click({target:{closest:s=>s==='[data-delete-message]'?{dataset:{deleteMessage:'1'}}:null}});
-  assert.match(b.element('dialog1').innerHTML,/양쪽 대화에서 사라져요/);assert.match(b.element('dialog1').innerHTML,/사진은 전송 후 12시간/);assert.doesNotMatch(b.element('dialog1').innerHTML,/관리자|운영자/);
+  assert.match(b.element('dialog1').innerHTML,/양쪽 대화에서 사라져요/);assert.match(b.element('dialog1').innerHTML,/사진과 글은 전송 후 24시간/);assert.doesNotMatch(b.element('dialog1').innerHTML,/관리자|운영자/);
   await b.element('#proceed').onclick();assert.doesNotMatch(b.element('#log').innerHTML,/삭제할 메시지/);
   assert.ok(requests.some(([url,body])=>url==='/api/messages/1/delete'&&body==='{"confirm":true}'));
   b.intervals.get(b.run('activeTimer')).fn();await settle();assert.doesNotMatch(b.element('#log').innerHTML,/삭제할 메시지/);
@@ -560,7 +560,7 @@ test('채팅 나가기는 양쪽 삭제를 확인하고 내용을 즉시 비우�
   }});
   b.run("stage='member';me={id:'a'}");await b.run("conversation('r','상대',false,rooms,'b')");b.element('#body').value='입력 중';
   b.intervals.get(b.run('activeTimer')).fn();await settle();
-  await b.element('#leaveRoom').handlers.click({});assert.match(b.element('dialog1').innerHTML,/나와 상대방의 채팅방이 모두 삭제/);assert.match(b.element('dialog1').innerHTML,/사진은 전송 후 12시간/);
+  await b.element('#leaveRoom').handlers.click({});assert.match(b.element('dialog1').innerHTML,/나와 상대방의 채팅방이 모두 삭제/);assert.match(b.element('dialog1').innerHTML,/사진과 글은 전송 후 24시간/);
   await b.element('#proceed').onclick();
   assert.ok(paths.some(([url,body])=>url==='/api/rooms/r/leave'&&body==='{"confirm":true}'));
   assert.equal(b.element('#log').innerHTML,'');assert.equal(b.element('#body').value,'');assert.match(b.element('#app').innerHTML,/내 대화/);
@@ -1353,4 +1353,96 @@ test('관리자 메인 다섯 메뉴는 지정한 순서이며 일반·긴급공
  await b.element('#announcements').handlers.click({});assert.match(b.element('#app').innerHTML,/id="announcement"/);assert.match(b.element('#app').innerHTML,/id="urgentAnnouncement"/);
  await b.element('#urgentAnnouncement').handlers.click({});assert.match(b.element('#app').innerHTML,/긴급공지 설정/);await b.element('#back').handlers.click({});assert.match(b.element('#app').innerHTML,/id="announcement"/);
  await b.element('#announcement').handlers.click({});await b.element('#back').handlers.click({});assert.match(b.element('#app').innerHTML,/id="urgentAnnouncement"/);
+});
+
+
+test('관리자 삭제 확인은 탈퇴와 같은 즉시 대화 삭제 및 24시간 현황 보관을 안내한다',async()=>{
+ const writes=[],b=browser({pathname:'/codenotekyh',fetchReply:(url,options)=>{writes.push([url,JSON.parse(options.body)]);return {};}});
+ b.run("deleteMember({id:'target',nick:'삭제 대상'},async()=>{})");const html=b.element('dialog1').innerHTML;
+ assert.match(html,/탈퇴 처리/);assert.match(html,/양쪽 메시지·사진이 즉시 삭제/);assert.match(html,/관리자 대화 기록도 삭제/);assert.match(html,/24시간/);assert.doesNotMatch(html,/기록은 보관됩니다/);
+ await b.element('#proceed').onclick();assert.deepEqual(writes,[['/api/admin/members/target/delete',{confirm:true}]]);
+});
+
+test('삭제된 회원의 모니터링 상세는 이전 프로필 원문을 남기지 않고 목록으로 돌아간다',async()=>{
+ const paths=[],b=browser({pathname:'/codenotekyh',fetchReply:url=>{paths.push(url);return url.includes('member=gone')?{$status:404,$body:{error:'탈퇴한 회원입니다.'}}:[];}});
+ await b.run("monitorRooms({id:'gone',nick:'삭제된 이름',memo:'남으면 안 되는 소개글',area:'서울 동부',year:1995,gender:'여성'})");
+ assert.equal(paths.at(-1),'/api/admin/monitor/profiles');assert.doesNotMatch(b.element('#app').innerHTML,/남으면 안 되는 소개글|삭제된 이름/);
+});
+
+test('관리자 열람 중 방이 삭제되면 대화 원문과 제목을 지우고 이전 목록으로 돌아간다',async()=>{
+ const b=browser({pathname:'/codenotekyh',fetchReply:()=>({$status:404,$body:{error:'대화방을 찾을 수 없어요.'}})});
+ await b.run("conversation('gone','지워질 상대',true,()=>paint('대화 모니터링','chat','새 목록'))");
+ assert.match(b.element('#app').innerHTML,/새 목록/);assert.doesNotMatch(b.element('#app').innerHTML,/지워질 상대/);assert.equal(b.element('#log').innerHTML,'');
+});
+
+test('개인정보 방침은 관리자 회원 삭제도 동일 탈퇴이며 대화를 보관하지 않는다고 설명한다',()=>{
+ const copy=JSON.stringify(privacySections);assert.match(copy,/회원탈퇴·운영자의 회원 삭제/);assert.match(copy,/관리자 대화 기록도 함께 삭제/);assert.doesNotMatch(copy,/기존 프로필과 대화 기록이 남는 조치/);
+});
+
+
+test('열린 채팅에서 글·사진의24시간만료는 DOM만 제거하고 초안과 남은 기록을 유지한다',async()=>{
+ let now=Date.now();const end=now+1000,rows=[{id:1,author:'b',nick:'상대',body:'사라질 글',sent:now-86400000+1000,expiresAt:end,visibility:'visible'},{id:2,author:'b',nick:'상대',sent:now-86400000+1000,expires:end,expiresAt:end,viewable:1,visibility:'visible'},{id:3,author:'b',nick:'상대',body:'남을 글',sent:now,expiresAt:now+86400000,visibility:'visible'}];
+ for(const isAdmin of [false,true]){
+  const b=browser({clockNow:()=>now,pathname:isAdmin?'/codenotekyh':'/',fetchReply:url=>url.includes('/messages')?rows:{total:0}});b.run("stage='member';me={id:'a'}");await b.run("conversation('r','대화',"+isAdmin+",rooms,'b')");b.element('#body').value='작성하던 글';b.element('#body').selectionStart=2;
+  const timer=b.timeouts.get(b.run('contentExpiryTimer'));now=end;timer.fn();
+  assert.doesNotMatch(b.element('#log').innerHTML,/사라질 글|data-message="2"/);assert.match(b.element('#log').innerHTML,/남을 글/);assert.equal(b.element('#body').value,'작성하던 글');assert.equal(b.element('#body').selectionStart,2);
+  assert.equal(b.run('message('+JSON.stringify(rows[0])+','+isAdmin+')'),'');now=end-1000;
+ }
+});
+
+test('만료 타이머는 화면 이동 때 해제되고 신고 검토의 원문과 사진도 만료시 제거한다',async()=>{
+ let now=Date.now();const end=now+1000,b=browser({pathname:'/codenotekyh',clockNow:()=>now,fetchReply:()=>({})});
+ b.run('reviewItem('+JSON.stringify({id:1,nick:'상대',message:2,photo:2,expiresAt:end,excerptExpiresAt:end,excerpt:'만료될 신고 원문'})+',false)');
+ const timer=b.timeouts.get(b.run('contentExpiryTimer'));assert.ok(timer);now=end;timer.fn();
+ assert.match(b.element('#preview').innerHTML,/24시간이 지나 삭제/);assert.equal(b.element('#showPhoto').disabled,true);
+ b.run("paint('다른 화면','book','안전한 화면')");assert.equal(b.run('contentExpiryTimer'),null);timer.fn();assert.match(b.element('#app').innerHTML,/안전한 화면/);
+});
+
+
+test('백그라운드 타이머가 늦어져도 복귀 확인 후 가림막을 걷기 전에 만료 원문을 지운다',async()=>{
+ let now=Date.now();const end=now+1000,b=browser({clockNow:()=>now,fetchReply:url=>url.includes('/messages')?[{id:1,author:'b',nick:'상대',body:'복귀시 사라질 원문',sent:now,expiresAt:end,visibility:'visible'}]:url.startsWith('/api/status')?{stage:'member',memberId:'a'}:{total:0}});
+ b.run("stage='member';me={id:'a'}");await b.run("conversation('r','대화',false,rooms,'b')");b.run('veil(true)');now=end;await b.run('pulse(true)');
+ assert.doesNotMatch(b.element('#log').innerHTML,/복귀시 사라질 원문/);assert.equal(b.element('#lockscreen').hidden,true);
+ b.run("paint('새 화면','book','다른 내용')");assert.equal(b.run('contentExpiryCheck'),null);
+});
+
+test('과거 페이지 재검증이 지연돼도 표시 중인 글·사진은 두 차례 만료되고 늦은 응답으로 복원되지 않는다',{timeout:2000},async()=>{
+ let now=Date.now(),version='1',releaseHistory,historyStarted;
+ const firstDeadline=now+1000,secondDeadline=now+2000,waiting=new Promise(resolve=>{historyStarted=resolve;});
+ const rows=Array.from({length:180},(_,index)=>{
+  const id=index+1,expiresAt=id<=60?firstDeadline:id<120?secondDeadline:now+86400000;
+  return {id,author:'peer',nick:'상대',sent:expiresAt-86400000,expiresAt,visibility:'visible',
+   ...(id===2||id===62?{expires:expiresAt,viewable:1}:{body:id===1?'첫 시점에 사라질 원문':id===61?'두 번째 시점에 사라질 원문':id===120?'유효한 과거 기록':'유효한 기록 '+id})};
+ });
+ const b=browser({pathname:'/',clockNow:()=>now,fetchReply:url=>{
+  if(!url.includes('/messages'))return {total:0};
+  const before=Number(new URL(url,'https://example.com').searchParams.get('before'))||Infinity;
+  const response={$roomVersion:version,$body:rows.filter(message=>message.id<before).slice(-60)};
+  if(version==='2'&&before===121)return new Promise(resolve=>{releaseHistory=()=>resolve(response);historyStarted();});
+  return response;
+ }});
+ b.run("stage='member';me={id:'a'}");await b.run("conversation('r','대화',false,rooms,'peer')");
+ await b.element('#older').handlers.click({});await b.element('#older').handlers.click({});
+ const log=b.element('#log'),composer=b.element('#body');
+ assert.equal([...log.innerHTML.matchAll(/data-message="/g)].length,180);
+ assert.match(log.innerHTML,/\/api\/photos\/2"/);assert.match(log.innerHTML,/\/api\/photos\/62"/);
+ composer.value='계속 작성 중인 초안';composer.selectionStart=2;composer.selectionEnd=6;
+ log.scrollHeight=2000;log.clientHeight=200;log.scrollTop=400;log.handlers.scroll({});
+ const preserved=()=>{
+  assert.match(log.innerHTML,/유효한 과거 기록/);assert.match(log.innerHTML,/유효한 기록 180/);
+  assert.equal(composer.value,'계속 작성 중인 초안');assert.equal(composer.selectionStart,2);assert.equal(composer.selectionEnd,6);
+ };
+ version='2';const refreshing=b.run('roomEventHandler({refresh:true})');await waiting;
+ const firstTimer=b.timeouts.get(b.run('contentExpiryTimer'));assert.ok(firstTimer);
+ now=firstDeadline;firstTimer.fn();
+ assert.doesNotMatch(log.innerHTML,/첫 시점에 사라질 원문|data-message="2"/);
+ assert.match(log.innerHTML,/두 번째 시점에 사라질 원문/);assert.match(log.innerHTML,/\/api\/photos\/62"/);preserved();
+ const secondTimer=b.timeouts.get(b.run('contentExpiryTimer'));assert.ok(secondTimer);assert.notEqual(secondTimer,firstTimer);
+ assert.equal(secondTimer.ms,1000);now=secondDeadline;secondTimer.fn();
+ assert.doesNotMatch(log.innerHTML,/첫 시점에 사라질 원문|두 번째 시점에 사라질 원문|data-message="(?:2|62)"/);preserved();
+ assert.equal([...log.innerHTML.matchAll(/data-message="/g)].length,61);
+ // This response was captured before either deadline, including expired rows.
+ releaseHistory();await refreshing;
+ assert.doesNotMatch(log.innerHTML,/첫 시점에 사라질 원문|두 번째 시점에 사라질 원문|data-message="(?:2|62)"/);preserved();
+ assert.equal([...log.innerHTML.matchAll(/data-message="/g)].length,61);
 });
