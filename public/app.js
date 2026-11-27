@@ -265,7 +265,7 @@ async function blockedList(){
 function gate(){
   paint('인증키를 입력해 주세요','key',`<form class="paper">${field('code','발급받은 일반 인증키','autocomplete="off" maxlength="256" aria-describedby="error" placeholder="인증키 입력"')}${notice}${actions(btn('인증하고 계속'))}</form>
     ${act('existing','기존 회원 로그인','secondary')}
-    <aside class="letter"><h2>${icon('mail')}인증키 발급 안내</h2><p>발급 서버에서 현재 승인된 인증키로 가입할 수 있어요. 사용했던 키도 관리자가 다시 활성화하면 사용할 수 있어요.</p><div class="rule"></div><a class="btn forest" href="/apply">발급 신청서 열기</a></aside>
+    <aside class="letter"><h2>${icon('mail')}인증키 발급 안내</h2><p>현재 승인된 인증키로 다음 가입 단계로 이동해요. 같은 인증키를 사용해도 회원 계정은 각각 만들어져요. 기존 계정은 개인 복구코드로 로그인해 주세요.</p><div class="rule"></div><a class="btn forest" href="/apply">발급 신청서 열기</a></aside>
     ${rulesCard()}`);
   on('#existing','click',loginPage);
   form(async f=>{await api('key',{code:f.get('code')});nick();});

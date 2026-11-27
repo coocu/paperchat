@@ -158,6 +158,11 @@ export function makeServer(config, upstream=providers) {
     cooldown(identity);
     if(safety.restricted(identity))reject(403,'이용 제한 기간에는 가입할 수 없어요.');
   }
+  function clearSignup(install) {
+    const grant=get('SELECT proof FROM signup_gates WHERE device=?',install);
+    if(grant)run("DELETE FROM sessions WHERE identity=? AND kind IN ('gate_ok','details')",grant.proof);
+    run('DELETE FROM signup_gates WHERE device=?',install);
+  }
   function throttle(key,max,window) {
     const k=h('rate',key), now=Date.now();
     run('INSERT INTO attempts VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET hits=CASE WHEN until<=? THEN 1 ELSE hits+1 END, until=CASE WHEN until<=? THEN excluded.until ELSE until END',k,1,now+window,now,now);
@@ -183,8 +188,12 @@ export function makeServer(config, upstream=providers) {
     const id=h('session',v), now=Date.now();
     if(admin)return get(`SELECT s.*,p.sealed AS proof FROM sessions s JOIN admin_session_proofs p ON p.session=s.id
       WHERE s.id=? AND s.kind='admin' AND s.expires>?`,id,now);
+    const install=cookieValue(req,'pc_install');
+    const installId=/^[a-f0-9]{64}$/.test(install||'')?h('install',install):null;
     return get(`SELECT s.* FROM sessions s WHERE s.id=? AND s.kind!='admin' AND s.expires>?
-      AND (s.kind!='member' OR EXISTS(SELECT 1 FROM members m WHERE m.id=s.member AND m.deleted_at IS NULL))`,id,now);
+      AND (s.kind!='member' OR EXISTS(SELECT 1 FROM members m WHERE m.id=s.member AND m.deleted_at IS NULL))
+      AND (s.kind NOT IN ('gate_ok','details') OR EXISTS(SELECT 1 FROM signup_gates g
+        WHERE g.proof=s.identity AND g.device=? AND g.expires>?))`,id,now,installId,now);
   }
   function need(req,kind,limited=false) {
     const s=sessions(req,kind==='admin');
@@ -356,9 +365,9 @@ export function makeServer(config, upstream=providers) {
       let s=sessions(req);
       const install=device(req,res);
       if(!s) {
-        const held=get('SELECT proof,pending_until FROM used_invites WHERE pending_device=? AND pending_until>?',install,Date.now());
+        const held=get('SELECT proof,expires FROM signup_gates WHERE device=? AND expires>?',install,Date.now());
         if(held){
-          const sid=issue(res,'gate_ok',held.pending_until-Date.now());
+          const sid=issue(res,'gate_ok',held.expires-Date.now());
           run('UPDATE sessions SET identity=? WHERE id=?',held.proof,sid);
           s={kind:'gate_ok'};
         }
@@ -392,30 +401,24 @@ export function makeServer(config, upstream=providers) {
     if(post && p==='/api/key') {
       throttle('key:'+ip,20,hour/4);
       const code=string(b.code,1,256,'인증키');
-      const invitation=h('invite',code.normalize('NFKC').toLowerCase());
       const install=device(req,res);
-      const signupEpoch=signupEpochs.get(install);
-      const available=()=>{
-        if(get('SELECT 1 FROM used_invites WHERE proof=? AND pending_device IS NOT NULL AND pending_device<>? AND pending_until>?',invitation,install,Date.now()))
-          reject(409,'이 인증키로 진행 중인 가입이 있어요.');
-        if(get('SELECT 1 FROM used_invites WHERE proof<>? AND pending_device=? AND pending_until>?',invitation,install,Date.now()))
-          reject(409,'이 기기에서 진행 중인 가입을 먼저 완료해 주세요.');
-      };
       checkSignup(install);
+      const signupEpoch=token();signupEpochs.set(install,signupEpoch);
       const v=await upstream.check(code);
       if(v?.status==='pending') reject(403,'승인 대기 중이에요.');
       if(!registryApproved(v)) reject(403,'승인된 인증키를 확인해 주세요.');
       if(revision!==resetVersion()) reject(409,'서버가 초기화됐어요.');
       if(signupEpoch!==signupEpochs.get(install))reject(409,'계정 정보가 변경됐어요. 인증키부터 다시 확인해 주세요.');
       transaction(db,()=>{
-        checkSignup(install);available();
+        checkSignup(install);
         const prev=sessions(req);
         if(prev?.kind==='member')reject(409,'이미 로그인한 계정이에요.');
         if(prev)run('DELETE FROM sessions WHERE id=?',prev.id);
-        run('UPDATE used_invites SET pending_device=NULL,pending_until=NULL WHERE pending_device=?',install);
-        run('INSERT INTO used_invites VALUES(?,?,?) ON CONFLICT(proof) DO UPDATE SET pending_device=excluded.pending_device,pending_until=excluded.pending_until',invitation,install,Date.now()+24*hour);
+        clearSignup(install);
+        const grant=token();
+        run('INSERT INTO signup_gates VALUES(?,?,?)',install,grant,Date.now()+24*hour);
         const sid=issue(res,'gate_ok',24*hour);
-        run('UPDATE sessions SET identity=? WHERE id=?',invitation,sid);
+        run('UPDATE sessions SET identity=? WHERE id=?',grant,sid);
       });
       return ok();
     }
@@ -431,6 +434,7 @@ export function makeServer(config, upstream=providers) {
     }
     if(post && p==='/api/account/login') {
       const s=sessions(req);
+      const install=device(req,res);
       throttle('recovery:'+ip,20,hour/4);
       const code=string(b.code,1,64,'개인 복구코드');
       const credential=proof(code);
@@ -440,11 +444,13 @@ export function makeServer(config, upstream=providers) {
         reject(403,'개인 복구코드를 확인해 주세요.');
       }
       transaction(db,()=>{
-        run('INSERT OR IGNORE INTO account_devices VALUES(?,?)',account.member,device(req,res));
+        run('INSERT OR IGNORE INTO account_devices VALUES(?,?)',account.member,install);
+        clearSignup(install);
         if(s)run('DELETE FROM sessions WHERE id=?',s.id);
         const sid=issue(res,'member',24*30*hour,account.member);
         touch(account.member,sid);
       });
+      signupEpochs.set(install,token());
       if(s)closeStreams(stream=>stream.session===s.id);
       return ok({stage:safety.memberStage(account.member)});
     }
@@ -465,8 +471,9 @@ export function makeServer(config, upstream=providers) {
       checkText(memo);checkText(s.nick);
       if(b.policy!==policyVersion)reject(400,'이용규칙을 확인하고 동의해 주세요.');
       transaction(db,()=>{
-        const consumed=run('UPDATE used_invites SET pending_device=NULL,pending_until=NULL WHERE proof=? AND pending_device=? AND pending_until>?',s.identity,install,Date.now());
+        const consumed=run('DELETE FROM signup_gates WHERE proof=? AND device=? AND expires>?',s.identity,install,Date.now());
         if(consumed.changes!==1)reject(409,'가입 요청이 만료되었거나 이미 처리됐어요.');
+        run("DELETE FROM sessions WHERE identity=? AND id<>? AND kind IN ('gate_ok','details')",s.identity,s.id);
         const id=randomUUID(),credential=proof(recoveryCode(id));
         run('INSERT INTO members(id,identity,nick,year,gender,area,memo) VALUES(?,?,?,?,?,?,?)',id,credential,s.nick,s.year,s.gender,area,memo);
         attachKey.run(id,credential,Date.now());
@@ -478,10 +485,12 @@ export function makeServer(config, upstream=providers) {
         touch(id,s.id);
         cookie(res,'pc_user',cookieValue(req,'pc_user'),ttl);
       });
+      signupEpochs.set(install,token());
       return ok();
     }
     if(post && p==='/api/logout') {
       const s=sessions(req);if(s) run('DELETE FROM sessions WHERE id=?',s.id);
+      signupEpochs.set(device(req,res),token());
       if(s)closeStreams(stream=>stream.session===s.id);
       cookie(res,'pc_user','',0);return ok();
     }
@@ -671,12 +680,7 @@ export function makeServer(config, upstream=providers) {
           if(!m)reject(404,'가입자 정보가 없어요.');
           if(m.deleted_at!==null)return [];
           const linked=all('SELECT device FROM account_devices WHERE member=?',target).map(d=>d.device);
-          for(const device of linked) {
-            const pending=all('SELECT proof FROM used_invites WHERE pending_device=?',device);
-            for(const invite of pending)
-              run("DELETE FROM sessions WHERE identity=? AND kind IN ('gate_ok','details','verified')",invite.proof);
-            run('UPDATE used_invites SET pending_device=NULL,pending_until=NULL WHERE pending_device=?',device);
-          }
+          for(const device of linked)clearSignup(device);
           run('DELETE FROM push_jobs WHERE message IN (SELECT id FROM messages WHERE author=?)',target);
           run('DELETE FROM sessions WHERE member=?',target);
           for(const table of ['account_keys','account_devices','contacts','acceptances','room_reads'])

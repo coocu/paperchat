@@ -1,11 +1,11 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { migrateMemberAreas } from './regions.mjs';
 
 export const hour = 3600_000;
-export const tables = ['used_invites','account_devices','account_keys','push_jobs','push_devices','session_presence','member_activity','admin_session_proofs','departures','pending_contacts','contacts','reports','penalty_events','reviews','room_reads','room_changes','blocks','acceptances','restrictions','messages','rooms','sessions','members','cooldowns','settings','attempts'];
+export const tables = ['signup_gates','used_invites','account_devices','account_keys','push_jobs','push_devices','session_presence','member_activity','admin_session_proofs','departures','pending_contacts','contacts','reports','penalty_events','reviews','room_reads','room_changes','blocks','acceptances','restrictions','messages','rooms','sessions','members','cooldowns','settings','attempts'];
 export function openStore(dir) {
   mkdirSync(dir, {recursive:true, mode:0o700});
   const db = new DatabaseSync(join(dir,'chat.sqlite'));
@@ -45,6 +45,7 @@ export function openStore(dir) {
     CREATE TABLE IF NOT EXISTS service_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS used_invites(proof TEXT PRIMARY KEY,pending_device TEXT,pending_until INTEGER);
     CREATE UNIQUE INDEX IF NOT EXISTS pending_invite_device ON used_invites(pending_device) WHERE pending_device IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS signup_gates(device TEXT PRIMARY KEY,proof TEXT UNIQUE NOT NULL,expires INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS account_keys(member TEXT PRIMARY KEY REFERENCES members ON DELETE CASCADE,proof TEXT UNIQUE NOT NULL,saved INTEGER NOT NULL DEFAULT 0,joined INTEGER);
     CREATE TABLE IF NOT EXISTS account_devices(member TEXT NOT NULL REFERENCES members ON DELETE CASCADE,device TEXT NOT NULL,PRIMARY KEY(member,device));
     CREATE TABLE IF NOT EXISTS member_activity(member TEXT PRIMARY KEY REFERENCES members ON DELETE CASCADE,last_seen INTEGER NOT NULL);
@@ -66,6 +67,22 @@ export function openStore(dir) {
     INSERT OR IGNORE INTO reviews SELECT id,'approved' FROM messages WHERE photo IS NOT NULL;
   `));
   transaction(db,()=>{
+    // An approval belongs to one installation, not to the reusable invitation.
+    // Keep pending legacy forms and their original expiry without claiming the
+    // invitation for future users. Clearing the legacy pointer makes this safe
+    // to run repeatedly, including after a partial deployment.
+    for(const held of db.prepare('SELECT proof,pending_device,pending_until FROM used_invites WHERE pending_device IS NOT NULL').all()) {
+      const existing=db.prepare('SELECT 1 FROM signup_gates WHERE device=?').get(held.pending_device);
+      if(held.pending_until>Date.now() && !existing) {
+        const grant=randomBytes(32).toString('hex');
+        db.prepare('INSERT INTO signup_gates VALUES(?,?,?)').run(held.pending_device,grant,held.pending_until);
+        db.prepare(`UPDATE sessions SET identity=?,expires=MIN(expires,?)
+          WHERE identity=? AND kind IN ('gate_ok','details')`).run(grant,held.pending_until,held.proof);
+      } else {
+        db.prepare("DELETE FROM sessions WHERE identity=? AND kind IN ('gate_ok','details')").run(held.proof);
+      }
+      db.prepare('UPDATE used_invites SET pending_device=NULL,pending_until=NULL WHERE proof=?').run(held.proof);
+    }
     if(!db.prepare('PRAGMA table_info(members)').all().some(c=>c.name==='deleted_at'))
       db.exec('ALTER TABLE members ADD COLUMN deleted_at INTEGER');
     if(!db.prepare('PRAGMA table_info(messages)').all().some(c=>c.name==='deleted_at'))
@@ -135,6 +152,8 @@ export function closeRoom(db,id,reason,now=Date.now()) {
 export function clean(db, now=Date.now()) {
   transaction(db, () => {
     db.prepare('UPDATE used_invites SET pending_device=NULL,pending_until=NULL WHERE pending_until<=?').run(now);
+    db.prepare("DELETE FROM sessions WHERE kind IN ('gate_ok','details') AND identity IN (SELECT proof FROM signup_gates WHERE expires<=?)").run(now);
+    db.prepare('DELETE FROM signup_gates WHERE expires<=?').run(now);
     db.prepare('UPDATE messages SET photo=NULL WHERE expires<=? AND photo IS NOT NULL').run(now);
     for (const [table,field] of [['sessions','expires'],['cooldowns','until'],['attempts','until'],['restrictions','until'],['departures','expires']])
       db.prepare('DELETE FROM '+table+' WHERE '+field+'<=?').run(now);

@@ -45,8 +45,8 @@ function fixture(t) {
     };
     call.cookies=cookies;return call;
   }
-  async function register(nick,region=area,call=client()) {
-    assert.equal((await call('/api/key',{code:'invite-'+randomUUID()})).status,200);
+  async function register(nick,region=area,call=client(),invitation='invite-'+randomUUID()) {
+    assert.equal((await call('/api/key',{code:invitation})).status,200);
     assert.equal((await call('/api/profile-details',{nick,birthDate:'1995-01-03',gender:'여성'})).status,200);
     assert.equal((await call('/api/register',{area:region,memo:'소개',policy:policyVersion})).status,200);
     const {profile}= (await call('/api/state')).body;
@@ -70,6 +70,87 @@ function fixture(t) {
   return {db,queue,client,register,admin,room,send,events,delivered,upstream,lookups,server:()=>server,
     now:()=>now,advance(ms){now+=ms;},restart(){if(!serverClosed)server.emit('close');server=makeServer(cfg,upstream);serverClosed=false;server.on('close',()=>serverClosed=true);}};
 }
+
+test('동일 인증키로 만든 회원은 복구·개인 대화·탈퇴 제한을 서로 공유하지 않는다',async t=>{
+  const f=fixture(t),shared='shared-approved-key';
+  const [a,b,c]=await Promise.all(['공유키 하나','공유키 둘','공유키 셋'].map(nick=>f.register(nick,area,f.client(),shared)));
+  assert.equal(new Set([a.id,b.id,c.id]).size,3);assert.equal(new Set([a.code,b.code,c.code]).size,3);
+  assert.equal(new Set(f.db.prepare('SELECT identity FROM members').all().map(m=>m.identity)).size,3);
+  const ab=await f.room(a,b),message=await f.send(a,ab,{body:'둘만의 편지'});
+  assert.equal((await c.call('/api/rooms/'+ab+'/messages')).status,404);
+  assert.deepEqual((await c.call('/api/rooms')).body,[]);
+  assert.equal((await b.call('/api/rooms/'+ab+'/messages')).body[0].id,message);
+  const another=f.client();await another('/api/account/login',{code:b.code});
+  assert.equal((await another('/api/state')).body.profile.id,b.id);
+  assert.equal((await f.client()('/api/account/login',{code:shared})).status,403);
+  await a.call('/api/withdraw',{confirm:true});
+  assert.equal((await a.call('/api/key',{code:shared})).status,403);
+  const later=await f.register('다음 공유키 회원',area,f.client(),shared);
+  assert.ok(![a.id,b.id,c.id].includes(later.id));
+  assert.equal((await b.call('/api/state')).body.profile.id,b.id);
+  assert.equal((await c.call('/api/state')).body.profile.id,c.id);
+});
+
+test('가입 승인은 기기별로 교체·복구·만료되고 모든 키 입력에서 외부 승인을 확인한다',async t=>{
+  const f=fixture(t),user=f.client();
+  assert.equal((await user('/api/key',{code:'first-key'})).status,200);
+  const original=f.db.prepare('SELECT * FROM signup_gates').get();
+  await user('/api/profile-details',{nick:'진행 중',birthDate:'1995-01-03',gender:'여성'});
+  const old=f.client();for(const [k,v]of user.cookies)old.cookies.set(k,v);
+  assert.equal((await user('/api/key',{code:'different-key'})).status,200);
+  const replacement=f.db.prepare('SELECT * FROM signup_gates').get();
+  assert.equal(replacement.device,original.device);assert.notEqual(replacement.proof,original.proof);
+  assert.equal((await old('/api/profile-details',{nick:'옛 요청',birthDate:'1995-01-03',gender:'여성'})).status,401);
+  assert.equal((await user('/api/state')).body.stage,'gate_ok');
+  await user('/api/profile-details',{nick:'새 입력',birthDate:'1995-01-03',gender:'여성'});
+  const check=f.upstream.check;
+  for(const answer of [{status:'pending',token:'pending'},{status:'expired',token:'expired'},{status:'approved',token:'  '}]) {
+    let calls=0;f.upstream.check=async()=>{calls++;return answer;};
+    assert.equal((await user('/api/key',{code:'different-key'})).status,403);assert.equal(calls,1);
+    assert.equal((await user('/api/state')).body.stage,'details');
+    assert.deepEqual(f.db.prepare('SELECT * FROM signup_gates').get(),replacement);
+  }
+  f.upstream.check=check;
+  user.cookies.delete('pc_user');
+  assert.equal((await user('/api/state')).body.stage,'gate_ok');
+  assert.deepEqual(f.db.prepare('SELECT * FROM signup_gates').get(),replacement);
+  f.restart();assert.equal((await user('/api/state')).body.stage,'gate_ok');
+  f.advance(replacement.expires-f.now());
+  assert.equal((await user('/api/state')).body.stage,'gate');
+  assert.equal((await user('/api/profile-details',{nick:'만료',birthDate:'1995-01-03',gender:'여성'})).status,401);
+  clean(f.db,f.now());assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM signup_gates').get().n,0);
+  assert.equal(f.db.prepare("SELECT COUNT(*) AS n FROM sessions WHERE kind IN ('gate_ok','details')").get().n,0);
+  assert.equal((await user('/api/key',{code:'first-key'})).status,200);
+});
+
+test('늦은 키 승인 응답은 같은 기기의 새 인증·가입·복구로그인·로그아웃을 덮지 않는다',async t=>{
+  const f=fixture(t),existing=await f.register('복구할 회원');
+  const check=f.upstream.check;
+  for(const action of ['replace','register','login','logout']) {
+    const user=f.client();await user('/api/key',{code:'initial-'+action});
+    await user('/api/profile-details',{nick:'경합 '+action,birthDate:'1995-01-03',gender:'여성'});
+    let started,release;const ready=new Promise(resolve=>started=resolve);
+    f.upstream.check=async code=>code==='delayed-'+action?new Promise(resolve=>{release=resolve;started();}):check(code);
+    const pending=user('/api/key',{code:'delayed-'+action});await ready;
+    let member=null;
+    if(action==='replace')assert.equal((await user('/api/key',{code:'latest-key'})).status,200);
+    if(action==='register'){
+      assert.equal((await user('/api/register',{area,memo:'경합 검증',policy:policyVersion})).status,200);
+      member=(await user('/api/state')).body.profile.id;
+    }
+    if(action==='login'){
+      assert.equal((await user('/api/account/login',{code:existing.code})).status,200);member=existing.id;
+    }
+    if(action==='logout')assert.equal((await user('/api/logout',{})).status,200);
+    const cookie=user.cookies.get('pc_user');
+    release({status:'approved',token:'late'});
+    const response=await pending;assert.equal(response.status,409);assert.equal(response.headers['set-cookie'],undefined);
+    assert.equal(user.cookies.get('pc_user'),cookie);
+    const state=(await user('/api/state')).body;
+    assert.equal(state.stage,member?'member':'gate_ok');if(member)assert.equal(state.profile.id,member);
+    f.upstream.check=check;
+  }
+});
 
 test('프로필 편집은 본인 지역·소개글만 검증해 저장하고 모든 조회에 반영한다',async t=>{
   const f=fixture(t),a=await f.register('편집 회원'),b=await f.register('상대 회원','인천광역시 검단구'),admin=await f.admin();
@@ -443,6 +524,9 @@ test('관리자 회원 삭제는 모든 인증·푸시·가입예약을 폐기�
   const image=await f.send(a,ab,{photo:photo.toString('base64')});
   const unrelated=await f.send(b,bc,{body:'다른 회원 알림'});
   await a2('/api/logout',{});await a2('/api/key',{code:'pending-key'});
+  const independent=f.client();await independent('/api/key',{code:'pending-key'});
+  await independent('/api/profile-details',{nick:'독립 가입',birthDate:'1995-01-03',gender:'여성'});
+  const independentProof=f.db.prepare("SELECT identity FROM sessions WHERE nick='독립 가입'").get().identity;
   await a3('/api/logout',{});
   let release,started;const ready=new Promise(resolve=>started=resolve);
   const originalCheck=f.upstream.check;
@@ -464,7 +548,9 @@ test('관리자 회원 삭제는 모든 인증·푸시·가입예약을 폐기�
   for(const table of ['account_keys','account_devices','contacts','acceptances','room_reads'])
     assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM '+table+' WHERE member=?').get(a.id).n,0);
   assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM sessions WHERE member=?').get(a.id).n,0);
-  assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM used_invites WHERE pending_device IS NOT NULL').get().n,0);
+  assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM signup_gates').get().n,1);
+  assert.ok(f.db.prepare('SELECT 1 FROM signup_gates WHERE proof=?').get(independentProof));
+  assert.equal((await independent('/api/state')).body.stage,'details');
   assert.ok(f.db.prepare('SELECT deleted_at FROM members WHERE id=?').get(a.id).deleted_at);
   const listing=(await admin('/api/admin/members')).body;
   assert.equal(listing.counts.active,2);assert.ok(!listing.items.some(m=>m.id===a.id));
@@ -479,6 +565,7 @@ test('관리자 회원 삭제는 모든 인증·푸시·가입예약을 폐기�
   assert.equal((await b.call('/api/state')).body.stage,'member');assert.equal((await c.call('/api/state')).body.stage,'member');
   await f.queue.flush();assert.deepEqual(f.delivered,[unrelated]);
   f.restart();
+  assert.equal((await independent('/api/state')).body.stage,'details');
   assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM account_keys WHERE member=?').get(a.id).n,0);
   assert.equal((await a.call('/api/account/login',{code:a.code})).status,403);
   assert.equal((await admin('/api/admin/rooms/'+ab+'/messages')).body[0].body,'관리자 보존 원문');
@@ -490,6 +577,58 @@ test('관리자 회원 삭제는 모든 인증·푸시·가입예약을 폐기�
   assert.equal((await admin('/api/admin/rooms/'+ab+'/messages')).status,404);
   await admin('/api/admin/reset',{key:'codenote-test-kyh',confirm:'전체 삭제'});
   for(const table of tables)assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM '+table).get().n,0);
+});
+
+test('기존 키 예약은 진행 중 입력과 만료시간을 보존해 이관하고 다른 기기 승인과 기존 계정은 유지한다',async t=>{
+  const f=fixture(t),member=await f.register('기존 계정'),admin=await f.admin();
+  const oldProfile=(await member.call('/api/state')).body.profile;
+  async function legacy(nick,remaining) {
+    const call=f.client();await call('/api/key',{code:'same-legacy-key'});
+    await call('/api/profile-details',{nick,birthDate:'1994-07-08',gender:'남성'});
+    const session=f.db.prepare('SELECT * FROM sessions WHERE nick=?').get(nick);
+    const gate=f.db.prepare('SELECT * FROM signup_gates WHERE proof=?').get(session.identity);
+    const oldProof='legacy-'+nick,expires=f.now()+remaining;
+    f.db.prepare('DELETE FROM signup_gates WHERE proof=?').run(gate.proof);
+    f.db.prepare('INSERT INTO used_invites VALUES(?,?,?)').run(oldProof,gate.device,expires);
+    f.db.prepare('UPDATE sessions SET identity=?,expires=? WHERE id=?').run(oldProof,f.now()+4*hour,session.id);
+    return {call,session,gate,oldProof,expires};
+  }
+  const active=await legacy('유지할 입력',5*hour),lost=await legacy('쿠키 유실',3*hour),expired=await legacy('만료 입력',-1);
+  lost.call.cookies.delete('pc_user');
+  f.db.prepare('INSERT INTO used_invites VALUES(?,NULL,NULL)').run('already-used-history');
+  const other=f.client();await other('/api/key',{code:'same-legacy-key'});
+  await other('/api/profile-details',{nick:'새 방식 독립 기기',birthDate:'1995-01-03',gender:'여성'});
+  const otherProof=f.db.prepare("SELECT identity FROM sessions WHERE nick='새 방식 독립 기기'").get().identity;
+  f.restart();
+  const migrated=f.db.prepare('SELECT * FROM signup_gates WHERE device=?').get(active.gate.device);
+  assert.notEqual(migrated.proof,active.oldProof);assert.notEqual(migrated.proof,active.gate.proof);
+  assert.equal(migrated.expires,active.expires);
+  const session=f.db.prepare('SELECT * FROM sessions WHERE id=?').get(active.session.id);
+  assert.equal(session.identity,migrated.proof);assert.equal(session.expires,f.now()+4*hour);
+  assert.equal(session.kind,'details');assert.equal(session.nick,'유지할 입력');assert.equal(session.year,1994);assert.equal(session.gender,'남성');
+  assert.equal((await active.call('/api/state')).body.stage,'details');
+  assert.equal((await lost.call('/api/state')).body.stage,'gate_ok');
+  assert.equal(f.db.prepare('SELECT expires FROM signup_gates WHERE device=?').get(lost.gate.device).expires,lost.expires);
+  assert.equal((await expired.call('/api/state')).body.stage,'gate');
+  assert.equal(f.db.prepare('SELECT 1 FROM signup_gates WHERE device=?').get(expired.gate.device),undefined);
+  assert.equal(f.db.prepare('SELECT 1 FROM sessions WHERE id=?').get(expired.session.id),undefined);
+  assert.ok(f.db.prepare('SELECT 1 FROM signup_gates WHERE proof=?').get(otherProof));
+  assert.ok(f.db.prepare('SELECT pending_device,pending_until FROM used_invites').all().every(r=>r.pending_device===null && r.pending_until===null));
+  f.restart();assert.deepEqual(f.db.prepare('SELECT * FROM signup_gates WHERE device=?').get(active.gate.device),migrated);
+  assert.deepEqual((await member.call('/api/state')).body.profile,oldProfile);
+  assert.equal((await member.call('/api/account/recovery')).body.code,member.code);
+  assert.equal((await admin('/api/admin/members')).body.counts.active,1);
+  const stale=f.client();for(const [key,value]of active.call.cookies)stale.cookies.set(key,value);
+  const body={area,memo:'이관 후 가입',policy:policyVersion};
+  const results=await Promise.all([active.call('/api/register',body),stale('/api/register',body)]);
+  assert.deepEqual(results.map(r=>r.status).sort(),[200,401]);
+  const newMember=(await active.call('/api/state')).body.profile;
+  assert.equal(newMember.nick,'유지할 입력');assert.equal(newMember.year,1994);assert.equal(newMember.gender,'남성');
+  assert.equal((await other('/api/state')).body.stage,'details');
+  assert.equal((await other('/api/register',body)).status,200);
+  assert.notEqual((await other('/api/state')).body.profile.id,newMember.id);
+  assert.equal((await admin('/api/admin/members')).body.counts.active,3);
+  assert.equal((await member.call('/api/account/recovery')).body.code,member.code);
 });
 
 test('구형 DB에 열을 추가할 때 기존 메시지·회원은 보존하고 관측일을 한 번만 설정한다',t=>{

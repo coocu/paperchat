@@ -102,36 +102,40 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
       } finally {registry.delete(key);}
     }
   });
-  await t.test('진행 중 가입은 한 기기에서 이어가고 사용 이력과 무관하게 발급 서버 승인에 따라 키를 재사용한다',async()=>{
-    const code='invite-race', first=client(),second=client();
-    await first('/api/state');await second('/api/state');
+  await t.test('같은 인증키로 여러 기기가 동시에 독립 가입하고 사용 뒤에도 승인에 따라 다시 쓴다',async()=>{
+    const code='invite-race', clients=[client(),client(),client()];
+    for(const user of clients)await user('/api/state');
     let pending=[];
     registry.set(code,()=>new Promise(resolve=>pending.push(resolve)));
-    const attempts=[first('/api/key',{code}),second('/api/key',{code})];
-    while(pending.length<2)await new Promise(r=>setImmediate(r));
+    const attempts=clients.map(user=>user('/api/key',{code}));
+    while(pending.length<3)await new Promise(r=>setImmediate(r));
     for(const release of pending)release({status:'approved',token:'once'});
     const result=await Promise.all(attempts);
-    assert.deepEqual(result.map(r=>r.status).sort(),[200,409]);
-    const winner=result[0].status===200?first:second;
-    const loser=winner===first?second:first;
-    await winner('/api/logout',{});
-    assert.equal((await winner('/api/state')).body.stage,'gate_ok');
-    assert.equal((await loser('/api/state')).body.stage,'gate');
+    assert.deepEqual(result.map(r=>r.status),[200,200,200]);
+    await clients[0]('/api/logout',{});
+    for(const user of clients)assert.equal((await user('/api/state')).body.stage,'gate_ok');
     registry.set(code,{status:'approved',token:'once'});
-    assert.equal((await loser('/api/key',{code})).status,409);
-    assert.equal((await winner('/api/profile-details',{nick:'키 재사용 검증',birthDate:'1995-01-01',gender:'여성'})).status,200);
-    assert.equal((await winner('/api/register',{area:'경기도 이천시',memo:'검증',policy:policyVersion})).status,200);
-    const member=(await winner('/api/state')).body.profile.id;
+    for(const [index,user] of clients.entries())assert.equal((await user('/api/profile-details',{nick:'키 재사용 '+index,birthDate:'1995-01-01',gender:'여성'})).status,200);
+    const body={area:'경기도 이천시',memo:'검증',policy:policyVersion};
+    assert.deepEqual((await Promise.all(clients.map(user=>user('/api/register',body)))).map(r=>r.status),[200,200,200]);
+    const members=await Promise.all(clients.map(async user=>(await user('/api/state')).body.profile.id));
+    const codes=await Promise.all(clients.map(async user=>(await user('/api/account/recovery')).body.code));
+    assert.equal(new Set(members).size,3);assert.equal(new Set(codes).size,3);
+    const next=client();
     registry.set(code,{status:'expired',token:'old'});
     const checked=registryLookups.length;
-    assert.equal((await loser('/api/key',{code})).status,403);
+    assert.equal((await next('/api/key',{code})).status,403);
     assert.equal(registryLookups.length,checked+1);
     registry.set(code,{status:'approved',token:'reopened'});
-    assert.equal((await loser('/api/key',{code})).status,200);
-    assert.equal((await loser('/api/state')).body.stage,'gate_ok');
-    assert.equal((await loser('/api/key',{code})).status,200);
-    assert.equal((await loser('/api/register',{area:'경기도 이천시',memo:'검증',policy:policyVersion})).status,401);
-    db.prepare('DELETE FROM members WHERE id=?').run(member);
+    assert.equal((await next('/api/key',{code})).status,200);
+    assert.equal((await next('/api/state')).body.stage,'gate_ok');
+    assert.equal((await next('/api/key',{code:'invite-other-key'})).status,200);
+    assert.equal((await next('/api/register',body)).status,401);
+    assert.equal((await next('/api/profile-details',{nick:'다음 회원',birthDate:'1995-01-01',gender:'여성'})).status,200);
+    assert.equal((await next('/api/register',body)).status,200);
+    const fourth=(await next('/api/state')).body.profile.id;
+    assert.ok(!members.includes(fourth));
+    for(const member of [...members,fourth])db.prepare('DELETE FROM members WHERE id=?').run(member);
     registry.delete(code);
   });
   await t.test('일반 웹과 앱은 회원 화면을 열고 관리자 새 경로도 API 인증을 우회하지 않는다',async()=>{

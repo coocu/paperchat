@@ -185,6 +185,8 @@ test('가입키 화면의 카드 간격, 기존 회원 로그인과 직접 입�
   assert.match(gate,/class="screen-stack"/);
   assert.equal((gate.match(/id="error"/g)||[]).length,1);
   assert.match(gate,/인증하고 계속[\s\S]*기존 회원 로그인[\s\S]*인증키 발급 안내[\s\S]*이용규칙/);
+  assert.match(gate,/현재 승인된 인증키로 다음 가입 단계로 이동/);assert.match(gate,/같은 인증키를 사용해도 회원 계정은 각각 만들어/);
+  assert.match(gate,/기존 계정은 개인 복구코드로 로그인/);assert.doesNotMatch(gate,/다시 활성화|이미 사용한 인증키/);
   await b.element('#existing').handlers.click({});
   assert.match(b.element('#app').innerHTML,/개인 복구코드/);
   assert.deepEqual(requests,['/api/state']);
@@ -192,6 +194,14 @@ test('가입키 화면의 카드 간격, 기존 회원 로그인과 직접 입�
   const page=b.element('#app').innerHTML;
   assert.match(page,/생년월일/);assert.match(page,/type="date"/);assert.match(page,/남자/);assert.match(page,/여자/);
   assert.match(page,/만 19세/);assert.doesNotMatch(page,/전화번호|통신사/);
+});
+
+test('가입 인증키 확인이 성공하면 기존 계정 로그인 없이 닉네임 입력 단계로 이동한다',async()=>{
+  const requests=[];const b=browser({pathname:'/',fetchReply:(url,options)=>{requests.push([url,JSON.parse(options.body)]);return {stage:'gate_ok'};}});
+  b.run('gate()');await submitForm(b,{code:'shared-registration-key'});
+  assert.deepEqual(requests,[['/api/key',{code:'shared-registration-key'}]]);
+  assert.match(b.element('#app').innerHTML,/어떻게 불러드릴까요/);assert.match(b.element('#app').innerHTML,/id="nick"/);
+  assert.doesNotMatch(b.element('#app').innerHTML,/개인 복구코드|id="recovery"/);
 });
 
 test('규칙 동의 문구와 설정 카드',()=>{
