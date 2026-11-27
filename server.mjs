@@ -265,6 +265,23 @@ export function makeServer(config, upstream=providers) {
     return {androidUrl:get("SELECT value FROM settings WHERE name='download_android'")?.value||'',
       iosUrl:get("SELECT value FROM settings WHERE name='download_ios'")?.value||''};
   }
+  function saveDownloadLinks({androidUrl,iosUrl}) {
+    for(const [name,value] of [['download_android',androidUrl],['download_ios',iosUrl]]) {
+      if(value)run('INSERT INTO settings VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value',name,value);
+      else run('DELETE FROM settings WHERE name=?',name);
+    }
+  }
+  function announcement() {
+    const defaults={enabled:false,title:'공지',body:'',androidEnabled:true,iosEnabled:true};
+    const row=get("SELECT value FROM settings WHERE name='announcement'");
+    let saved;
+    try{saved=row?JSON.parse(row.value):null;}catch{}
+    // Keep the public shape fixed and fail closed if stored settings are damaged.
+    const valid=saved && typeof saved.enabled==='boolean' && typeof saved.title==='string'
+      && typeof saved.body==='string' && typeof saved.androidEnabled==='boolean' && typeof saved.iosEnabled==='boolean';
+    const content=valid?Object.fromEntries(Object.keys(defaults).map(key=>[key,saved[key]])):defaults;
+    return {...content,...downloadLinks()};
+  }
   function downloadURL(value) {
     if(typeof value!=='string')reject(400,'다운로드 주소를 문자열로 입력해 주세요.');
     const input=value.trim();
@@ -313,6 +330,7 @@ export function makeServer(config, upstream=providers) {
         operator:String(process.env.OPERATOR_NAME || 'CodeNote').trim(),appName:'종이편지'});
     }
     if(!post && p==='/api/download-links')return ok(downloadLinks());
+    if(!post && p==='/api/announcement')return ok(announcement());
     if(!post && p==='/privacy')return finish(res,200,renderPrivacyPage(),'text/html; charset=utf-8');
     if(!post && assets.has(p)) {
       const file=assets.get(p);
@@ -749,17 +767,28 @@ export function makeServer(config, upstream=providers) {
         return ok();
       }
       if(p==='/api/admin/settings' && !post) return ok({url:configURL()});
+      if(p==='/api/admin/announcement') {
+        if(!post)return ok(announcement());
+        const fields=['enabled','title','body','androidEnabled','iosEnabled','androidUrl','iosUrl'];
+        if(Object.keys(b).length!==fields.length || fields.some(key=>!Object.hasOwn(b,key))
+          || ['enabled','androidEnabled','iosEnabled'].some(key=>typeof b[key]!=='boolean'))
+          reject(400,'공지 내용과 다운로드 버튼 설정을 함께 확인해 주세요.');
+        const title=string(b.title,b.enabled?1:0,120,'공지 제목');
+        const body=string(b.body,b.enabled?1:0,20000,'공지 내용');
+        const links={androidUrl:downloadURL(b.androidUrl),iosUrl:downloadURL(b.iosUrl)};
+        const content={enabled:b.enabled,title,body,androidEnabled:b.androidEnabled,iosEnabled:b.iosEnabled};
+        transaction(db,()=>{
+          run("INSERT INTO settings VALUES('announcement',?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",JSON.stringify(content));
+          saveDownloadLinks(links);
+        });
+        return ok({...content,...links});
+      }
       if(p==='/api/admin/download-links') {
         if(!post)return ok(downloadLinks());
         if(Object.keys(b).length!==2 || !Object.hasOwn(b,'androidUrl') || !Object.hasOwn(b,'iosUrl'))
           reject(400,'Android와 iPhone 다운로드 주소만 함께 입력해 주세요.');
         const androidUrl=downloadURL(b.androidUrl),iosUrl=downloadURL(b.iosUrl);
-        transaction(db,()=>{
-          for(const [name,value] of [['download_android',androidUrl],['download_ios',iosUrl]]) {
-            if(value)run('INSERT INTO settings VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value',name,value);
-            else run('DELETE FROM settings WHERE name=?',name);
-          }
-        });
+        transaction(db,()=>saveDownloadLinks({androidUrl,iosUrl}));
         return ok({androidUrl,iosUrl});
       }
       if(p==='/api/admin/settings' && post) {

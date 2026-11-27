@@ -838,3 +838,69 @@ test('웹 알림은 네이티브 앱·관리자·보안 연결이 아닌 화면�
     assert.deepEqual(w.calls,[]);assert.deepEqual(requests,[]);
   }
 });
+
+const announcementFixture={enabled:true,title:'안내 <제목>',body:'첫째 줄\n<img src=x onerror=alert(1)>',androidEnabled:true,iosEnabled:true,androidUrl:'',iosUrl:'https://apps.example/ios'};
+test('웹 공지는 안전한 중앙 정렬 본문과 하단 앱 버튼을 표시하며 로그인 화면 버튼도 유지한다',async()=>{
+ const opened=[],requests=[];
+ const b=browser({pathname:'/',userAgent:'Mozilla/5.0 Macintosh Chrome',windowProps:{open:(...args)=>opened.push(args)},fetchReply:url=>{requests.push(url);return url==='/api/announcement'?announcementFixture:{androidUrl:'',iosUrl:'https://apps.example/ios'};}});
+ b.run('gate()');await b.run('maybeAnnouncement()');
+ const d=b.element('dialog1');assert.equal(d.open,true);assert.match(d.innerHTML,/안내 &lt;제목&gt;/);assert.match(d.innerHTML,/첫째 줄\n&lt;img/);assert.doesNotMatch(d.innerHTML,/<img/);
+ assert.ok(d.innerHTML.indexOf('announcement-content')<d.innerHTML.indexOf('announcement-footer'));
+ assert.ok(d.innerHTML.indexOf('announcement-android')<d.innerHTML.indexOf('announcement-ios'));
+ assert.ok(d.innerHTML.indexOf('announcement-ios')<d.innerHTML.indexOf('announcement-hide'));
+ assert.match(b.element('#app').innerHTML,/download-android/);assert.match(b.element('#app').innerHTML,/download-ios/);
+ b.element('#announcement-android').onclick();assert.equal(b.element('#announcement-status').textContent,'아직 개발 진행중이에요.');
+ b.element('#announcement-ios').onclick();assert.deepEqual(opened,[['https://apps.example/ios','_blank','noopener,noreferrer']]);
+ b.element('#announcement-close').onclick();assert.equal(d.open,false);assert.equal(b.local.has('paperchat.announcement.hiddenUntil'),false);
+ await b.run('maybeAnnouncement()');assert.equal(requests.filter(v=>v==='/api/announcement').length,1);
+});
+
+test('공지에서 앱 버튼을 개별로 숨겨도 로그인 화면 다운로드 버튼은 그대로 남는다',async()=>{
+ for(const androidEnabled of [false,true])for(const iosEnabled of [false,true]){
+  const data={...announcementFixture,androidEnabled,iosEnabled};
+  const b=browser({userAgent:'Mozilla/5.0 Macintosh Chrome',fetchReply:()=>data});b.run('gate()');await b.run('maybeAnnouncement()');
+  const html=b.element('dialog1').innerHTML;
+  assert.equal(html.includes('id="announcement-android"'),androidEnabled);assert.equal(html.includes('id="announcement-ios"'),iosEnabled);
+  assert.match(html,/4시간 보지않기/);assert.match(html,/id="announcement-close"/);
+  assert.match(b.element('#app').innerHTML,/download-android/);assert.match(b.element('#app').innerHTML,/download-ios/);
+ }
+});
+
+test('4시간 숨김은 브라우저 저장소에 남고 재접속시 유지되며 만료 후 다시 표시한다',async()=>{
+ const b=browser({fetchReply:()=>announcementFixture});await b.run('maybeAnnouncement()');const before=Date.now();
+ b.element('#announcement-hide').onclick();const key='paperchat.announcement.hiddenUntil',until=Number(b.local.get(key));
+ assert.ok(until>=before+4*60*60*1000 && until<=Date.now()+4*60*60*1000);assert.equal(b.element('dialog1').open,false);
+ const requests=[],again=browser({fetchReply:url=>{requests.push(url);return announcementFixture;}});again.local.set(key,String(until));await again.run('maybeAnnouncement()');assert.deepEqual(requests,[]);
+ again.local.set(key,String(Date.now()-1));await again.run('maybeAnnouncement()');assert.deepEqual(requests,['/api/announcement']);assert.equal(again.element('dialog1').open,true);
+ for(const stored of ['bad',String(Date.now()+10*60*60*1000)]){const broken=browser({fetchReply:()=>announcementFixture});broken.local.set(key,stored);await broken.run('maybeAnnouncement()');assert.equal(broken.element('dialog1').open,true);}
+});
+
+test('PC·모바일 웹은 공지를 조회하지만 네이티브 앱과 관리자 화면은 조회하지 않는다',async()=>{
+ for(const input of [{userAgent:'Mozilla/5.0 Macintosh Chrome'},{userAgent:'Mozilla/5.0 Android SamsungBrowser Mobile'},{userAgent:'Mozilla/5.0 iPhone Mobile Safari'}]){
+  const b=browser({...input,fetchReply:()=>announcementFixture});await b.run('maybeAnnouncement()');assert.equal(b.element('dialog1').open,true);
+ }
+ for(const input of [{userAgent:'PaperChatAndroid/3'},{userAgent:'PaperChatIOS/4'},{windowProps:{paperChatNativeForeground:true}},{windowProps:{webkit:{messageHandlers:{paperChatPush:{}}}}},{pathname:'/codenotekyh'}]){
+  const requests=[],b=browser({...input,fetchReply:url=>{requests.push(url);return announcementFixture;}});await b.run('maybeAnnouncement()');assert.deepEqual(requests,[]);assert.equal(b.element('dialog1').open,undefined);
+ }
+});
+
+test('공지 비활성·조회 실패·지연 응답은 로그인 화면이나 입력 중인 내용을 바꾸지 않는다',async()=>{
+ for(const data of [{...announcementFixture,enabled:false},{$status:503,$body:{error:'offline'}}]){
+  const b=browser({fetchReply:()=>data});b.run('loginPage()');b.element('#recovery').value='작성 중';await b.run('maybeAnnouncement()');
+  assert.match(b.element('#app').innerHTML,/다시 로그인/);assert.equal(b.element('#recovery').value,'작성 중');assert.equal(b.element('dialog1').open,undefined);
+ }
+ let release;const b=browser({fetchReply:()=>new Promise(r=>release=r)});b.run('gate()');const pending=b.run('maybeAnnouncement()');b.run('loginPage()');const html=b.element('#app').innerHTML;release(announcementFixture);await pending;
+ assert.equal(b.element('#app').innerHTML,html);assert.equal(b.element('dialog1').open,undefined);
+});
+
+test('관리자는 공지와 두 버튼 표시 여부 및 공유 다운로드 주소를 함께 저장한다',async()=>{
+ const writes=[],b=browser({pathname:'/codenotekyh',fetchReply:(url,options)=>{
+  assert.equal(url,'/api/admin/announcement');if(options.method==='GET')return announcementFixture;
+  const value=JSON.parse(options.body);writes.push(value);return value;
+ }});
+ await b.run('adminAnnouncement()');const html=b.element('#app').innerHTML;assert.match(html,/공지 안의 버튼에만/);assert.match(html,/name="androidEnabled"/);assert.match(html,/name="iosEnabled"/);
+ const form=b.element('form');form.values={enabled:'on',title:' 알림 ',body:' 안내 내용 ',androidEnabled:'',iosEnabled:'on',androidUrl:'',iosUrl:'https://apps.example/new'};
+ await form.handlers.submit({preventDefault(){},currentTarget:form});assert.deepEqual(writes,[{enabled:true,title:'알림',body:'안내 내용',androidEnabled:false,iosEnabled:true,androidUrl:'',iosUrl:'https://apps.example/new'}]);
+ form.values.title=' ';await form.handlers.submit({preventDefault(){},currentTarget:form});assert.equal(writes.length,1);assert.match(b.element('#error').textContent,/제목과 내용/);
+ form.values={enabled:'',title:'',body:'',androidEnabled:'',iosEnabled:'',androidUrl:'',iosUrl:''};await form.handlers.submit({preventDefault(){},currentTarget:form});assert.equal(writes.length,2);assert.equal(writes[1].enabled,false);
+});

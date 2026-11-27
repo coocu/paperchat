@@ -4,6 +4,8 @@ const main=document.querySelector('#app');
 const adminPath='/codenotekyh';
 const admin=location.pathname===adminPath;
 const memberPath=location.pathname==='/app'?'/app':'/';
+const nativeClient=/PaperChat(?:Android|IOS)/i.test(navigator.userAgent||'')
+  || Boolean(window.webkit?.messageHandlers?.paperChatPush) || typeof window.paperChatNativeForeground==='boolean';
 const desktopDownloads=(()=>{
   const ua=navigator.userAgent||'',platform=navigator.platform||'';
   if(/PaperChat(?:Android|IOS)/i.test(ua)||window.webkit?.messageHandlers?.paperChatPush||typeof window.paperChatNativeForeground==='boolean')return false;
@@ -309,6 +311,46 @@ function wireDownloads(){
     status.textContent='';window.open(links[key],'_blank','noopener,noreferrer');
   });
   on('#download-retry','click',load);void load();
+}
+const announcementHideKey='paperchat.announcement.hiddenUntil',announcementHideDuration=4*60*60*1000;
+let announcementRequested=false;
+function announcementHidden(){
+  try{
+    const until=Number(localStorage.getItem(announcementHideKey)),now=Date.now();
+    return Number.isFinite(until) && until>now && until<=now+announcementHideDuration;
+  }catch{return false;}
+}
+function showAnnouncement(data){
+  if(admin || nativeClient || !data?.enabled || typeof data.title!=='string' || typeof data.body!=='string' || document.querySelector('dialog[open]'))return;
+  const links={androidUrl:downloadURL(data.androidUrl),iosUrl:downloadURL(data.iosUrl)};
+  const d=document.createElement('dialog');d.className='dialog announcement-dialog';
+  d.setAttribute('aria-labelledby','announcement-heading');
+  const appButtons=(data.androidEnabled?act('announcement-android','안드로이드앱','secondary'):'')+(data.iosEnabled?act('announcement-ios','아이폰앱','secondary'):'');
+  d.innerHTML=`<header class="announcement-header" tabindex="0"><h2 id="announcement-heading">${esc(data.title)}</h2></header>
+    <div class="announcement-content" tabindex="0">${esc(data.body)}</div>
+    <footer class="announcement-footer">${appButtons?`<div class="announcement-buttons" aria-label="앱 다운로드">${appButtons}</div><p id="announcement-status" class="note" role="status" aria-live="polite"></p>`:''}
+      <div class="announcement-buttons">${act('announcement-hide','4시간 보지않기')}${act('announcement-close','닫기','primary')}</div>
+    </footer>`;
+  d.onclose=()=>d.remove();main.append(d);
+  for(const [enabled,selector,key] of [[data.androidEnabled,'#announcement-android','androidUrl'],[data.iosEnabled,'#announcement-ios','iosUrl']])if(enabled)d.querySelector(selector).onclick=()=>{
+    const status=d.querySelector('#announcement-status');
+    if(!links[key]){status.textContent='아직 개발 진행중이에요.';return;}
+    status.textContent='';window.open(links[key],'_blank','noopener,noreferrer');
+  };
+  d.querySelector('#announcement-hide').onclick=()=>{
+    try{localStorage.setItem(announcementHideKey,String(Date.now()+announcementHideDuration));}
+    catch{note('이 브라우저에서는 4시간 숨김을 저장할 수 없어요.');}
+    d.close();
+  };
+  d.querySelector('#announcement-close').onclick=()=>d.close();d.showModal();
+}
+async function maybeAnnouncement(){
+  if(admin || nativeClient || announcementRequested || announcementHidden() || leaving)return;
+  announcementRequested=true;
+  try{
+    const data=await api('announcement');
+    if(!leaving && !announcementHidden())showAnnouncement(data);
+  }catch{/* A failed or outdated notice must never interrupt signing in. */}
 }
 function nick(){
   paint('어떻게 불러드릴까요?','pen',`<form class="paper">${field('nick','닉네임',`value="${esc(draft.nick)}" maxlength="24" placeholder="대화에서 사용할 이름"`)}${actions(btn('다음'))}</form>`,{back:()=>{draft.nick=$('#nick').value;gate();}});
@@ -768,8 +810,8 @@ function reviewItem(item,isPhoto){
 async function adminHome(){
   try{await api('admin/settings');}catch(e){if(e.status===401){adminLogin();return;}throw e;}
   adminPrivate=true;
-  paint('운영자 관리실','settings',`<div class="grid adminGrid">${menu('url','mail','인증폼 주소','발급 신청서 연결') }${menu('downloadLinks','photo','앱 다운로드 링크','PC 웹의 Android·iPhone 다운로드 주소')}${menu('monitor','chat','대화 모니터링','전체·지역별 대화 열람')}${menu('members','book','가입자 현황','가입·탈퇴 회원 조회')}${menu('inactiveMembers','book','30일 미접속 회원','최근 접속 확인·회원 삭제')}${menu('reset','bin','서버 초기화','서비스 데이터 전체 삭제','destructive')}</div>${act('out','관리자 로그아웃','textBtn')}`,{wide:true});
-  on('#members','click',()=>membersPage());on('#inactiveMembers','click',()=>membersPage(0,null,'inactive'));on('#url','click',adminURL);on('#downloadLinks','click',adminDownloadLinks);on('#monitor','click',monitor);on('#reset','click',reset);on('#out','click',async()=>{await api('admin/logout',{});adminLogin();});
+  paint('운영자 관리실','settings',`<div class="grid adminGrid">${menu('url','mail','인증폼 주소','발급 신청서 연결') }${menu('downloadLinks','photo','앱 다운로드 링크','PC 웹의 Android·iPhone 다운로드 주소')}${menu('announcement','book','공지 설정','공지 내용·앱 다운로드 버튼 관리')}${menu('monitor','chat','대화 모니터링','전체·지역별 대화 열람')}${menu('members','book','가입자 현황','가입·탈퇴 회원 조회')}${menu('inactiveMembers','book','30일 미접속 회원','최근 접속 확인·회원 삭제')}${menu('reset','bin','서버 초기화','서비스 데이터 전체 삭제','destructive')}</div>${act('out','관리자 로그아웃','textBtn')}`,{wide:true});
+  on('#members','click',()=>membersPage());on('#inactiveMembers','click',()=>membersPage(0,null,'inactive'));on('#url','click',adminURL);on('#downloadLinks','click',adminDownloadLinks);on('#announcement','click',adminAnnouncement);on('#monitor','click',monitor);on('#reset','click',reset);on('#out','click',async()=>{await api('admin/logout',{});adminLogin();});
 }
 function adminLogin(){
   adminPrivate=false;scopes.monitor={};
@@ -791,6 +833,27 @@ async function adminDownloadLinks(){
     $('#androidUrl').value=saved.androidUrl;$('#iosUrl').value=saved.iosUrl;note('앱 다운로드 링크를 저장했어요.');
   });
 }
+async function adminAnnouncement(){
+  const data=await api('admin/announcement');
+  const toggle=(id,title)=>`<label class="check"><input id="${id}" name="${id}" type="checkbox" ${data[id]?'checked':''}><span>${title}</span></label>`;
+  const input=(id,title)=>`<div class="field"><label for="${id}">${title}</label><input id="${id}" name="${id}" type="url" maxlength="2048" placeholder="https://" value="${esc(data[id])}"></div>`;
+  paint('공지 설정','book',`<form class="paper">${toggle('enabled','웹에 공지 표시')}
+    <div class="field"><label for="announcementTitle">공지 제목</label><input id="announcementTitle" name="title" maxlength="120" value="${esc(data.title)}"></div>
+    <div class="field"><label for="announcementBody">공지 내용</label><textarea id="announcementBody" name="body" maxlength="20000" rows="8" placeholder="회원에게 안내할 내용을 입력해 주세요.">${esc(data.body)}</textarea></div>
+    <p class="note">웹 접속 시 가운데 정렬된 공지가 표시돼요. 긴 내용은 스크롤할 수 있으며, ‘4시간 보지않기’는 해당 브라우저에 적용돼요.</p><div class="rule"></div>
+    ${toggle('androidEnabled','공지에 안드로이드앱 버튼 표시')}${input('androidUrl','안드로이드앱 다운로드 URL')}<div class="rule"></div>
+    ${toggle('iosEnabled','공지에 아이폰앱 버튼 표시')}${input('iosUrl','아이폰앱 다운로드 URL')}
+    <p class="note">켜기·끄기는 공지 안의 버튼에만 적용돼요. 다운로드 주소는 로그인 화면과 함께 사용해요. 주소를 비워두면 ‘아직 개발 진행중이에요.’라고 안내해요. 저장한 공지는 웹에 다시 접속할 때 반영됩니다.</p>${actions(btn('공지 저장'))}</form>`,{back:adminHome});
+  form(async f=>{
+    const values={enabled:f.get('enabled')==='on',title:String(f.get('title')??'').trim(),body:String(f.get('body')??'').trim(),
+      androidEnabled:f.get('androidEnabled')==='on',iosEnabled:f.get('iosEnabled')==='on',
+      androidUrl:downloadURL(String(f.get('androidUrl')??'')),iosUrl:downloadURL(String(f.get('iosUrl')??''))};
+    if(values.enabled && (!values.title || !values.body))throw new Error('공지를 표시하려면 제목과 내용을 입력해 주세요.');
+    const saved=await api('admin/announcement',values);
+    $('#announcementTitle').value=saved.title;$('#announcementBody').value=saved.body;
+    $('#androidUrl').value=saved.androidUrl;$('#iosUrl').value=saved.iosUrl;note('공지를 저장했어요.');
+  });
+}
 function monitor(){
   const participants=r=>r.first+' ('+r.firstArea+') · '+r.second+' ('+r.secondArea+')';
   return scopedDirectory('monitor','admin/rooms','대화 모니터링','chat',
@@ -801,7 +864,7 @@ function monitor(){
      extra:actions(act('reviewQueue','사진·신고 검토','primary')),wireExtra:()=>on('#reviewQueue','click',reviewList),live:true});
 }
 function reset(){
-  paint('서버 초기화','bin',`<form class="paper"><p>회원, 프로필, 대화, 사진, 로그인 정보, 탈퇴 후 24시간 현황, 실명·전화번호, 신고·제재·차단·동의 기록과 발급 폼 주소, 앱 다운로드 링크까지 모두 지워요. 사용자 앱은 다음 연결 때 초기화됩니다.</p>${field('key','로그인한 관리자 보안키','type="password" maxlength="256" autocomplete="current-password"')}${field('confirm','확인을 위해 ‘전체 삭제’ 입력','autocomplete="off"')}${actions(btn('전체 삭제','danger fill'))}</form>`,{back:adminHome});
+  paint('서버 초기화','bin',`<form class="paper"><p>회원, 프로필, 대화, 사진, 로그인 정보, 탈퇴 후 24시간 현황, 실명·전화번호, 신고·제재·차단·동의 기록과 발급 폼 주소, 앱 다운로드 링크, 공지 설정까지 모두 지워요. 사용자 앱은 다음 연결 때 초기화됩니다.</p>${field('key','로그인한 관리자 보안키','type="password" maxlength="256" autocomplete="current-password"')}${field('confirm','확인을 위해 ‘전체 삭제’ 입력','autocomplete="off"')}${actions(btn('전체 삭제','danger fill'))}</form>`,{back:adminHome});
   form(async f=>{await api('admin/reset',{key:f.get('key'),confirm:f.get('confirm')});note('가입 중 0명 · 탈퇴 현황 0명으로 초기화했어요.');adminLogin();});
 }
 async function boot(){
@@ -828,7 +891,7 @@ async function start(){
   await api('status');
   if(admin){await adminHome();return;}
   main.innerHTML=`<div class="splash"><div class="stamp">${icon('leaf')}</div><h1>당신은 어떤 사람인가요?</h1></div>`;
-  await new Promise(r=>setTimeout(r,matchMedia('(prefers-reduced-motion: reduce)').matches?100:1300));await boot();
+  await new Promise(r=>setTimeout(r,matchMedia('(prefers-reduced-motion: reduce)').matches?100:1300));await boot();void maybeAnnouncement();
 }
 let pulseTask=null;
 function veil(show,message='서버의 계정 상태를 확인하고 있어요.'){

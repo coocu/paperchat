@@ -50,6 +50,17 @@ input[type=date]::-webkit-date-and-time-value {
 .download-buttons{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
 .download-buttons button{width:100%;padding:12px 10px;background:var(--card)}
 .download-options>.note{margin:10px 0 0}.download-options>.note:empty{display:none}.download-options>[hidden]{display:none}
+.announcement-dialog{width:min(calc(100% - 24px),560px);max-height:min(calc(100dvh - 32px),calc(var(--app-height,100dvh) - 32px));padding:0;overflow:hidden}
+.announcement-dialog[open]{display:flex;flex-direction:column}
+.announcement-header{flex:none;max-height:25dvh;overflow-y:auto;overscroll-behavior:contain;padding:24px 24px 12px;text-align:center}
+.announcement-header h2{margin:0;font:650 27px/1.4 var(--serif)}
+.announcement-content{min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:8px 24px 24px;text-align:center;white-space:pre-wrap;line-height:1.8}
+.announcement-footer{flex:none;padding:16px 20px max(16px,env(safe-area-inset-bottom));border-top:1px solid var(--line);background:var(--card)}
+.announcement-buttons{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.announcement-buttons>button{width:100%;padding:10px 8px}.announcement-buttons>button:only-child{grid-column:1/-1}
+.announcement-footer>.announcement-buttons+.announcement-buttons{margin-top:12px}
+.announcement-footer>.note{margin:12px 0;text-align:center}.announcement-footer>.note:empty{height:0;margin:0 0 12px}
+@media(max-height:420px){.announcement-header{padding:12px 20px 8px}.announcement-header h2{font-size:22px}.announcement-footer{padding:10px 16px}.announcement-buttons>button{min-height:40px;padding:7px 8px}}
 .privacy-dialog{width:min(calc(100% - 24px),700px);height:min(900px,calc(var(--app-height,100dvh) - 24px));max-height:calc(var(--app-height,100dvh) - 24px);padding:0;overflow:hidden}
 .privacy-dialog[open]{display:flex;flex-direction:column}
 .privacy-header{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:20px var(--pad) 16px;border-bottom:1px solid var(--line);flex:none}
