@@ -96,7 +96,7 @@ function clearMemberSession(message=''){
   accountRevision++;bootSerial++;unreadRequest++;
   closeMemberEvents();
   clearInterval(activeTimer);clearInterval(presenceTimer);presenceTimer=null;
-  me=null;accountState={};stage='gate';unreadTotal=0;nextPushSync=0;
+  me=null;accountState={};stage='gate';unreadTotal=0;nextPushSync=0;announcementRequested=false;
   currentBack=null;backBusy=false;lastPresence=null;lastPresenceAt=0;resetScopes();
   for(const key of Object.keys(draft))draft[key]='';
   sessionStorage.clear();closeDialogs();main.replaceChildren();veil(false);gate();
@@ -240,8 +240,8 @@ function recordVersion(version){
   }
 }
 function accountActions(){
-  on('#logout','click',async()=>{await api('logout',{});closeMemberEvents();location.replace(memberPath);});
-  on('#withdraw','click',()=>modal('회원탈퇴','프로필과 참여한 대화가 삭제돼요. 관리자 현황에는 닉네임과 탈퇴 시각이 24시간 표시돼요. 일반 재가입은 24시간 후, 이용 제한 중이면 제한 종료 후 가능해요.','탈퇴하기',async()=>{await api('withdraw',{confirm:true});location.replace(memberPath);}));
+  on('#logout','click',async()=>{await api('logout',{});clearMemberSession();location.replace(memberPath);});
+  on('#withdraw','click',()=>modal('회원탈퇴','프로필과 참여한 대화가 삭제돼요. 관리자 현황에는 닉네임과 탈퇴 시각이 24시간 표시돼요. 일반 재가입은 24시간 후, 이용 제한 중이면 제한 종료 후 가능해요.','탈퇴하기',async()=>{await api('withdraw',{confirm:true});clearMemberSession();location.replace(memberPath);}));
 }
 function limitedPage(state){
   const policy=state==='policy';
@@ -321,7 +321,7 @@ function announcementHidden(){
   }catch{return false;}
 }
 function showAnnouncement(data){
-  if(admin || nativeClient || !data?.enabled || typeof data.title!=='string' || typeof data.body!=='string' || document.querySelector('dialog[open]'))return;
+  if(admin || nativeClient || stage!=='member' || !me?.id || accountState.needsRecoveryCopy || !data?.enabled || typeof data.title!=='string' || typeof data.body!=='string' || document.querySelector('dialog[open]'))return;
   const links={androidUrl:downloadURL(data.androidUrl),iosUrl:downloadURL(data.iosUrl)};
   const d=document.createElement('dialog');d.className='dialog announcement-dialog';
   d.setAttribute('aria-labelledby','announcement-heading');
@@ -345,7 +345,7 @@ function showAnnouncement(data){
   d.querySelector('#announcement-close').onclick=()=>d.close();d.showModal();
 }
 async function maybeAnnouncement(){
-  if(admin || nativeClient || announcementRequested || announcementHidden() || leaving)return;
+  if(admin || nativeClient || stage!=='member' || !me?.id || accountState.needsRecoveryCopy || announcementRequested || announcementHidden() || leaving)return;
   announcementRequested=true;
   try{
     const data=await api('announcement');
@@ -840,10 +840,10 @@ async function adminAnnouncement(){
   paint('공지 설정','book',`<form class="paper">${toggle('enabled','웹에 공지 표시')}
     <div class="field"><label for="announcementTitle">공지 제목</label><input id="announcementTitle" name="title" maxlength="120" value="${esc(data.title)}"></div>
     <div class="field"><label for="announcementBody">공지 내용</label><textarea id="announcementBody" name="body" maxlength="20000" rows="8" placeholder="회원에게 안내할 내용을 입력해 주세요.">${esc(data.body)}</textarea></div>
-    <p class="note">웹 접속 시 가운데 정렬된 공지가 표시돼요. 긴 내용은 스크롤할 수 있으며, ‘4시간 보지않기’는 해당 브라우저에 적용돼요.</p><div class="rule"></div>
+    <p class="note">로그인 완료 후 가운데 정렬된 공지가 표시돼요. 긴 내용은 스크롤할 수 있으며, ‘4시간 보지않기’는 해당 브라우저에 적용돼요.</p><div class="rule"></div>
     ${toggle('androidEnabled','공지에 안드로이드앱 버튼 표시')}${input('androidUrl','안드로이드앱 다운로드 URL')}<div class="rule"></div>
     ${toggle('iosEnabled','공지에 아이폰앱 버튼 표시')}${input('iosUrl','아이폰앱 다운로드 URL')}
-    <p class="note">켜기·끄기는 공지 안의 버튼에만 적용돼요. 다운로드 주소는 로그인 화면과 함께 사용해요. 주소를 비워두면 ‘아직 개발 진행중이에요.’라고 안내해요. 저장한 공지는 웹에 다시 접속할 때 반영됩니다.</p>${actions(btn('공지 저장'))}</form>`,{back:adminHome});
+    <p class="note">켜기·끄기는 공지 안의 버튼에만 적용돼요. 다운로드 주소는 로그인 화면과 함께 사용해요. 주소를 비워두면 ‘아직 개발 진행중이에요.’라고 안내해요. 저장한 공지는 다음 로그인 또는 로그인 상태에서 새로고침할 때 반영됩니다.</p>${actions(btn('공지 저장'))}</form>`,{back:adminHome});
   form(async f=>{
     const values={enabled:f.get('enabled')==='on',title:String(f.get('title')??'').trim(),body:String(f.get('body')??'').trim(),
       androidEnabled:f.get('androidEnabled')==='on',iosEnabled:f.get('iosEnabled')==='on',
@@ -882,6 +882,7 @@ async function boot(){
     if(new URLSearchParams(location.search).get('inbox')==='1'){
       history.replaceState(null,'',memberPath);await rooms();
     }else await people();
+    if(revision===accountRevision && serial===bootSerial && stage==='member')void maybeAnnouncement();
     return;
   }
   if(stage==='details'){Object.assign(draft,{nick:s.nick,gender:s.gender});await regionStep();return;}
@@ -891,7 +892,7 @@ async function start(){
   await api('status');
   if(admin){await adminHome();return;}
   main.innerHTML=`<div class="splash"><div class="stamp">${icon('leaf')}</div><h1>당신은 어떤 사람인가요?</h1></div>`;
-  await new Promise(r=>setTimeout(r,matchMedia('(prefers-reduced-motion: reduce)').matches?100:1300));await boot();void maybeAnnouncement();
+  await new Promise(r=>setTimeout(r,matchMedia('(prefers-reduced-motion: reduce)').matches?100:1300));await boot();
 }
 let pulseTask=null;
 function veil(show,message='서버의 계정 상태를 확인하고 있어요.'){
