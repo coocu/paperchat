@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { migrateMemberAreas } from './regions.mjs';
 
 export const hour = 3600_000;
 export const tables = ['used_invites','account_devices','account_keys','push_jobs','push_devices','session_presence','member_activity','admin_session_proofs','departures','pending_contacts','contacts','reports','penalty_events','reviews','room_reads','room_changes','blocks','acceptances','restrictions','messages','rooms','sessions','members','cooldowns','settings','attempts'];
@@ -96,12 +97,18 @@ export function openStore(dir) {
     db.prepare('INSERT OR IGNORE INTO member_activity SELECT id,? FROM members WHERE deleted_at IS NULL').run(Date.now());
     if(!db.prepare('PRAGMA table_info(reports)').all().some(c=>c.name==='content'))
       db.exec('ALTER TABLE reports ADD COLUMN content TEXT');
+    if(!db.prepare('PRAGMA table_info(reports)').all().some(c=>c.name==='profile_snapshot'))
+      db.exec('ALTER TABLE reports ADD COLUMN profile_snapshot TEXT');
     db.exec("UPDATE reports SET content='message:'||message WHERE content IS NULL AND message IS NOT NULL");
-    for(const row of db.prepare('SELECT DISTINCT target FROM reports WHERE content IS NULL').all()) {
-      const profile=db.prepare('SELECT nick,memo FROM members WHERE id=?').get(row.target);
-      const content='profile:'+row.target+':'+createHash('sha256').update(JSON.stringify(profile)).digest('hex');
-      db.prepare('UPDATE reports SET content=? WHERE content IS NULL AND target=?').run(content,row.target);
+    // Only backfill an unreviewed profile when its recorded content hash still
+    // matches. A changed current profile is not evidence of an earlier report.
+    for(const row of db.prepare(`SELECT r.id,r.target,r.content,m.nick,m.memo,m.area FROM reports r
+      JOIN members m ON m.id=r.target WHERE r.message IS NULL AND r.status='open' AND r.profile_snapshot IS NULL`).all()) {
+      const content='profile:'+row.target+':'+
+        createHash('sha256').update(JSON.stringify({nick:row.nick,memo:row.memo})).digest('hex');
+      if(content===row.content)db.prepare('UPDATE reports SET profile_snapshot=? WHERE id=?').run(JSON.stringify({nick:row.nick,area:row.area,memo:row.memo}),row.id);
     }
+    migrateMemberAreas(db);
     // Only legacy, unreported, unexpired pending photos become public. Decisions
     // and open reports survive this migration unchanged.
     db.prepare(`UPDATE reviews SET state='approved' WHERE state='pending'

@@ -140,22 +140,22 @@ test('관리자 대화 목록은 전체로 열리고 참여자별 지역을 구�
   assert.match(b.element('#list').innerHTML,/가을 \(경기도 이천시\) · 겨울 \(서울특별시 중구\)/);
 });
 
-test('프로필과 내 대화는 전체로 시작하고 선택한 시·군·구로 정확히 전환한다',async()=>{
+test('프로필과 내 대화는 전체로 시작하고 선택한 권역으로 정확히 전환한다',async()=>{
   for(const entry of ['people','rooms']){
     const requests=[];
     const b=browser({fetchReply:url=>{
       requests.push(url);
-      if(url==='/api/regions')return {'경기도':['이천시','여주시'],'서울특별시':['중구']};
-      return [{id:'other',nick:'봄',year:1995,gender:'여성',area:'경기도 이천시'}];
+      if(url==='/api/regions')return {'경기':['남부','북부'],'서울':['동부','서부','남부','북부','중부']};
+      return [{id:'other',nick:'봄',year:1995,gender:'여성',area:'경기 남부'}];
     }});
-    b.run("me={area:'경기도 이천시'}");
+    b.run("me={area:'경기 남부'}");
     await b.run(entry+'()');
     assert.deepEqual(requests,['/api/'+entry]);
-    assert.match(b.element('#list').innerHTML,/경기도 이천시/);
+    assert.match(b.element('#list').innerHTML,/경기 남부/);
     await b.element('#scope-area').handlers.click({});
-    assert.equal(requests.at(-1),'/api/'+entry+'?area='+encodeURIComponent('경기도 이천시'));
-    b.element('#district').value='여주시';b.element('#district').onchange();
-    assert.equal(requests.at(-1),'/api/'+entry+'?area='+encodeURIComponent('경기도 여주시'));
+    assert.equal(requests.at(-1),'/api/'+entry+'?area='+encodeURIComponent('경기 남부'));
+    b.element('#district').value='북부';b.element('#district').onchange();
+    assert.equal(requests.at(-1),'/api/'+entry+'?area='+encodeURIComponent('경기 북부'));
     await b.element('#scope-all').handlers.click({});
     assert.equal(requests.at(-1),'/api/'+entry);
   }
@@ -417,4 +417,86 @@ test('실시간 연결은 백그라운드·계정 초기화·로그아웃 시 �
   b.run('window.paperChatPresence(true)');await settle();assert.equal(sources.length,2);
   b.run('clearMemberSession()');assert.equal(sources[1].closed,true);sources[1].emit('room-change',{room:'r',closed:true,version:99});assert.match(b.element('#app').innerHTML,/인증키를 입력해 주세요/);
   b.run("stage='member';me={id:'new'};updatePresence();settings()");await b.element('#logout').handlers.click({});assert.equal(sources[2].closed,true);assert.equal(b.location.redirect,'/app');
+});
+
+const profileRegions={'서울':['동부','서부','남부','북부','중부'],'경기':['남부','북부'],'부산':['전체']};
+const currentProfile={id:'self',nick:'가을',year:1995,gender:'여성',area:'경기 남부',memo:'처음 소개글'};
+function editingBrowser(reply,profile=currentProfile){
+  const requests=[];
+  const b=browser({fetchReply:(url,options)=>{
+    requests.push([url,options.body&&JSON.parse(options.body)]);
+    if(url==='/api/regions')return profileRegions;
+    if(url==='/api/state')return {stage:'member',profile};
+    return reply(url,options);
+  }});
+  b.run(`stage='member';me=${JSON.stringify(currentProfile)};accountState={stage,profile:me};settings()`);
+  return {...b,requests};
+}
+function submitForm(b,values){const form=b.element('form');form.values=values;return form.handlers.submit({preventDefault(){},currentTarget:form});}
+
+test('프로필 편집은 최신 소개글을 불러오고 지역·소개글만 저장해 서버 응답을 표시한다',async()=>{
+  const latest={...currentProfile,memo:'다른 기기에서 바꾼 소개글'},saved={...currentProfile,area:'서울 동부',memo:'서버에서 확인한 소개글'};
+  const b=editingBrowser(()=>({profile:saved}),latest);
+  await b.element('#editProfile').handlers.click({});
+  const html=b.element('#app').innerHTML;
+  assert.match(html,/다른 기기에서 바꾼 소개글/);assert.match(html,/당신을 표현해주세요/);assert.match(html,/1995년/);assert.match(html,/여성/);
+  assert.doesNotMatch(html,/<(?:input|select)[^>]*(?:name|id)="(?:nick|birthDate|year|gender)"/);
+  assert.equal(b.element('#province').value,'경기');assert.equal(b.element('#district').value,'남부');
+  b.element('#province').value='서울';b.element('#province').onchange();b.element('#district').value='동부';
+  await submitForm(b,{memo:'  새로 입력한 소개글  ',nick:'변조',gender:'남성',year:'2000'});
+  assert.deepEqual(b.requests.find(([url])=>url==='/api/profile')[1],{area:'서울 동부',memo:'새로 입력한 소개글'});
+  assert.deepEqual(JSON.parse(b.run('JSON.stringify(me)')),saved);assert.equal(b.run('accountState.profile===me'),true);
+  assert.match(b.element('#app').innerHTML,/내 설정/);assert.match(b.element('#app').innerHTML,/서버에서 확인한 소개글/);assert.match(b.element('#notice').textContent,/프로필을 저장/);
+});
+
+test('프로필 편집 취소와 뒤로가기는 입력값을 저장하거나 원래 프로필을 변경하지 않는다',async()=>{
+  const b=editingBrowser(()=>{throw new Error('저장 요청 금지');});
+  for(const cancel of ['button','back']){
+    await b.run('editProfile()');b.element('#province').value='부산';b.element('#province').onchange();b.element('#district').value='전체';b.element('#memo').value='저장하지 않을 소개글';
+    if(cancel==='button')await b.element('#cancelEdit').handlers.click({});else{b.run('window.paperChatBack()');await settle();}
+    assert.deepEqual(JSON.parse(b.run('JSON.stringify(me)')),currentProfile);assert.match(b.element('#app').innerHTML,/처음 소개글/);
+  }
+  assert.equal(b.requests.some(([url])=>url==='/api/profile'),false);
+});
+
+test('알 수 없는 기존 지역은 편집 화면에서 자동 선택하지 않고 새 권역 선택을 요구한다',async()=>{
+  const b=editingBrowser(()=>({}),{...currentProfile,area:'지역 미선택'});await b.run('editProfile()');
+  assert.equal(b.element('#province').value,'');assert.equal(b.element('#district').value,'');assert.equal(b.element('#district').disabled,true);
+  await submitForm(b,{memo:'소개글'});assert.match(b.element('#error').textContent,/지역과 권역을 선택/);assert.equal(b.requests.some(([url])=>url==='/api/profile'),false);
+  b.element('#province').value='서울';b.element('#province').onchange();b.element('#district').value='동부';
+  await submitForm(b,{memo:'   '});assert.match(b.element('#error').textContent,/소개글을 1자 이상/);assert.equal(b.requests.some(([url])=>url==='/api/profile'),false);
+});
+
+test('프로필 저장 오류는 입력을 유지하고 회원 삭제 401은 편집 화면과 계정 상태를 지운다',async()=>{
+  for(const status of [400,401]){
+    const b=editingBrowser(()=>({$status:status,$body:{error:'저장할 수 없어요.'}}));await b.run('editProfile()');b.element('#memo').value='입력 중인 소개글';
+    await submitForm(b,{memo:'입력 중인 소개글'});
+    if(status===400){assert.equal(b.element('#memo').value,'입력 중인 소개글');assert.match(b.element('#app').innerHTML,/프로필 편집/);assert.deepEqual(JSON.parse(b.run('JSON.stringify(me)')),currentProfile);assert.match(b.element('#error').textContent,/저장할 수 없어요/);}
+    else{assert.equal(b.run('me'),null);assert.equal(b.run('stage'),'gate');assert.match(b.element('#app').innerHTML,/인증키를 입력해 주세요/);assert.doesNotMatch(b.element('#app').innerHTML,/id="memo"/);}
+  }
+});
+
+test('편집 진입의 늦은 지역 조회와 저장 응답은 이동한 화면이나 프로필을 덮지 않는다',async()=>{
+  let finishRegions;
+  const b=browser({fetchReply:url=>url==='/api/regions'?new Promise(resolve=>{finishRegions=resolve;}):{stage:'member',profile:currentProfile}});
+  b.run(`stage='member';me=${JSON.stringify(currentProfile)};settings()`);const opening=b.run('editProfile()');
+  b.run("profile({id:'other',nick:'다른 화면'})");finishRegions(profileRegions);await assert.rejects(opening,e=>e.stale===true);assert.match(b.element('#app').innerHTML,/다른 화면/);
+  let finishSave;const editing=editingBrowser(()=>new Promise(resolve=>{finishSave=resolve;}));await editing.run('editProfile()');
+  const saving=submitForm(editing,{memo:'새 소개글'});editing.run("profile({id:'other',nick:'선택한 프로필'})");finishSave({profile:{...currentProfile,memo:'늦게 온 소개글'}});await saving;
+  assert.match(editing.element('#app').innerHTML,/선택한 프로필/);assert.deepEqual(JSON.parse(editing.run('JSON.stringify(me)')),currentProfile);
+});
+
+test('새 지역 목록에 없는 이전 조회 범위는 현재 회원의 권역으로 다시 선택한다',async()=>{
+  const paths=[];const b=browser({fetchReply:url=>{paths.push(url);return url==='/api/regions'?profileRegions:[];}});
+  b.run("me={area:'경기 북부'};scopes.people={regional:true,area:'서울특별시 중구'}");await b.run('people()');
+  assert.equal(paths.at(-1),'/api/people?area='+encodeURIComponent('경기 북부'));assert.equal(b.run('scopes.people.area'),'경기 북부');
+});
+
+test('프로필 신고는 본 버전을 보내며 변경된 소개글이면 최신 목록에서 다시 확인하게 한다',async()=>{
+  const requests=[];
+  const b=browser({fetchReply:(url,options)=>{requests.push([url,options.body&&JSON.parse(options.body)]);return url==='/api/report'?{$status:409,$body:{error:'프로필 변경'}}:[];}});
+  b.run("stage='member';me={id:'self'};profile({id:'peer',nick:'상대',memo:'봤던 소개글',profileVersion:'seen-version'})");
+  await b.element('#report').handlers.click({});await submitForm(b,{reason:'괴롭힘·기타 위반'});
+  assert.deepEqual(requests.find(([url])=>url==='/api/report')[1],{kind:'profile',peer:'peer',profileVersion:'seen-version',reason:'괴롭힘·기타 위반'});
+  assert.match(b.element('#app').innerHTML,/프로필 목록/);assert.doesNotMatch(b.element('#app').innerHTML,/봤던 소개글/);assert.match(b.element('#error').textContent,/내용을 다시 확인한 뒤 신고/);
 });

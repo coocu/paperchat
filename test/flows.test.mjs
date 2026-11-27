@@ -305,7 +305,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     const nationwide=(await admin('/api/admin/rooms')).body;
     assert.equal(nationwide.length,1);assert.equal(nationwide[0].id,room);
     const {first,firstArea,second,secondArea}=nationwide[0];
-    assert.deepEqual(new Map([[first,firstArea],[second,secondArea]]),new Map([['가을','경기도 이천시'],['겨울','서울특별시 중구']]));
+    assert.deepEqual(new Map([[first,firstArea],[second,secondArea]]),new Map([['가을','경기 남부'],['겨울','서울 중부']]));
     for(const area of ['서울특별시 중구','경기도 이천시'])
       assert.deepEqual((await admin('/api/admin/rooms?area='+encodeURIComponent(area))).body,nationwide);
     assert.equal((await a('/api/admin/rooms')).status,401);
@@ -589,8 +589,8 @@ test('기존 pending 사진 이관은 신고·삭제·만료를 보존하고 동
   assert.equal(legacy.content,'message:'+ids[1]);
   safety.reportDecision(legacy.id,'dismiss');
   assert.equal(db.prepare('SELECT state FROM reviews WHERE message=?').get(ids[1]).state,'approved');
-  safety.report('receiver',{kind:'profile',peer:'author',reason});
-  safety.report('other',{kind:'profile',peer:'author',reason});
+  safety.report('receiver',{kind:'profile',peer:'author',reason,profileVersion:safety.profileContent('author')});
+  safety.report('other',{kind:'profile',peer:'author',reason,profileVersion:safety.profileContent('author')});
   const reports=safety.queue().reports;assert.equal(reports.length,2);
   safety.reportDecision(reports[0].id,'accept');
   safety.reportDecision(reports[1].id,'accept');
@@ -598,7 +598,7 @@ test('기존 pending 사진 이관은 신고·삭제·만료를 보존하고 동
   assert.equal(safety.penalty('author-identity').restrictedUntil,0);
   assert.equal(safety.queue().reports.length,0);
   db.prepare("UPDATE members SET memo='새 소개' WHERE id='author'").run();
-  safety.report('receiver',{kind:'profile',peer:'author',reason});
+  safety.report('receiver',{kind:'profile',peer:'author',reason,profileVersion:safety.profileContent('author')});
   const next=safety.queue().reports;assert.equal(next.length,1);
   safety.reportDecision(next[0].id,'accept');
   assert.equal(safety.penalty('author-identity').totalStrikes,2);

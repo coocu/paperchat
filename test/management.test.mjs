@@ -71,6 +71,118 @@ function fixture(t) {
     now:()=>now,advance(ms){now+=ms;},restart(){if(!serverClosed)server.emit('close');server=makeServer(cfg,upstream);serverClosed=false;server.on('close',()=>serverClosed=true);}};
 }
 
+test('프로필 편집은 본인 지역·소개글만 검증해 저장하고 모든 조회에 반영한다',async t=>{
+  const f=fixture(t),a=await f.register('편집 회원'),b=await f.register('상대 회원','인천광역시 검단구'),admin=await f.admin();
+  const room=await f.room(a,b),message=await f.send(a,room,{body:'기존 대화 보존'});
+  const before=(await a.call('/api/state')).body.profile,peerBefore=(await b.call('/api/state')).body.profile;
+  assert.equal(before.area,'경기 남부');
+  assert.equal((await f.client()('/api/profile',{area:'서울 동부',memo:'안녕'})).status,401);
+  assert.equal((await admin('/api/profile',{area:'서울 동부',memo:'안녕'})).status,401);
+  const registering=f.client();await registering('/api/key',{code:'profile-test-pending-key'});
+  assert.equal((await registering('/api/profile',{area:'서울 동부',memo:'안녕'})).status,401);
+  assert.equal((await a.call('/api/profile',{area:'서울 동부',memo:'안녕'},{origin:'https://untrusted.example'})).status,403);
+  for(const [key,value] of Object.entries({nick:'다른 이름',year:2010,birthDate:'2010-01-01',gender:'남성',id:b.id,identity:'changed',unknown:true,policy:policyVersion}))
+    assert.equal((await a.call('/api/profile',{area:'서울 동부',memo:'적용하면 안 됨',[key]:value})).status,400);
+  for(const body of [{},{memo:'글'},{area:'서울 동부'},...['',null,123,'가'.repeat(801)].map(memo=>({area:'서울 동부',memo})),
+    ...['',null,[],{},'서울 전체','아무 지역','지역 미선택'].map(area=>({area,memo:'소개'}))])
+    assert.equal((await a.call('/api/profile',body)).status,400);
+  const prohibited=await a.call('/api/profile',{area:'서울 동부',memo:'조건만남구함'});
+  assert.equal(prohibited.status,422);
+  assert.deepEqual((await a.call('/api/state')).body.profile,before);
+  await a.call('/api/presence',{online:false});f.advance(1000);
+  const changed=await a.call('/api/profile',{area:' 서울특별시 광진구 ',memo:'  새 소개글\n두 번째 줄  '});
+  assert.equal(changed.status,200);
+  const expected={...before,area:'서울 동부',memo:'새 소개글\n두 번째 줄'};
+  assert.deepEqual(changed.body,{profile:expected});assert.deepEqual((await a.call('/api/state')).body.profile,expected);
+  const person=(await b.call('/api/people')).body.find(p=>p.id===a.id);
+  assert.equal(person.memo,expected.memo);assert.equal(person.area,expected.area);assert.equal(person.online,false);
+  assert.deepEqual((await b.call('/api/people?area='+encodeURIComponent('서울특별시 광진구'))).body.map(p=>p.id),[a.id]);
+  assert.deepEqual((await b.call('/api/people?area='+encodeURIComponent('경기 남부'))).body,[]);
+  assert.equal((await b.call('/api/rooms?area='+encodeURIComponent('서울 동부'))).body[0].area,'서울 동부');
+  const detail=(await admin('/api/admin/members/'+a.id)).body;
+  assert.equal(detail.area,expected.area);assert.equal(detail.memo,expected.memo);assert.equal(detail.nick,before.nick);assert.equal(detail.year,before.year);assert.equal(detail.gender,before.gender);
+  const managed=(await admin('/api/admin/rooms?area='+encodeURIComponent('서울특별시 광진구'))).body[0];
+  assert.ok([managed.firstArea,managed.secondArea].includes('서울 동부'));
+  assert.deepEqual((await b.call('/api/state')).body.profile,peerBefore);
+  assert.equal(f.db.prepare('SELECT body FROM messages WHERE id=?').get(message).body,'기존 대화 보존');
+  assert.equal((await a.call('/api/account/recovery')).body.code,a.code);
+  for(const memo of ['가','가'.repeat(800)])assert.equal((await a.call('/api/profile',{area:'서울 동부',memo})).status,200);
+  const saved=(await a.call('/api/state')).body.profile;
+  f.db.prepare('DELETE FROM acceptances WHERE member=?').run(a.id);
+  assert.equal((await a.call('/api/profile',{area:'부산 전체',memo:'제한된 변경'})).status,403);
+  await a.call('/api/policy',{version:policyVersion});
+  f.db.prepare('INSERT INTO restrictions VALUES(?,?)').run(f.db.prepare('SELECT identity FROM members WHERE id=?').get(a.id).identity,f.now()+hour);
+  assert.equal((await a.call('/api/profile',{area:'부산 전체',memo:'제한된 변경'})).status,403);
+  f.db.prepare('DELETE FROM restrictions').run();assert.deepEqual((await a.call('/api/state')).body.profile,saved);
+  await admin('/api/admin/members/'+a.id+'/delete',{confirm:true});
+  assert.equal((await a.call('/api/profile',{area:'부산 전체',memo:'삭제 뒤 변경'})).status,401);
+  assert.equal(f.db.prepare('SELECT memo FROM members WHERE id=?').get(a.id).memo,saved.memo);
+});
+
+test('프로필 신고는 화면의 버전을 검증하고 수정 전 원문으로 심사하며 새 소개글은 보존한다',async t=>{
+  const f=fixture(t),a=await f.register('작성자'),b=await f.register('신고자'),c=await f.register('다른 신고자'),admin=await f.admin();
+  await a.call('/api/profile',{area:'서울 동부',memo:'신고 당시 소개글'});
+  const shown=()=>b.call('/api/people').then(r=>r.body.find(p=>p.id===a.id));
+  const first=await shown(),report={kind:'profile',peer:a.id,reason,profileVersion:first.profileVersion};
+  assert.equal((await b.call('/api/report',{kind:'profile',peer:a.id,reason})).status,400);
+  assert.equal((await b.call('/api/report',{...report,profileVersion:'forged'})).status,409);
+  assert.equal((await b.call('/api/report',report)).status,200);
+  await a.call('/api/profile',{area:'경기 북부',memo:first.memo});
+  assert.equal((await shown()).profileVersion,first.profileVersion);
+  await b.call('/api/report',report);await c.call('/api/report',report);
+  assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM reports').get().n,2);
+  await a.call('/api/profile',{area:'부산 전체',memo:'새로운 소개글은 별도 내용'});
+  const edited=await shown();assert.notEqual(edited.profileVersion,first.profileVersion);
+  assert.equal((await c.call('/api/report',report)).status,409);
+  let queue=(await admin('/api/admin/review')).body.reports;
+  assert.equal(queue[0].excerpt,first.memo);assert.equal(queue[0].area,first.area);assert.equal(queue[0].nick,first.nick);
+  f.restart();queue=(await admin('/api/admin/review')).body.reports;
+  assert.equal(queue[0].excerpt,first.memo);assert.equal(queue[0].profileSnapshotAvailable,true);
+  assert.equal((await admin('/api/admin/review',{kind:'report',id:queue[0].id,action:'accept'})).status,200);
+  assert.equal((await admin('/api/admin/review',{kind:'report',id:queue[1].id,action:'accept'})).status,200);
+  const current=(await a.call('/api/state')).body;
+  assert.equal(current.profile.memo,edited.memo);assert.equal(current.profile.nick,first.nick);assert.equal(current.totalStrikes,1);
+  assert.equal((await b.call('/api/report',{...report,profileVersion:edited.profileVersion})).status,200);
+  const next=(await admin('/api/admin/review')).body.reports[0];assert.equal(next.excerpt,edited.memo);
+  await admin('/api/admin/review',{kind:'report',id:next.id,action:'accept'});
+  const removed=(await a.call('/api/state')).body;
+  assert.equal(removed.totalStrikes,2);assert.equal(removed.profile.memo,'운영자가 프로필 내용을 삭제했어요.');
+});
+
+test('지역·신고 snapshot 마이그레이션은 기존 계정과 대화를 보존하고 불명확한 신고 원문을 만들지 않는다',async t=>{
+  const f=fixture(t),a=await f.register('기존 회원'),b=await f.register('상대 회원'),admin=await f.admin();
+  const room=await f.room(a,b),message=await f.send(a,room,{body:'마이그레이션 이후에도 같은 대화'});
+  const identity=f.db.prepare('SELECT identity FROM members WHERE id=?').get(a.id).identity;
+  const safety=moderation(f.db),content=safety.profileContent(a.id);
+  const insert=f.db.prepare("INSERT INTO reports(reporter,target,message,reason,created,content) VALUES(?,?,NULL,?,?,?)");
+  const same=Number(insert.run(b.id,a.id,reason,f.now(),content).lastInsertRowid);
+  const changed=Number(insert.run(b.id,a.id,reason,f.now(),'profile:'+a.id+':historical-unknown').lastInsertRowid);
+  const missing=Number(insert.run(b.id,a.id,reason,f.now(),null).lastInsertRowid);
+  f.db.prepare('UPDATE members SET area=? WHERE id=?').run('경기도 이천시',a.id);
+  f.db.prepare('UPDATE members SET area=? WHERE id=?').run('미상 지역의 오래된 값',b.id);
+  f.restart();f.restart();
+  const state=(await a.call('/api/state')).body;
+  assert.equal(state.profile.area,'경기 남부');assert.equal(state.profile.id,a.id);
+  assert.equal((await b.call('/api/state')).body.profile.area,'지역 미선택');
+  assert.equal((await a.call('/api/account/recovery')).body.code,a.code);
+  assert.equal(f.db.prepare('SELECT identity FROM members WHERE id=?').get(a.id).identity,identity);
+  assert.equal((await a.call('/api/rooms/'+room+'/messages')).body.find(m=>m.id===message).body,'마이그레이션 이후에도 같은 대화');
+  const rows=f.db.prepare('SELECT id,content,profile_snapshot FROM reports ORDER BY id').all();
+  assert.equal(JSON.parse(rows[0].profile_snapshot).memo,'소개');assert.equal(JSON.parse(rows[0].profile_snapshot).area,'경기도 이천시');
+  assert.equal(rows[1].profile_snapshot,null);assert.equal(rows[2].profile_snapshot,null);assert.equal(rows[2].content,null);
+  const queue=(await admin('/api/admin/review')).body.reports;
+  assert.equal(queue.find(r=>r.id===same).profileSnapshotAvailable,true);
+  for(const id of [changed,missing]){
+    assert.equal(queue.find(r=>r.id===id).profileSnapshotAvailable,false);
+    assert.match(queue.find(r=>r.id===id).excerpt,/원문을 확인할 수 없/);
+    assert.equal((await admin('/api/admin/review',{kind:'report',id,action:'accept'})).status,409);
+    assert.equal((await admin('/api/admin/review',{kind:'report',id,action:'dismiss'})).status,200);
+  }
+  assert.equal((await a.call('/api/state')).body.totalStrikes,0);
+  assert.equal((await b.call('/api/profile',{area:'제주 전체',memo:'지역 다시 선택'})).status,200);
+  assert.equal((await b.call('/api/state')).body.profile.area,'제주 전체');
+});
+
 test('나가기·차단은 양쪽 대화와 미발송 알림을 닫고 명시 재개방도 옛 메시지를 복원하지 않는다',async t=>{
   const f=fixture(t),a=await f.register('나가는 회원'),b=await f.register('상대 회원'),c=await f.register('외부 회원'),admin=await f.admin();
   const room=await f.room(a,b),path='/api/rooms/'+room+'/messages',leave='/api/rooms/'+room+'/leave';

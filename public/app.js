@@ -212,7 +212,14 @@ function limitedPage(state){
 }
 function reportUI(target,back){
   paint('신고하기','mail',`<form class="paper"><label for="reason">신고 사유</label><select id="reason" required name="reason"><option value="">선택해 주세요</option>${reasons.map(r=>`<option>${esc(r)}</option>`).join('')}</select><p class="note">담당자가 내용을 확인해요. 신고된 메시지는 검토 중 숨겨집니다.</p>${actions(btn('신고 접수'))}</form>`,{back});
-  form(async f=>{await api('report',{...target,reason:f.get('reason')});await back();note('신고를 접수했어요.');});
+  form(async f=>{
+    try{await api('report',{...target,reason:f.get('reason')});}
+    catch(e){
+      if(target.kind==='profile'&&e.status===409){await people();err(new Error('프로필이 변경됐어요. 내용을 다시 확인한 뒤 신고해 주세요.'));return;}
+      throw e;
+    }
+    await back();note('신고를 접수했어요.');
+  });
 }
 function blockPeer(id,back){
   modal('사용자 차단','서로의 프로필이 숨겨지고 두 사람의 채팅방이 삭제돼요. 관리자는 원래 대화에서 기록을 확인할 수 있으며, 사진은 전송 후 12시간에 만료돼요.','차단하기',async()=>{await api('blocks',{peer:id});await back();note('사용자를 차단했어요.');void syncUnread();});
@@ -262,17 +269,19 @@ async function recoveryPage(back){
   });
   form(async()=>{await api('account/recovery',{saved:true});if(back)await back();else await boot();});
 }
-function picker(){return '<div class="split"><div><label for="province">시·도</label><select id="province"></select></div><div><label for="district">시·군·구</label><select id="district"></select></div></div>';}
+function picker(){return '<div class="split"><div><label for="province">지역</label><select id="province"></select></div><div><label for="district">권역</label><select id="district"></select></div></div>';}
 function areaOf(){return $('#province').value+' '+$('#district').value;}
+function knownArea(area){return Object.entries(regions||{}).some(([region,zones])=>zones.some(zone=>area===region+' '+zone));}
 function wirePicker(area='',changed=()=>{},requireChoice=false){
   const a=$('#province'),b=$('#district'),provinces=Object.keys(regions);
-  if(requireChoice)a.add(new Option('시·도를 선택해 주세요',''));
+  a.replaceChildren();a.required=requireChoice;b.required=requireChoice;
+  if(requireChoice)a.add(new Option('지역을 선택해 주세요',''));
   for(const x of provinces)a.add(new Option(x,x));
-  const region=provinces.find(x=>area.startsWith(x+' '));
+  const region=knownArea(area)?provinces.find(x=>area.startsWith(x+' ')):null;
   if(region)a.value=region;
   function list(){
     b.replaceChildren();b.disabled=!a.value;
-    if(requireChoice)b.add(new Option('시·군·구를 선택해 주세요',''));
+    if(requireChoice)b.add(new Option('권역을 선택해 주세요',''));
     for(const n of regions[a.value]||[])b.add(new Option(n,n));
   }
   list();if(region)b.value=area.slice(region.length+1);
@@ -280,15 +289,15 @@ function wirePicker(area='',changed=()=>{},requireChoice=false){
 }
 async function regionStep(){
   regions||=await api('regions');
-  paint('어느 지역에 계세요?','pin',`<form class="paper">${picker()}${actions(btn('다음'))}</form>`,{back:details,sub:'프로필에 표시할 시·군·구를 선택해 주세요.'});
+  paint('어느 지역에 계세요?','pin',`<form class="paper">${picker()}${actions(btn('다음'))}</form>`,{back:details,sub:'프로필에 표시할 지역과 권역을 선택해 주세요.'});
   wirePicker(draft.province+' '+draft.district,()=>{},true);
   form(()=>{
-    if(!$('#province').value || !$('#district').value)throw new Error('시·도와 시·군·구를 선택해 주세요.');
+    if(!knownArea(areaOf()))throw new Error('지역과 권역을 선택해 주세요.');
     draft.province=$('#province').value;draft.district=$('#district').value;memo();
   });
 }
 function memo(){
-  paint('당신의 성향을 알려주세요','leaf',rulesCard()+`<form class="paper"><label for="memo">성향 메모</label><textarea id="memo" name="memo" required maxlength="800" placeholder="나를 소개하는 글을 자유롭게 적어주세요.">${esc(draft.memo)}</textarea><div class="rule"></div><label class="check"><input type="checkbox" required><span>이용규칙에 동의해요</span></label>${actions(btn('확인'))}</form>`,{back:()=>{draft.memo=$('#memo').value;return regionStep();}});
+  paint('당신은 어떤 사람인가요?','leaf',rulesCard()+`<form class="paper"><label for="memo">당신을 표현해주세요</label><textarea id="memo" name="memo" required maxlength="800" placeholder="나를 소개하는 글을 자유롭게 적어주세요.">${esc(draft.memo)}</textarea><div class="rule"></div><label class="check"><input type="checkbox" required><span>이용규칙에 동의해요</span></label>${actions(btn('확인'))}</form>`,{back:()=>{draft.memo=$('#memo').value;return regionStep();}});
   form(async f=>{draft.memo=f.get('memo');await api('register',{area:draft.province+' '+draft.district,memo:draft.memo,policy:policyVersion});draft.birthDate='';await boot();});
 }
 const applePush=window.webkit?.messageHandlers?.paperChatPush;
@@ -361,7 +370,7 @@ async function scopedDirectory(key,endpoint,title,mark,renderRows,open,empty,{ba
   if(scope.regional){
     regions||=await api('regions');
     if(current!==epoch)return;
-    wirePicker(scope.area||me?.area||'',()=>{scope.area=areaOf();list.replaceChildren();void refresh();});
+    wirePicker(knownArea(scope.area)?scope.area:me?.area||'',()=>{scope.area=areaOf();list.replaceChildren();void refresh();});
     scope.area=areaOf();
   }
   await refresh();
@@ -370,13 +379,13 @@ async function scopedDirectory(key,endpoint,title,mark,renderRows,open,empty,{ba
 function presenceBadge(p){return `<span class="presence-badge ${p.online?'online':''}">${p.online?'접속 중':p.lastSeen?'최근 접속 · '+esc(at(p.lastSeen)):'접속 기록 없음'}</span>`;}
 function people(){
   return scopedDirectory('people','people','프로필 목록','book',
-    p=>`<button type="button" class="row profile-row" data-id="${esc(p.id)}"><span><strong>${esc(p.nick)}</strong>${presenceBadge(p)}<small>${esc(p.area+' · '+p.year+'년생 · '+p.gender)}</small><span class="profile-memo-label">성향 메모</span><span class="profile-memo">${esc(p.memo||'아직 작성된 성향 메모가 없어요.')}</span></span>${icon('arrow')}</button>`,profile,
+    p=>`<button type="button" class="row profile-row" data-id="${esc(p.id)}"><span><strong>${esc(p.nick)}</strong>${presenceBadge(p)}<small>${esc(p.area+' · '+p.year+'년생 · '+p.gender)}</small><span class="profile-memo-label">소개글</span><span class="profile-memo">${esc(p.memo||'아직 작성된 소개글이 없어요.')}</span></span>${icon('arrow')}</button>`,profile,
     regional=>regional?'이 지역에 다른 회원이 아직 없어요.':'아직 표시할 다른 회원이 없어요.',{live:true,sub:'최근 접속한 회원부터 표시돼요.'});
 }
 function profile(p){
-  paint(p.nick,'book',`<article class="paper">${presenceBadge(p)}<p class="sub">${esc(p.year)}년생 · ${esc(p.gender)} · ${esc(p.area)}</p><div class="rule"></div><h2>성향 메모</h2><p class="memo">${esc(p.memo)}</p>${actions(act('start','대화하기','primary'))}</article>`,{back:people});
+  paint(p.nick,'book',`<article class="paper">${presenceBadge(p)}<p class="sub">${esc(p.year)}년생 · ${esc(p.gender)} · ${esc(p.area)}</p><div class="rule"></div><h2>소개글</h2><p class="memo">${esc(p.memo)}</p>${actions(act('start','대화하기','primary'))}</article>`,{back:people});
   $('#sections').insertAdjacentHTML('beforeend',actions(act('report','프로필 신고'),act('block','사용자 차단','danger')));
-  on('#report','click',()=>reportUI({kind:'profile',peer:p.id},()=>profile(p)));on('#block','click',()=>blockPeer(p.id,people));
+  on('#report','click',()=>reportUI({kind:'profile',peer:p.id,profileVersion:p.profileVersion},()=>profile(p)));on('#block','click',()=>blockPeer(p.id,people));
   on('#start','click',async()=>{const r=await api('room',{peer:p.id});await conversation(r.id,p.nick,false,rooms,p.id,p.area,r.version);});
 }
 function rooms(){
@@ -385,9 +394,35 @@ function rooms(){
     regional=>regional?'선택한 지역의 회원과 나눈 대화가 없어요.':'프로필을 열고 첫 대화를 시작해 보세요.',{live:true});
 }
 function settings(){
-  paint('내 설정','settings',`<div class="paper"><h2>${esc(me.nick)}</h2><p class="sub">${esc(me.year)}년생 · ${esc(me.gender)} · ${esc(me.area)}</p><div class="rule"></div><p class="memo">${esc(me.memo)}</p>${actions(act('logout','로그아웃'),act('withdraw','회원탈퇴','danger'))}</div>`,{nav:tabs('settings')});
+  paint('내 설정','settings',`<div class="paper"><h2>${esc(me.nick)}</h2><p class="sub">${esc(me.year)}년생 · ${esc(me.gender)} · ${esc(me.area)}</p><div class="rule"></div><h2>소개글</h2><p class="memo">${esc(me.memo)}</p>${actions(act('editProfile','프로필 편집','secondary'))}${actions(act('logout','로그아웃'),act('withdraw','회원탈퇴','danger'))}</div>`,{nav:tabs('settings')});
   $('#sections').insertAdjacentHTML('beforeend',actions(act('recovery','개인 복구코드 보기'),act('blocked','차단한 사용자'))+rulesCard());
-  wireTabs();accountActions();on('#recovery','click',()=>recoveryPage(settings));on('#blocked','click',blockedList);
+  wireTabs();accountActions();on('#editProfile','click',editProfile);on('#recovery','click',()=>recoveryPage(settings));on('#blocked','click',blockedList);
+}
+async function editProfile(){
+  if(stage!=='member'||!me)return;
+  const openingView=epoch,openingRevision=accountRevision;
+  const [state,choices]=await Promise.all([api('state'),regions?Promise.resolve(regions):api('regions')]);
+  if(openingView!==epoch||openingRevision!==accountRevision)return;
+  if(state.stage==='gate'){clearMemberSession('사용자 정보가 없거나 로그인이 종료되었어요. 다시 인증해 주세요.');return;}
+  if(state.stage!=='member'){await boot();return;}
+  if(!state.profile)throw new Error('프로필을 확인하지 못했어요. 다시 시도해 주세요.');
+  me=state.profile;accountState=state;regions=choices;
+  const profile=me,editingId=profile.id;
+  paint('프로필 편집','pen',`<section class="paper"><h2>기본 정보</h2><dl class="details"><dt>닉네임</dt><dd>${esc(profile.nick)}</dd><dt>출생연도</dt><dd>${esc(profile.year)}년</dd><dt>성별</dt><dd>${esc(profile.gender)}</dd></dl></section><form class="paper"><div class="field">${picker()}</div><div class="field"><label for="memo">당신을 표현해주세요</label><textarea id="memo" name="memo" required maxlength="800" placeholder="나를 소개하는 글을 자유롭게 적어주세요.">${esc(profile.memo)}</textarea></div>${actions(btn('저장'),act('cancelEdit','취소'))}</form>`,{back:settings,sub:'지역과 소개글을 수정할 수 있어요.'});
+  const editingView=epoch,editingRevision=accountRevision;
+  wirePicker(profile.area,()=>{},true);
+  on('#cancelEdit','click',settings);
+  form(async f=>{
+    const area=areaOf(),memo=String(f.get('memo')??'').trim();
+    if(!knownArea(area))throw new Error('지역과 권역을 선택해 주세요.');
+    if(!memo||memo.length>800)throw new Error('소개글을 1자 이상 800자 이하로 입력해 주세요.');
+    const result=await api('profile',{area,memo});
+    if(editingView!==epoch||editingRevision!==accountRevision||stage!=='member')return;
+    if(!result.profile||result.profile.id!==editingId)throw new Error('저장된 프로필을 확인하지 못했어요. 다시 시도해 주세요.');
+    me=result.profile;accountState={...accountState,profile:me};
+    for(const scope of Object.values(scopes))if(scope.area&&!knownArea(scope.area))scope.area='';
+    settings();note('프로필을 저장했어요.');
+  });
 }
 async function jpeg(file){
   if(!file || file.size>24*1024*1024)throw new Error('24MB 이하의 사진을 선택해 주세요.');
@@ -558,7 +593,7 @@ async function membersPage(offset=0,page=null,filter=''){
   page??=await api(path);
   const itemLabel=m=>m.status==='withdrawn'?'탈퇴 · '+at(m.expires)+' 삭제 예정':m.area+' · '+(m.online?'접속 중':'최근 접속 '+at(m.lastSeen));
   const reopen=()=>membersPage(offset,null,filter);
-  paint(filter==='inactive'?'30일 미접속 회원':'가입자 현황','book',`<p class="counts">가입 중 <strong>${page.counts.active}명</strong> · 30일 미접속 <strong>${page.counts.inactive||0}명</strong> · 탈퇴 후 24시간 이내 <strong>${page.counts.withdrawn}명</strong></p><section class="paper"><div class="rows">${page.items.map(m=>`<div class="member-row">${row(m.id,m.nick,itemLabel(m))}${m.status==='withdrawn'?'':`<button type="button" class="textBtn danger" data-delete-member="${esc(m.id)}" aria-label="${esc(m.nick)} 회원 삭제">회원 삭제</button>`}</div>`).join('')||'<p class="empty">해당하는 회원이 없어요.</p>'}</div></section>${actions(offset?act('prevPage','이전 목록'):'',page.more?act('nextPage','다음 목록'):'')}`,{back:adminHome,sub:filter==='inactive'?'마지막 접속 후 30일 이상 지난 회원이에요.':'회원을 선택하면 출생연도, 성별, 지역과 성향 메모를 볼 수 있어요.'});
+  paint(filter==='inactive'?'30일 미접속 회원':'가입자 현황','book',`<p class="counts">가입 중 <strong>${page.counts.active}명</strong> · 30일 미접속 <strong>${page.counts.inactive||0}명</strong> · 탈퇴 후 24시간 이내 <strong>${page.counts.withdrawn}명</strong></p><section class="paper"><div class="rows">${page.items.map(m=>`<div class="member-row">${row(m.id,m.nick,itemLabel(m))}${m.status==='withdrawn'?'':`<button type="button" class="textBtn danger" data-delete-member="${esc(m.id)}" aria-label="${esc(m.nick)} 회원 삭제">회원 삭제</button>`}</div>`).join('')||'<p class="empty">해당하는 회원이 없어요.</p>'}</div></section>${actions(offset?act('prevPage','이전 목록'):'',page.more?act('nextPage','다음 목록'):'')}`,{back:adminHome,sub:filter==='inactive'?'마지막 접속 후 30일 이상 지난 회원이에요.':'회원을 선택하면 출생연도, 성별, 지역과 소개글을 볼 수 있어요.'});
   watchDirectory(path,page,next=>membersPage(offset,next,filter),Math.min(...page.items.filter(i=>i.expires).map(i=>i.expires)));
   rows(page.items,m=>memberDetail(m.id,reopen));
   document.querySelectorAll('[data-delete-member]').forEach(el=>el.onclick=()=>{const m=page.items.find(i=>i.id===el.dataset.deleteMember);if(m)deleteMember(m,reopen);});
@@ -576,7 +611,7 @@ async function memberDetail(id,back,m=null){
     watchDirectory(path,m,next=>memberDetail(id,back,next),m.expires);
     return;
   }
-  const fields=[['닉네임',m.nick],['출생연도',m.year],['성별',m.gender],['지역',m.area],['성향 메모',m.memo],['최근 접속',at(m.lastSeen)],['접속 상태',m.online?'접속 중':'접속 종료'],['회원 ID',m.id],['현재 벌점',(m.strikes||0)+' / 3'],['누적 신고 인정',m.totalStrikes||0]];
+  const fields=[['닉네임',m.nick],['출생연도',m.year],['성별',m.gender],['지역',m.area],['소개글',m.memo],['최근 접속',at(m.lastSeen)],['접속 상태',m.online?'접속 중':'접속 종료'],['회원 ID',m.id],['현재 벌점',(m.strikes||0)+' / 3'],['누적 신고 인정',m.totalStrikes||0]];
   if(m.contact)fields.push(['이전 인증 이름',m.contact.name],['이전 인증 전화번호',m.contact.phone],['이전 인증 일시',at(m.verified)]);
   if(m.restrictedUntil)fields.push(['이용 제한 종료',at(m.restrictedUntil)]);
   paint('가입자 상세','book',`<section class="paper"><dl class="details">${fields.map(([k,v])=>`<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl>${actions(act('deleteMember','회원 삭제','danger'))}</section>`,{back});
@@ -660,7 +695,7 @@ async function boot(){
 async function start(){
   await api('status');
   if(admin){await adminHome();return;}
-  main.innerHTML=`<div class="splash"><div class="stamp">${icon('leaf')}</div><h1>당신의 성향을 존중합니다</h1></div>`;
+  main.innerHTML=`<div class="splash"><div class="stamp">${icon('leaf')}</div><h1>당신은 어떤 사람인가요?</h1></div>`;
   await new Promise(r=>setTimeout(r,matchMedia('(prefers-reduced-motion: reduce)').matches?100:1300));await boot();
 }
 let pulseTask=null;

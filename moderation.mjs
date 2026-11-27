@@ -72,9 +72,14 @@ export function moderation(db) {
     } else reject(400,'신고 대상을 확인해 주세요.');
     transaction(db,()=>{
       const content=message==null?profileContent(peer):'message:'+message;
+      if(message==null) {
+        if(typeof b.profileVersion!=='string' || !b.profileVersion)reject(400,'프로필을 새로 확인한 뒤 신고해 주세요.');
+        if(b.profileVersion!==content)reject(409,'소개글이 변경됐어요. 프로필을 새로 확인한 뒤 신고해 주세요.');
+      }
       const previous=get('SELECT id FROM reports WHERE reporter=? AND target=? AND content=?',reporter,peer,content);
       if(previous)return;
-      run('INSERT INTO reports(reporter,target,message,reason,created,content) VALUES(?,?,?,?,?,?)',reporter,peer,message,b.reason,Date.now(),content);
+      const snapshot=message==null?JSON.stringify(get('SELECT nick,area,memo FROM members WHERE id=?',peer)):null;
+      run('INSERT INTO reports(reporter,target,message,reason,created,content,profile_snapshot) VALUES(?,?,?,?,?,?,?)',reporter,peer,message,b.reason,Date.now(),content,snapshot);
       if(room)bump(room);
     });
   }
@@ -88,6 +93,8 @@ export function moderation(db) {
       if(!r)reject(404,'신고를 찾을 수 없어요.');
       if(r.status===action)return;
       if(r.status!=='open')reject(409,'이미 처리된 신고예요.');
+      if(action==='accept' && r.message===null && !r.profile_snapshot)
+        reject(409,'신고 당시 소개글 원문을 확인할 수 없어 승인할 수 없어요.');
       const content=r.content || (r.message==null?profileContent(r.target):'message:'+r.message);
       if(action==='accept'){
         const added=run('INSERT OR IGNORE INTO penalty_events VALUES(?,?,?)',content,r.identity,Date.now());
@@ -111,13 +118,18 @@ export function moderation(db) {
   function queue() {
     return {
       photos:[],
-      reports:all(`SELECT r.id,r.reason,r.created,r.message,r.reporter,u.id AS sender,u.nick,u.area,
-        CASE WHEN r.message IS NULL THEN u.memo ELSE m.body END AS excerpt,
+      reports:all(`SELECT r.id,r.reason,r.created,r.message,r.reporter,r.profile_snapshot,u.id AS sender,u.nick,u.area,
+        m.body AS excerpt,
         CASE WHEN m.photo IS NOT NULL AND m.expires>? THEN m.id END AS photo,
         m.deleted_at AS deletedAt
         FROM reports r JOIN members u ON r.target=u.id LEFT JOIN messages m ON r.message=m.id
-        WHERE r.status='open' ORDER BY r.created,r.id LIMIT 100`,Date.now())
+        WHERE r.status='open' ORDER BY r.created,r.id LIMIT 100`,Date.now()).map(({profile_snapshot,...report})=>{
+          if(report.message!==null)return report;
+          const snapshot=profile_snapshot?JSON.parse(profile_snapshot):null;
+          return {...report,...(snapshot?{nick:snapshot.nick,area:snapshot.area}:{}),
+            excerpt:snapshot?.memo??'신고 당시 소개글 원문을 확인할 수 없어요.',profileSnapshotAvailable:Boolean(snapshot)};
+        })
     };
   }
-  return {restricted,penalty,memberStage,accept,pairAllowed,setBlock,report,queue,photoDecision,reportDecision};
+  return {restricted,penalty,memberStage,accept,pairAllowed,setBlock,report,queue,photoDecision,reportDecision,profileContent};
 }

@@ -1,0 +1,40 @@
+{
+  "date": "2026-11-27",
+  "changes": [
+    "가입·시작 질문과 소개글 입력 문구 변경",
+    "지역·소개글만 편집하는 설정 화면 및 서버 검증",
+    "기존256개 지역을22개 서비스권역으로 이관",
+    "프로필 수정 전 신고 원문 보관 및 변경된 프로필 신고 방지"
+  ],
+  "checks": {
+    "node_tests": {
+      "passed": 86,
+      "failed": 0
+    },
+    "browser": {
+      "passed": [
+        "iPhone viewport registration uses requested wording and broad region picker",
+        "Android viewport edit prefill/cancel/save/reload works; age, gender, name and identity cannot be changed through API",
+        "public profile and regional conversation filters immediately use updated wider area and memo",
+        "profile report keeps original text/area after edit; stale report rejected; accepting old report preserves new introduction"
+      ],
+      "pageErrors": [],
+      "productionTouched": false
+    },
+    "visual_qa": "4 screenshots inspected: signup wording, readonly basic profile + region/memo editor, regional profile list, original reported profile",
+    "region_migration": {
+      "legacy_areas": 256,
+      "new_areas": 22,
+      "unmapped": 0,
+      "alias_collisions": 0,
+      "idempotence": "passed"
+    },
+    "native_source": {
+      "files_compared": 49,
+      "changed": 0,
+      "rebuild": "Not run; this update changes shared server/web UI only."
+    }
+  },
+  "production_deployed": false,
+  "production_data_changed": false
+}

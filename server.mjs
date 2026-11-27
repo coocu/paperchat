@@ -12,12 +12,13 @@ import { pushProvider } from './push-provider.mjs';
 import { pushQueue } from './push-queue.mjs';
 import { moderation, checkText } from './moderation.mjs';
 import { policyVersion } from './public/rules.js';
+import { regions, normalizeArea } from './regions.mjs';
 
-const regions=JSON.parse(readFileSync(new URL('./regions.json',import.meta.url)));
-const areas=new Set(Object.entries(regions).flatMap(([p,ds])=>ds.map(d=>p+' '+d)));
 function directoryArea(url) {
-  const area=url.searchParams.get('area');
-  if(area!==null && !areas.has(area)) reject(400,'지역을 선택해 주세요.');
+  const raw=url.searchParams.get('area');
+  if(raw===null)return null;
+  const area=normalizeArea(raw);
+  if(!area) reject(400,'지역을 선택해 주세요.');
   return area;
 }
 const profileCols='id,nick,year,gender,area,memo';
@@ -358,6 +359,20 @@ export function makeServer(config, upstream=providers) {
         profile:stage==='member'?get('SELECT '+profileCols+' FROM members WHERE id=?',s.member):null});
     }
     if(!post && p==='/api/regions') return ok(regions);
+    if(post && p==='/api/profile') {
+      const s=need(req,'member');
+      if(Object.keys(b).some(key=>key!=='area' && key!=='memo'))reject(400,'지역과 소개글만 수정할 수 있어요.');
+      const area=normalizeArea(b.area);
+      if(!area)reject(400,'지역을 선택해 주세요.');
+      const memo=string(b.memo,1,800,'소개글');checkText(memo);
+      const profile=transaction(db,()=>{
+        const updated=run('UPDATE members SET area=?,memo=? WHERE id=? AND deleted_at IS NULL',area,memo,s.member);
+        if(!updated.changes)reject(401,'이 화면을 이용하려면 다시 인증해 주세요.');
+        touch(s.member,null);
+        return get('SELECT '+profileCols+' FROM members WHERE id=?',s.member);
+      });
+      return ok({profile});
+    }
     if(post && p==='/api/key') {
       throttle('key:'+ip,20,hour/4);
       const code=string(b.code,1,256,'인증키');
@@ -428,15 +443,16 @@ export function makeServer(config, upstream=providers) {
       const s=need(req,'details');
       const install=device(req,res);
       checkSignup(install);
-      if(!areas.has(b.area)) reject(400,'지역을 선택해 주세요.');
-      const memo=string(b.memo,1,800,'성향 메모');
+      const area=normalizeArea(b.area);
+      if(!area) reject(400,'지역을 선택해 주세요.');
+      const memo=string(b.memo,1,800,'소개글');
       checkText(memo);checkText(s.nick);
       if(b.policy!==policyVersion)reject(400,'이용규칙을 확인하고 동의해 주세요.');
       transaction(db,()=>{
         const consumed=run('UPDATE used_invites SET pending_device=NULL,pending_until=NULL WHERE proof=? AND pending_device=? AND pending_until>?',s.identity,install,Date.now());
         if(consumed.changes!==1)reject(409,'가입 요청이 만료되었거나 이미 처리됐어요.');
         const id=randomUUID(),credential=proof(recoveryCode(id));
-        run('INSERT INTO members(id,identity,nick,year,gender,area,memo) VALUES(?,?,?,?,?,?,?)',id,credential,s.nick,s.year,s.gender,b.area,memo);
+        run('INSERT INTO members(id,identity,nick,year,gender,area,memo) VALUES(?,?,?,?,?,?,?)',id,credential,s.nick,s.year,s.gender,area,memo);
         attachKey.run(id,credential,Date.now());
         run('INSERT INTO account_devices VALUES(?,?)',id,install);
         safety.accept(id,b.policy);
@@ -492,7 +508,7 @@ export function makeServer(config, upstream=providers) {
       const area=directoryArea(u);
       return ok(all('SELECT '+profileCols+' FROM members p WHERE (? IS NULL OR p.area=?) AND p.id<>? AND '+visiblePeer+
         ' ORDER BY (SELECT last_seen FROM member_activity WHERE member=p.id) DESC,p.id',area,area,s.member,Date.now(),s.member,s.member)
-        .map(member=>({...member,...activity(member.id)})));
+        .map(member=>({...member,...activity(member.id),profileVersion:safety.profileContent(member.id)})));
     }
     if(!post && p==='/api/rooms') {
       const s=need(req,'member'),area=directoryArea(u);
