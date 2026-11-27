@@ -609,6 +609,20 @@ function message(m,isAdmin){
   const mine=!isAdmin&&m.author===me?.id;
   return `<article class="msg ${mine?'mine':''}" data-message="${m.id}"><span class="by">${esc(m.nick)}</span>${deleted?`<span class="deleted-label" title="삭제 · ${esc(at(m.deletedAt))}">${m.expires?'삭제된 사진':'삭제된 채팅'}</span>`:''}<div class="bubble msgText">${body}</div><time class="time">${esc(when)}</time>${mine?`<button type="button" class="textBtn danger" data-delete-message="${m.id}">${m.expires?'사진':'메시지'} 삭제</button>`:!isAdmin&&!['reported','removed','expired'].includes(m.visibility)?`<button type="button" class="textBtn" data-report="${m.id}">신고</button>`:''}</article>`;
 }
+function wireChatEnter(composer){
+  if(nativeClient || !composer)return;
+  let composing=false;
+  composer.addEventListener('compositionstart',()=>{composing=true;});
+  composer.addEventListener('compositionend',()=>{composing=false;});
+  composer.addEventListener('keydown',event=>{
+    if(event.key!=='Enter' || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey
+      || composing || event.isComposing || event.keyCode===229)return;
+    event.preventDefault();
+    const form=composer.form,submit=form?.querySelector('[type=submit]');
+    if(event.repeat || !composer.value.trim() || !submit || submit.disabled)return;
+    form.requestSubmit(submit);
+  });
+}
 function followChatLayout(log,composer,current,onVisible){
   let following=true,frame=null,disposed=false,height=log.clientHeight;
   const schedule=window.requestAnimationFrame?.bind(window)||(fn=>{fn();return null;});
@@ -759,7 +773,14 @@ async function conversation(id,title,isAdmin,back,peer,area='',initialVersion=nu
   }
   on('#older','click',()=>refresh(true));
   if(!isAdmin){
-    form(async f=>{const body=String(f.get('body')).trim();if(!body)throw new Error('메시지를 입력해 주세요.');await roomRequest(endpoint,{body});$('#body').value='';await refresh();});
+    form(async f=>{
+      const input=$('#body'),draft=input.value,body=String(f.get('body')).trim();
+      if(!body)throw new Error('메시지를 입력해 주세요.');
+      await roomRequest(endpoint,{body});
+      if(input.value===draft)input.value='';
+      await refresh();
+    });
+    wireChatEnter($('#body'));
     on('#attach','click',()=>$('#photo').click());on('#photo','change',async e=>{
       const f=e.target.files[0];e.target.value='';if(!f)return;const button=$('#attach');button.disabled=true;
       try{const photo=await jpeg(f);if(v!==epoch)return;await roomRequest(endpoint,{photo});note('사진을 보냈어요. 전송 후 12시간 동안 볼 수 있어요.');await refresh();}finally{button.disabled=false;}

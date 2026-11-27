@@ -1052,3 +1052,29 @@ test('다른 화면으로 이동한 뒤 도착한 상대 프로필 응답은 표
  let release;const b=browser({fetchReply:url=>url==='/api/people/b'?new Promise(r=>release=r):url.endsWith('/messages')?[]:{total:0}});
  b.run("stage='member';me={id:'a'}");await b.run("conversation('r','상대',false,rooms,'b')");const pending=b.element('#peerProfile').handlers.click({});b.run('settings()');release({id:'b',nick:'이전 상대',memo:'이전 정보'});await pending;assert.equal(b.element('dialog1').open,undefined);assert.match(b.element('#app').innerHTML,/내 설정/);
 });
+
+test('웹 채팅 Enter는 기존 form 전송을 사용하고 Shift+Enter·IME 확정은 줄바꿈/조합에 맡긴다',()=>{
+ const b=browser({pathname:'/',fetchReply:()=>({})}),input=b.element('#body'),button={disabled:false};let submits=0,prevented=0;
+ input.value='안녕하세요';input.form={querySelector:()=>button,requestSubmit:s=>{assert.equal(s,button);submits++;}};b.run('wireChatEnter($("#body"))');
+ const event=extra=>({key:'Enter',preventDefault(){prevented++;},...extra});
+ input.handlers.keydown(event());assert.equal(submits,1);assert.equal(prevented,1);
+ for(const extra of [{shiftKey:true},{ctrlKey:true},{altKey:true},{metaKey:true},{isComposing:true},{keyCode:229},{key:'a'}])input.handlers.keydown(event(extra));
+ input.handlers.compositionstart();input.handlers.keydown(event());assert.equal(submits,1);assert.equal(prevented,1);
+ input.handlers.compositionend();input.handlers.keydown(event());assert.equal(submits,2);
+ button.disabled=true;input.handlers.keydown(event());assert.equal(submits,2);button.disabled=false;
+ input.handlers.keydown(event({repeat:true}));input.value=' \n ';input.handlers.keydown(event());assert.equal(submits,2);
+});
+
+test('설치 앱에서는 Enter 키의 기존 줄바꿈 동작을 유지한다',()=>{
+ for(const userAgent of ['PaperChatIOS/4','PaperChatAndroid/3']){const b=browser({userAgent,fetchReply:()=>({})});b.run('wireChatEnter($("#body"))');assert.equal(b.element('#body').handlers.keydown,undefined);}
+});
+
+test('전송 응답을 기다리며 새로 작성한 문장은 이전 전송 완료가 지우지 않는다',async()=>{
+ let release;const sent=[],b=browser({fetchReply:(url,options)=>{
+  if(url.endsWith('/messages')&&options.method==='POST'){sent.push(JSON.parse(options.body));return new Promise(r=>release=r);}
+  return url.endsWith('/messages')?[]:{total:0};
+ }});b.run("stage='member';me={id:'a'}");await b.run("conversation('r','상대',false,rooms,'b')");
+ const form=b.element('form'),input=b.element('#body');form.values={body:'첫 번째 메시지'};input.value='첫 번째 메시지';
+ const pending=form.handlers.submit({preventDefault(){},currentTarget:form});await new Promise(setImmediate);input.value='이어서 쓰는 다음 메시지';release({});await pending;
+ assert.deepEqual(sent,[{body:'첫 번째 메시지'}]);assert.equal(input.value,'이어서 쓰는 다음 메시지');
+});
