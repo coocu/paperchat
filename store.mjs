@@ -5,7 +5,13 @@ import { createHash, randomBytes } from 'node:crypto';
 import { migrateMemberAreas } from './regions.mjs';
 
 export const hour = 3600_000;
-export const tables = ['signup_gates','used_invites','account_devices','account_keys','push_jobs','push_devices','session_presence','member_activity','admin_session_proofs','departures','pending_contacts','contacts','reports','penalty_events','reviews','room_reads','room_changes','blocks','acceptances','restrictions','messages','rooms','sessions','members','cooldowns','settings','attempts'];
+export const tables = ['signup_gates','used_invites','account_devices','account_keys','push_jobs','push_devices','session_presence','member_activity','admin_session_proofs','departures','pending_contacts','contacts','report_messages','reports','penalty_contents','penalty_events','reviews','room_reads','room_changes','blocks','acceptances','restrictions','messages','rooms','sessions','members','cooldowns','settings','attempts'];
+// Only pass a source-controlled SQL column expression, never request input.
+export function openMessageReportSQL(message) {
+  return `(EXISTS(SELECT 1 FROM reports f WHERE f.message=${message} AND f.status='open')
+    OR EXISTS(SELECT 1 FROM report_messages rm JOIN reports f ON f.id=rm.report
+      WHERE rm.message=${message} AND f.status='open'))`;
+}
 export function openStore(dir) {
   mkdirSync(dir, {recursive:true, mode:0o700});
   const db = new DatabaseSync(join(dir,'chat.sqlite'));
@@ -116,11 +122,23 @@ export function openStore(dir) {
       db.exec('ALTER TABLE reports ADD COLUMN content TEXT');
     if(!db.prepare('PRAGMA table_info(reports)').all().some(c=>c.name==='profile_snapshot'))
       db.exec('ALTER TABLE reports ADD COLUMN profile_snapshot TEXT');
+    const reportColumns=db.prepare('PRAGMA table_info(reports)').all();
+    if(!reportColumns.some(c=>c.name==='room'))db.exec('ALTER TABLE reports ADD COLUMN room TEXT REFERENCES rooms(id) ON DELETE CASCADE');
+    if(!reportColumns.some(c=>c.name==='context_message'))db.exec('ALTER TABLE reports ADD COLUMN context_message INTEGER REFERENCES messages(id) ON DELETE SET NULL');
+    if(!reportColumns.some(c=>c.name==='conversation_excerpt'))db.exec('ALTER TABLE reports ADD COLUMN conversation_excerpt TEXT');
+    db.exec(`CREATE TABLE IF NOT EXISTS report_messages(
+      report INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+      message INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,PRIMARY KEY(report,message));
+      CREATE INDEX IF NOT EXISTS report_messages_by_message ON report_messages(message,report);
+      CREATE INDEX IF NOT EXISTS reports_by_room ON reports(room,status);
+      CREATE TABLE IF NOT EXISTS penalty_contents(content TEXT PRIMARY KEY,
+        event TEXT NOT NULL REFERENCES penalty_events(content) ON DELETE CASCADE);
+      INSERT OR IGNORE INTO penalty_contents SELECT content,content FROM penalty_events;`);
     db.exec("UPDATE reports SET content='message:'||message WHERE content IS NULL AND message IS NOT NULL");
     // Only backfill an unreviewed profile when its recorded content hash still
     // matches. A changed current profile is not evidence of an earlier report.
     for(const row of db.prepare(`SELECT r.id,r.target,r.content,m.nick,m.memo,m.area FROM reports r
-      JOIN members m ON m.id=r.target WHERE r.message IS NULL AND r.status='open' AND r.profile_snapshot IS NULL`).all()) {
+      JOIN members m ON m.id=r.target WHERE r.message IS NULL AND r.room IS NULL AND r.status='open' AND r.profile_snapshot IS NULL`).all()) {
       const content='profile:'+row.target+':'+
         createHash('sha256').update(JSON.stringify({nick:row.nick,memo:row.memo})).digest('hex');
       if(content===row.content)db.prepare('UPDATE reports SET profile_snapshot=? WHERE id=?').run(JSON.stringify({nick:row.nick,area:row.area,memo:row.memo}),row.id);
@@ -130,7 +148,7 @@ export function openStore(dir) {
     // and open reports survive this migration unchanged.
     db.prepare(`UPDATE reviews SET state='approved' WHERE state='pending'
       AND message IN (SELECT id FROM messages WHERE photo IS NOT NULL AND expires>?)
-      AND NOT EXISTS(SELECT 1 FROM reports WHERE reports.message=reviews.message AND status='open')`).run(Date.now());
+      AND NOT ${openMessageReportSQL('reviews.message')}`).run(Date.now());
   });
   return db;
 }

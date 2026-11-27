@@ -3,7 +3,7 @@ import { createHmac, createHash, randomBytes, randomUUID, timingSafeEqual } from
 import { readFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
-import { openStore, hour, transaction, clean, closeRoom, tables } from './store.mjs';
+import { openStore, hour, transaction, clean, closeRoom, tables, openMessageReportSQL } from './store.mjs';
 import { providers, reject, profileDetails, RequestError } from './providers.mjs';
 
 import { textVault } from './vault.mjs';
@@ -58,6 +58,9 @@ export function makeServer(config, upstream=providers) {
   const base=new URL(origin).origin, secure=base.startsWith('https://');
   if(!secure && !['localhost','127.0.0.1','[::1]'].includes(new URL(base).hostname)) throw Error('HTTPS URL을 설정하세요.');
   const db=openStore(config.dir), h=(scope,v)=>createHmac('sha256',secret).update(scope+'|'+v).digest('hex');
+  // A literal Unicode case-insensitive search: SQL LIKE would treat % and _ as patterns.
+  db.function('paperchat_contains',{deterministic:true},(value,query)=>
+    typeof value==='string' && typeof query==='string' && value.toLowerCase().includes(query.toLowerCase())?1:0);
   const safety=moderation(db);
   const delivery=config.pushProvider || pushProvider();
   const webDelivery=config.webPushProvider || webPushProvider(db,secret);
@@ -105,6 +108,14 @@ export function makeServer(config, upstream=providers) {
       if(!streamValid(stream)){endStream(stream);continue;}
       if(stream.member!==members.a && stream.member!==members.b)continue;
       try {stream.res.write('event: room-change\ndata: '+data+'\n\n');}catch{endStream(stream);}
+    }
+  }
+  function notifyUrgentAnnouncement(revision) {
+    const data=JSON.stringify({revision});
+    for(const stream of [...streams]) {
+      if(!streamValid(stream)){endStream(stream);continue;}
+      if(safety.memberStage(stream.member)!=='member')continue;
+      try{stream.res.write('event: urgent-announcement\ndata: '+data+'\n\n');}catch{endStream(stream);}
     }
   }
   run("INSERT OR IGNORE INTO service_meta VALUES('reset',?)",token());
@@ -223,7 +234,7 @@ export function makeServer(config, upstream=providers) {
   }
   const visibleMessage=`m.deleted_at IS NULL AND (v.state IS NULL OR v.state='approved')
     AND ((m.expires IS NULL AND m.body IS NOT NULL) OR (m.photo IS NOT NULL AND m.expires>?))
-    AND NOT EXISTS(SELECT 1 FROM reports f WHERE f.message=m.id AND f.status='open')`;
+    AND NOT ${openMessageReportSQL('m.id')}`;
   function unread(member,room) {
     return get(`SELECT COUNT(*) AS n FROM messages m LEFT JOIN reviews v ON v.message=m.id
       WHERE m.room=? AND m.author<>? AND m.id>COALESCE((SELECT through FROM room_reads WHERE room=? AND member=?),0)
@@ -244,8 +255,56 @@ export function makeServer(config, upstream=providers) {
   const messageColumns=`m.id,m.room,m.author,p.nick,p.area,m.sent,m.body,m.expires,m.deleted_at AS deletedAt,
     v.state,
     (m.photo IS NOT NULL AND m.expires>?) AS live,
-    EXISTS(SELECT 1 FROM reports f WHERE f.message=m.id AND f.status='open') AS reported`;
+    ${openMessageReportSQL('m.id')} AS reported`;
   const messageJoins=`FROM messages m JOIN members p ON m.author=p.id LEFT JOIN reviews v ON v.message=m.id`;
+  const adminSearchVisible=`m.body IS NOT NULL AND (v.state IS NULL OR v.state!='removed')
+    AND (m.expires IS NULL OR (m.photo IS NOT NULL AND m.expires>?))`;
+  const matchingMessages=`SELECT m.id,m.room,m.body,m.sent,m.deleted_at FROM messages m LEFT JOIN reviews v ON v.message=m.id
+    WHERE ? IS NOT NULL AND paperchat_contains(m.body,?) AND ${adminSearchVisible}`;
+  function searchQuery(url) {
+    const value=url.searchParams.get('q');
+    return value===null?null:string(value,0,200,'검색어')||null;
+  }
+  function monitorMember(url) {
+    const member=url.searchParams.get('member');
+    if(member!==null && !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(member))
+      reject(400,'조회할 회원을 확인해 주세요.');
+    return member;
+  }
+  function matchSnippet(body,query) {
+    if(body===null || !query)return null;
+    const index=body.toLowerCase().indexOf(query.toLowerCase());
+    let position=0,foldedLength=0;
+    // Some Unicode letters expand while lowercasing; map back to original characters.
+    for(const character of body){if(foldedLength>=index)break;foldedLength+=character.toLowerCase().length;position++;}
+    const start=Math.max(0,position-Math.min(60,200-Array.from(query).length));
+    return Array.from(body).slice(start,start+200).join('');
+  }
+  function monitorProfiles(area,query) {
+    return all(`WITH matching AS (${matchingMessages})
+      SELECT p.id,p.nick,p.year,p.gender,p.area,p.memo,p.deleted_at AS deletedAt,COUNT(r.id) AS roomCount,
+        SUM(CASE WHEN ? IS NULL OR paperchat_contains(p.nick,?) OR paperchat_contains(peer.nick,?) OR EXISTS(SELECT 1 FROM matching WHERE room=r.id)
+          THEN 1 ELSE 0 END) AS matchedRoomCount,
+        MAX((SELECT MAX(sent) FROM messages WHERE room=r.id)) AS recent
+      FROM members p JOIN rooms r ON r.a=p.id OR r.b=p.id
+      JOIN members peer ON peer.id=CASE WHEN r.a=p.id THEN r.b ELSE r.a END
+      WHERE (? IS NULL OR p.area=?) GROUP BY p.id HAVING matchedRoomCount>0
+      ORDER BY recent DESC,p.nick,p.id`,query,query,Date.now(),query,query,query,area,area);
+  }
+  function monitorRooms(area,member,query) {
+    return all(`WITH matching AS (${matchingMessages})
+      SELECT r.id,x.id AS firstId,y.id AS secondId,x.nick AS first,x.area AS firstArea,y.nick AS second,y.area AS secondArea,
+        x.deleted_at AS firstDeletedAt,y.deleted_at AS secondDeletedAt,r.closed_at AS closedAt,r.closed_reason AS closedReason,
+        MAX(m.sent) AS recent,(SELECT COUNT(*) FROM matching WHERE room=r.id) AS matchingMessages,
+        (SELECT body FROM matching WHERE room=r.id ORDER BY id DESC LIMIT 1) AS matchBody,
+        (SELECT deleted_at FROM matching WHERE room=r.id ORDER BY id DESC LIMIT 1) AS matchDeletedAt,
+        (SELECT sent FROM matching WHERE room=r.id ORDER BY id DESC LIMIT 1) AS matchSent
+      FROM rooms r JOIN members x ON r.a=x.id JOIN members y ON r.b=y.id LEFT JOIN messages m ON m.room=r.id
+      WHERE (? IS NULL OR r.a=? OR r.b=?) AND (? IS NULL OR x.area=? OR y.area=?)
+        AND (? IS NULL OR paperchat_contains(x.nick,?) OR paperchat_contains(y.nick,?) OR EXISTS(SELECT 1 FROM matching WHERE room=r.id))
+      GROUP BY r.id ORDER BY recent DESC,r.id`,query,query,Date.now(),member,member,member,area,area,area,query,query,query)
+      .map(({matchBody,...room})=>({...room,matchSnippet:matchSnippet(matchBody,query)}));
+  }
   function presentMessage({state,live,reported,...m},admin) {
     const deleted=m.deletedAt!==null;
     let visibility='visible';
@@ -259,10 +318,13 @@ export function makeServer(config, upstream=providers) {
       viewable:Number(Boolean(live && visibility==='visible'))};
   }
   function processMessages(room,u,admin) {
+    if(!admin && u.searchParams.has('q'))reject(400,'메시지 검색은 관리자 화면에서 이용해 주세요.');
+    const query=admin?searchQuery(u):null;
     const before=u.searchParams.get('before');
     if(before && !/^\d+$/.test(before)) reject(400,'조회 범위를 확인해 주세요.');
     const data=all(`SELECT ${messageColumns} ${messageJoins}
-      WHERE m.room=? AND m.id<? ORDER BY m.id DESC LIMIT 60`,Date.now(),room,before?Number(before):Number.MAX_SAFE_INTEGER);
+      WHERE m.room=? AND m.id<? AND (? IS NULL OR (paperchat_contains(m.body,?) AND ${adminSearchVisible}))
+      ORDER BY m.id DESC LIMIT 60`,Date.now(),room,before?Number(before):Number.MAX_SAFE_INTEGER,query,query,Date.now());
     return data.reverse().map(m=>presentMessage(m,admin));
   }
   function configURL(){return get("SELECT value FROM settings WHERE name='form'")?.value||'';}
@@ -286,6 +348,15 @@ export function makeServer(config, upstream=providers) {
       && typeof saved.body==='string' && typeof saved.androidEnabled==='boolean' && typeof saved.iosEnabled==='boolean';
     const content=valid?Object.fromEntries(Object.keys(defaults).map(key=>[key,saved[key]])):defaults;
     return {...content,...downloadLinks()};
+  }
+  function urgentAnnouncement() {
+    const defaults={enabled:false,title:'긴급공지',body:'',revision:null,publishedAt:null};
+    const row=get("SELECT value FROM settings WHERE name='urgent_announcement'");
+    let saved;
+    try{saved=row?JSON.parse(row.value):null;}catch{}
+    const valid=saved && typeof saved.enabled==='boolean' && typeof saved.title==='string' && typeof saved.body==='string'
+      && typeof saved.revision==='string' && (saved.enabled?Number.isSafeInteger(saved.publishedAt):saved.publishedAt===null);
+    return valid?Object.fromEntries(Object.keys(defaults).map(key=>[key,saved[key]])):defaults;
   }
   function downloadURL(value) {
     if(typeof value!=='string')reject(400,'다운로드 주소를 문자열로 입력해 주세요.');
@@ -386,6 +457,10 @@ export function makeServer(config, upstream=providers) {
       res.on('close',()=>streams.delete(stream));
       res.write(': connected\n\n');
       return;
+    }
+    if(!post && p==='/api/urgent-announcement') {
+      need(req,'member');
+      return ok(urgentAnnouncement());
     }
     if(p.startsWith('/api/admin/') && p!=='/api/admin/login' && p!=='/api/admin/logout') {
       const s=need(req,'admin');
@@ -563,7 +638,9 @@ export function makeServer(config, upstream=providers) {
     }
     if(post && p==='/api/report') {
       const s=need(req,'member');throttle('report:'+s.member,30,hour);
-      safety.report(s.member,b);return ok();
+      const room=safety.report(s.member,b);
+      if(room)notifyRoom(room,{refresh:true});
+      return ok();
     }
     if(post && p==='/api/withdraw') {
       const s=need(req,'member',true);
@@ -691,7 +768,7 @@ export function makeServer(config, upstream=providers) {
       roomFor(req,meta.room,!!media[1]);
       if(!media[1] && meta.deleted_at!==null)reject(403,'삭제한 사진이에요.');
       if(!media[1] && !get(`SELECT 1 FROM reviews v WHERE v.message=? AND v.state='approved'
-        AND NOT EXISTS(SELECT 1 FROM reports f WHERE f.message=v.message AND f.status='open')`,media[2]))
+        AND NOT ${openMessageReportSQL('v.message')}`,media[2]))
         reject(403,'열람할 수 없는 사진이에요.');
       const m=get(`SELECT m.photo FROM messages m LEFT JOIN reviews v ON v.message=m.id
         WHERE m.id=? AND m.expires>? AND m.photo IS NOT NULL AND (v.state IS NULL OR v.state!='removed')`,media[2],Date.now());
@@ -716,20 +793,20 @@ export function makeServer(config, upstream=providers) {
         if(!Number.isSafeInteger(offset)||offset<0)reject(400,'목록 범위를 확인해 주세요.');
         const filter=u.searchParams.get('filter')||'all';
         if(!['all','active','inactive','withdrawn'].includes(filter))reject(400,'회원 조회 조건을 확인해 주세요.');
-        const now=Date.now(),cutoff=now-inactiveAfter;
-        const counts={active:get('SELECT COUNT(*) AS n FROM members WHERE deleted_at IS NULL').n,
+        const area=directoryArea(u),now=Date.now(),cutoff=now-inactiveAfter;
+        const counts={active:get('SELECT COUNT(*) AS n FROM members WHERE deleted_at IS NULL AND (? IS NULL OR area=?)',area,area).n,
           inactive:get(`SELECT COUNT(*) AS n FROM members p JOIN member_activity a ON a.member=p.id
-            WHERE p.deleted_at IS NULL AND a.last_seen<=?`,cutoff).n,
-          withdrawn:get('SELECT COUNT(*) AS n FROM departures WHERE expires>?',now).n};
+            WHERE p.deleted_at IS NULL AND a.last_seen<=? AND (? IS NULL OR p.area=?)`,cutoff,area,area).n,
+          withdrawn:area===null?get('SELECT COUNT(*) AS n FROM departures WHERE expires>?',now).n:0};
         const members=all(`SELECT * FROM (
           SELECT p.id,p.nick,p.area,COALESCE(k.joined,c.joined) AS joined,'active' AS status,NULL AS withdrawn,NULL AS expires,
             a.last_seen AS lastSeen
           FROM members p LEFT JOIN account_keys k ON k.member=p.id LEFT JOIN contacts c ON p.id=c.member
           LEFT JOIN member_activity a ON a.member=p.id
-          WHERE p.deleted_at IS NULL AND ?!='withdrawn' AND (?!='inactive' OR a.last_seen<=?)
+          WHERE p.deleted_at IS NULL AND ?!='withdrawn' AND (?!='inactive' OR a.last_seen<=?) AND (? IS NULL OR p.area=?)
           UNION ALL SELECT id,nick,NULL,NULL,'withdrawn',withdrawn,expires,NULL FROM departures
-          WHERE expires>? AND ? IN ('all','withdrawn')
-        ) ORDER BY status,CASE WHEN ?='inactive' THEN lastSeen END,nick,id LIMIT 51 OFFSET ?`,filter,filter,cutoff,now,filter,filter,offset);
+          WHERE expires>? AND ? IN ('all','withdrawn') AND ? IS NULL
+        ) ORDER BY status,CASE WHEN ?='inactive' THEN lastSeen END,nick,id LIMIT 51 OFFSET ?`,filter,filter,cutoff,area,area,now,filter,area,filter,offset);
         return ok({items:members.slice(0,50).map(m=>({...m,online:m.status==='active'?activity(m.id).online:false})),more:members.length>50,counts});
       }
       const deletingMember=p.match(/^\/api\/admin\/members\/([a-f0-9-]+)\/delete$/);
@@ -771,11 +848,39 @@ export function makeServer(config, upstream=providers) {
       if(p==='/api/admin/review' && post) {
         if(!Number.isSafeInteger(b.id))reject(400,'검토 대상을 확인해 주세요.');
         if(b.kind==='photo')safety.photoDecision(b.id,b.action,pushes.enqueue);
-        else if(b.kind==='report')safety.reportDecision(b.id,b.action);
+        else if(b.kind==='report') {
+          const room=safety.reportDecision(b.id,b.action);
+          if(room)notifyRoom(room,{refresh:true});
+        }
         else reject(400,'검토 대상을 확인해 주세요.');
         return ok();
       }
+      if(p==='/api/admin/link-settings') {
+        if(!post)return ok({url:configURL(),...downloadLinks()});
+        const fields=['url','androidUrl','iosUrl'];
+        if(Object.keys(b).length!==fields.length || fields.some(key=>!Object.hasOwn(b,key)))
+          reject(400,'인증폼과 Android, iPhone 다운로드 주소를 함께 입력해 주세요.');
+        const url=downloadURL(b.url),links={androidUrl:downloadURL(b.androidUrl),iosUrl:downloadURL(b.iosUrl)};
+        transaction(db,()=>{
+          if(url)run("INSERT INTO settings VALUES('form',?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",url);
+          else run("DELETE FROM settings WHERE name='form'");
+          saveDownloadLinks(links);
+        });
+        return ok({url,...links});
+      }
       if(p==='/api/admin/settings' && !post) return ok({url:configURL()});
+      if(p==='/api/admin/urgent-announcement') {
+        if(!post)return ok(urgentAnnouncement());
+        const fields=['enabled','title','body'];
+        if(Object.keys(b).length!==fields.length || fields.some(key=>!Object.hasOwn(b,key)) || typeof b.enabled!=='boolean')
+          reject(400,'긴급공지 표시 여부와 제목, 내용을 함께 확인해 주세요.');
+        const title=string(b.title,b.enabled?1:0,120,'긴급공지 제목');
+        const body=string(b.body,b.enabled?1:0,20000,'긴급공지 내용');
+        const content={enabled:b.enabled,title,body,revision:randomUUID(),publishedAt:b.enabled?Date.now():null};
+        run("INSERT INTO settings VALUES('urgent_announcement',?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",JSON.stringify(content));
+        notifyUrgentAnnouncement(content.revision);
+        return ok(content);
+      }
       if(p==='/api/admin/announcement') {
         if(!post)return ok(announcement());
         const fields=['enabled','title','body','androidEnabled','iosEnabled','androidUrl','iosUrl'];
@@ -805,13 +910,8 @@ export function makeServer(config, upstream=providers) {
         if(url.protocol!=='https:' || url.username || url.password) reject(400,'올바른 HTTPS 주소를 입력해 주세요.');
         run("INSERT OR REPLACE INTO settings VALUES('form',?)",url.href);return ok();
       }
-      if(p==='/api/admin/rooms' && !post) {
-        const area=directoryArea(u);
-        return ok(all(`SELECT r.id,x.nick AS first,x.area AS firstArea,y.nick AS second,y.area AS secondArea,
-          x.deleted_at AS firstDeletedAt,y.deleted_at AS secondDeletedAt,r.closed_at AS closedAt,r.closed_reason AS closedReason,MAX(m.sent) AS recent
-          FROM rooms r JOIN members x ON r.a=x.id JOIN members y ON r.b=y.id
-          LEFT JOIN messages m ON m.room=r.id WHERE (? IS NULL OR x.area=? OR y.area=?) GROUP BY r.id ORDER BY recent DESC,r.id`,area,area,area));
-      }
+      if(p==='/api/admin/monitor/profiles' && !post)return ok(monitorProfiles(directoryArea(u),searchQuery(u)));
+      if(p==='/api/admin/rooms' && !post)return ok(monitorRooms(directoryArea(u),monitorMember(u),searchQuery(u)));
       if(p==='/api/admin/reset' && post) {
         transaction(db,()=>{for(const table of tables) db.exec('DELETE FROM '+table);db.exec("DELETE FROM sqlite_sequence WHERE name='messages'");run("UPDATE service_meta SET value=? WHERE key='reset'",token());});
         closeStreams();

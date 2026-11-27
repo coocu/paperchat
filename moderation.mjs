@@ -60,6 +60,29 @@ export function moderation(db) {
   }
   function report(reporter,b) {
     if(!reasons.includes(b.reason))reject(400,'신고 사유를 선택해 주세요.');
+    if(b.kind==='conversation')return transaction(db,()=>{
+      if(typeof b.room!=='string')reject(400,'신고할 대화방을 선택해 주세요.');
+      const room=get('SELECT id,a,b FROM rooms WHERE id=? AND closed_at IS NULL',b.room);
+      if(!room || (room.a!==reporter && room.b!==reporter))reject(404,'신고할 대화방을 찾을 수 없어요.');
+      const peer=room.a===reporter?room.b:room.a;
+      pairAllowed(reporter,peer);
+      // A new message from the target creates a new reportable conversation.
+      // Expiry, deletion and a review decision do not change this identity.
+      const last=get('SELECT MAX(id) AS id FROM messages WHERE room=? AND author=?',room.id,peer).id;
+      const content='conversation:'+room.id+':'+peer+':'+(last??0);
+      if(get('SELECT 1 FROM reports WHERE reporter=? AND target=? AND content=?',reporter,peer,content))return null;
+      const context=get(`SELECT m.id,m.body FROM messages m LEFT JOIN reviews v ON v.message=m.id
+        WHERE m.room=? AND m.author=? AND m.deleted_at IS NULL AND m.expires IS NULL AND m.body IS NOT NULL
+          AND (v.state IS NULL OR v.state='approved') ORDER BY m.id DESC LIMIT 1`,room.id,peer);
+      const inserted=run(`INSERT INTO reports(reporter,target,message,reason,created,content,room,context_message,conversation_excerpt)
+        VALUES(?,?,NULL,?,?,?,?,?,?)`,reporter,peer,b.reason,Date.now(),content,room.id,context?.id??null,context?.body??null);
+      // The fixed mapping is deliberately not extended when new photos arrive.
+      run(`INSERT INTO report_messages(report,message) SELECT ?,m.id FROM messages m LEFT JOIN reviews v ON v.message=m.id
+        WHERE m.room=? AND m.author=? AND m.deleted_at IS NULL AND m.photo IS NOT NULL
+          AND m.expires>? AND m.sent+?>? AND (v.state IS NULL OR v.state IN ('approved','pending'))`,
+        inserted.lastInsertRowid,room.id,peer,Date.now(),12*hour,Date.now());
+      bump(room.id);return room.id;
+    });
     let peer,room=null,message=null;
     if(b.kind==='message'){
       if(!Number.isSafeInteger(b.message))reject(400,'신고할 메시지를 선택해 주세요.');
@@ -70,17 +93,18 @@ export function moderation(db) {
       peer=b.peer;
       if(typeof peer!=='string' || peer===reporter || !get('SELECT 1 FROM members WHERE id=? AND deleted_at IS NULL',peer))reject(404,'프로필을 찾을 수 없어요.');
     } else reject(400,'신고 대상을 확인해 주세요.');
-    transaction(db,()=>{
+    return transaction(db,()=>{
       const content=message==null?profileContent(peer):'message:'+message;
       if(message==null) {
         if(typeof b.profileVersion!=='string' || !b.profileVersion)reject(400,'프로필을 새로 확인한 뒤 신고해 주세요.');
         if(b.profileVersion!==content)reject(409,'소개글이 변경됐어요. 프로필을 새로 확인한 뒤 신고해 주세요.');
       }
       const previous=get('SELECT id FROM reports WHERE reporter=? AND target=? AND content=?',reporter,peer,content);
-      if(previous)return;
+      if(previous)return null;
       const snapshot=message==null?JSON.stringify(get('SELECT nick,area,memo FROM members WHERE id=?',peer)):null;
       run('INSERT INTO reports(reporter,target,message,reason,created,content,profile_snapshot) VALUES(?,?,?,?,?,?,?)',reporter,peer,message,b.reason,Date.now(),content,snapshot);
       if(room)bump(room);
+      return room;
     });
   }
   function photoDecision(id,decision,onApproved) {
@@ -88,42 +112,70 @@ export function moderation(db) {
   }
   function reportDecision(id,action) {
     if(!['dismiss','accept'].includes(action))reject(400,'처리 방법을 선택해 주세요.');
-    transaction(db,()=>{
+    return transaction(db,()=>{
       const r=get('SELECT r.*, m.identity FROM reports r JOIN members m ON m.id=r.target WHERE r.id=?',id);
       if(!r)reject(404,'신고를 찾을 수 없어요.');
-      if(r.status===action)return;
+      if(r.status===action)return null;
       if(r.status!=='open')reject(409,'이미 처리된 신고예요.');
-      if(action==='accept' && r.message===null && !r.profile_snapshot)
+      if(action==='accept' && r.room===null && r.message===null && !r.profile_snapshot)
         reject(409,'신고 당시 소개글 원문을 확인할 수 없어 승인할 수 없어요.');
       const content=r.content || (r.message==null?profileContent(r.target):'message:'+r.message);
+      const photos=r.room===null?[]:all('SELECT message FROM report_messages WHERE report=? ORDER BY message',id).map(m=>m.message);
+      if(action==='accept' && r.room!==null && photos.length===0 && r.context_message===null)
+        reject(409,'신고 당시 확인할 수 있는 상대의 대화 내용이 없어 승인할 수 없어요.');
       if(action==='accept'){
-        const added=run('INSERT OR IGNORE INTO penalty_events VALUES(?,?,?)',content,r.identity,Date.now());
-        if(added.changes && penalty(r.identity).totalStrikes%3===0)
-          run('INSERT INTO restrictions VALUES(?,?) ON CONFLICT(identity) DO UPDATE SET until=excluded.until',r.identity,Math.max(Date.now(),restricted(r.identity))+24*hour);
-        if(r.message!=null){
-          run("INSERT OR REPLACE INTO reviews VALUES(?,'removed')",r.message);
-          run('UPDATE messages SET photo=NULL,body=NULL WHERE id=?',r.message);
+        // An accepted group counts once, even if it contains many photos. An
+        // individual report and overlapping groups share the same evidence keys.
+        const evidence=r.room===null?[content]:photos.length?photos.map(message=>'message:'+message):
+          [r.context_message===null?content:'message:'+r.context_message];
+        if(evidence.some(key=>!get('SELECT 1 FROM penalty_contents WHERE content=?',key))) {
+          const added=run('INSERT OR IGNORE INTO penalty_events VALUES(?,?,?)',content,r.identity,Date.now());
+          if(added.changes) {
+            for(const key of [...evidence,...(r.room!==null && r.context_message!==null?['message:'+r.context_message]:[])])
+              run('INSERT OR IGNORE INTO penalty_contents VALUES(?,?)',key,content);
+            if(penalty(r.identity).totalStrikes%3===0)
+              run('INSERT INTO restrictions VALUES(?,?) ON CONFLICT(identity) DO UPDATE SET until=excluded.until',r.identity,Math.max(Date.now(),restricted(r.identity))+24*hour);
+          }
+        }
+        if(r.room!==null || r.message!==null) {
+          const removedMessages=r.room===null?[r.message]:photos.length?photos:[r.context_message];
+          for(const message of removedMessages) {
+            run("INSERT OR REPLACE INTO reviews VALUES(?,'removed')",message);
+            run('UPDATE messages SET photo=NULL,body=NULL WHERE id=?',message);
+            run('UPDATE reports SET conversation_excerpt=NULL WHERE context_message=?',message);
+          }
         }else if(content===profileContent(r.target)){
           run("UPDATE members SET nick='이용자',memo='운영자가 프로필 내용을 삭제했어요.' WHERE id=?",r.target);
         }
         run("UPDATE reports SET status='accept' WHERE status='open' AND (content=? OR (? IS NOT NULL AND message=?))",content,r.message,r.message);
+      }else if(r.room!==null) {
+        run("UPDATE reviews SET state='approved' WHERE state='pending' AND message IN (SELECT message FROM report_messages WHERE report=?)",id);
       }else if(r.message!=null){
         // A dismissed legacy report may still have a pre-moderation marker.
         run("UPDATE reviews SET state='approved' WHERE message=? AND state='pending'",r.message);
       }
       run('UPDATE reports SET status=?,content=? WHERE id=?',action,content,id);
-      if(r.message!=null)bump(get('SELECT room FROM messages WHERE id=?',r.message).room);
+      const room=r.room??(r.message===null?null:get('SELECT room FROM messages WHERE id=?',r.message).room);
+      if(room)bump(room);
+      return room;
     });
   }
   function queue() {
     return {
       photos:[],
-      reports:all(`SELECT r.id,r.reason,r.created,r.message,r.reporter,r.profile_snapshot,u.id AS sender,u.nick,u.area,
+      reports:all(`SELECT r.id,r.reason,r.created,r.message,r.reporter,r.profile_snapshot,r.room AS conversationRoom,r.conversation_excerpt,u.id AS sender,u.nick,u.area,
         m.body AS excerpt,
-        CASE WHEN m.photo IS NOT NULL AND m.expires>? THEN m.id END AS photo,
+        CASE WHEN m.photo IS NOT NULL AND m.expires>? AND NOT EXISTS(SELECT 1 FROM reviews v WHERE v.message=m.id AND v.state='removed') THEN m.id END AS photo,
         m.deleted_at AS deletedAt
         FROM reports r JOIN members u ON r.target=u.id LEFT JOIN messages m ON r.message=m.id
-        WHERE r.status='open' ORDER BY r.created,r.id LIMIT 100`,Date.now()).map(({profile_snapshot,...report})=>{
+        WHERE r.status='open' ORDER BY r.created,r.id LIMIT 100`,Date.now()).map(({profile_snapshot,conversation_excerpt,...report})=>{
+          if(report.conversationRoom!==null) {
+            const photos=all(`SELECT m.id,m.expires,m.deleted_at AS deletedAt,
+              (m.photo IS NOT NULL AND m.expires>? AND m.sent+?>? AND (v.state IS NULL OR v.state!='removed')) AS viewable
+              FROM report_messages rm JOIN messages m ON m.id=rm.message LEFT JOIN reviews v ON v.message=m.id
+              WHERE rm.report=? ORDER BY m.id`,Date.now(),12*hour,Date.now(),report.id);
+            return {...report,excerpt:conversation_excerpt,photos,photoCount:photos.length};
+          }
           if(report.message!==null)return report;
           const snapshot=profile_snapshot?JSON.parse(profile_snapshot):null;
           return {...report,...(snapshot?{nick:snapshot.nick,area:snapshot.area}:{}),

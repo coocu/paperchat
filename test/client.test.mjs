@@ -9,18 +9,18 @@ import { privacyEffectiveDate,privacyIntro,privacySections } from '../public/pri
 // The real native shells use the same controller.
 const script=readFileSync(new URL('../public/app.js',import.meta.url),'utf8')
   .replace(/^import [^\n]+\n/gm,'').replace('start().catch(', 'Promise.resolve().catch(');
-function browser({version,search='',userAgent='',pathname='/app',EventSource,instantSplash=false,navigatorProps={},windowProps={},fetchReply}){
+function browser({version,search='',userAgent='',pathname='/app',EventSource,instantSplash=false,navigatorProps={},windowProps={},urgentReply,fetchReply}){
   const nodes=new Map(),local=new Map(),session=new Map(),intervals=new Map(),events=new Map();let timerId=0,dialogId=0;
   if(version)local.set('paperchat.reset',version);
   function element(k){
     if(!nodes.has(k))nodes.set(k,{
-      innerHTML:'',textContent:'',hidden:true,handlers:{},options:[],value:'',attributes:{},scrollHeight:100,scrollTop:100,clientHeight:100,
+      innerHTML:'',textContent:'',hidden:true,handlers:{},options:[],value:'',attributes:{},dataset:{},children:[],scrollHeight:100,scrollTop:100,clientHeight:100,
       classList:{toggle(){},add(){},remove(){}},
       querySelector(selector){
         if(selector.startsWith('[data-message='))return {remove:()=>{this.innerHTML=this.innerHTML.replace(new RegExp('<article[^>]*data-message="'+selector.match(/"(\d+)"/)[1]+'"[\\s\\S]*?</article>'),'');}};
         return element(selector);
       },
-      append(){},showModal(){this.open=true;},close(){this.open=false;this.onclose?.();},remove(){this.open=false;},
+      append(...children){for(const child of children){child.parentElement=this;this.children.push(child);}},showModal(){this.open=true;},close(){this.open=false;this.onclose?.();},remove(){this.open=false;if(this.parentElement)this.parentElement.children=this.parentElement.children.filter(child=>child!==this);this.parentElement=null;},
       setAttribute(k,v){this.attributes[k]=v;},
       add(option){this.options.push(option);if(this.options.length===1)this.value=option.value;},
       addEventListener(e,cb){this.handlers[e]=cb;},
@@ -32,12 +32,12 @@ function browser({version,search='',userAgent='',pathname='/app',EventSource,ins
   const storage=map=>({getItem:k=>map.get(k)||null,setItem:(k,v)=>map.set(k,v),clear:()=>map.clear()});
   const location={pathname,search,replacements:[],replace(url){this.redirect=url;this.replacements.push(url);}};
   const history={replaceState(state,title,url){this.replaced=url;}};
-  const ctx=createContext({document:{querySelector:s=>s==='dialog[open]'?[...nodes.values()].find(el=>el.open)||null:element(s),querySelectorAll:s=>s==='dialog[open]'?[...nodes.values()].filter(el=>el.open):[],createElement:tag=>element(tag+ ++dialogId),hidden:false,addEventListener:(name,fn)=>events.set(name,fn)},navigator:{userAgent,...navigatorProps},
+  const ctx=createContext({document:{body:element('body'),querySelector:s=>s==='dialog[open]'?[...nodes.values()].find(el=>el.open)||null:element(s),querySelectorAll:s=>s==='dialog[open]'?[...nodes.values()].filter(el=>el.open):[],createElement:tag=>element(tag+ ++dialogId),hidden:false,addEventListener:(name,fn)=>events.set(name,fn)},navigator:{userAgent,...navigatorProps},
     location,history,matchMedia:()=>({matches:true}),window:{EventSource,addEventListener:(name,fn)=>events.set(name,fn),scrollTo(){},...windowProps},setInterval:(fn,ms)=>{const id=++timerId;intervals.set(id,{fn,ms});return id;},clearInterval:id=>intervals.delete(id),setTimeout:(fn,ms)=>{if(instantSplash&&ms<=1300)queueMicrotask(fn);return 7;},clearTimeout,AbortController,
     policyVersion,reasons,rules,privacyEffectiveDate,privacyIntro,privacySections,sessionStorage:storage(session),localStorage:storage(local),
     Option:class { constructor(text,value){this.text=text;this.value=value;} },
     FormData:class { constructor(form){this.form=form;}get(key){return this.form.values?.[key]??'';} },
-    URL,URLSearchParams,atob,fetch:async(url,options)=>{const r=await fetchReply(url,options),status=r?.$status||200;return {ok:status>=200&&status<300,status,headers:{get:k=>k==='X-Service-Version'?r?.version:k==='X-Room-Version'?r?.$roomVersion:null},json:async()=>r?.$body??r};}});
+    URL,URLSearchParams,atob,fetch:async(url,options)=>{const r=await (url==='/api/urgent-announcement'?(typeof urgentReply==='function'?urgentReply(url,options):urgentReply??{enabled:false,title:'긴급공지',body:'',revision:null,publishedAt:null}):fetchReply(url,options)),status=r?.$status||200;return {ok:status>=200&&status<300,status,headers:{get:k=>k==='X-Service-Version'?r?.version:k==='X-Room-Version'?r?.$roomVersion:null},json:async()=>r?.$body??r};}});
   runInContext(script,ctx);
   return {run:code=>runInContext(code,ctx),element,local,location,history,session,intervals,events};
 }
@@ -263,13 +263,40 @@ test('정책을 읽는 중 계정이 폐기되면 닫고 이전 설정 대신 �
   assert.match(b.element('#app').innerHTML,/인증키를 입력해 주세요/);assert.doesNotMatch(b.element('#app').innerHTML,/이전 회원/);
 });
 
-test('관리자 대화 목록은 전체로 열리고 참여자별 지역을 구분한다',async()=>{
+test('관리자 모니터링은 전체 프로필과 대화방 수를 표시하고 삭제 회원도 구분한다',async()=>{
   const paths=[];
-  const b=browser({fetchReply:url=>{paths.push(url);return [{id:'r',first:'가을',firstArea:'경기도 이천시',second:'겨울',secondArea:'서울특별시 중구'}];}});
+  const b=browser({pathname:'/codenotekyh',fetchReply:url=>{paths.push(url);return [{id:'p',nick:'가을',year:1995,gender:'여성',area:'서울 동부',memo:'편안한 대화',deletedAt:100,roomCount:3,matchedRoomCount:3,recent:123}];}});
   await b.run('monitor()');
-  assert.deepEqual(paths,['/api/admin/rooms']);
+  assert.deepEqual(paths,['/api/admin/monitor/profiles']);
   assert.match(b.element('#app').innerHTML,/aria-pressed="true">전체/);
-  assert.match(b.element('#list').innerHTML,/가을 \(경기도 이천시\) · 겨울 \(서울특별시 중구\)/);
+  assert.match(b.element('#list').innerHTML,/가을/);assert.match(b.element('#list').innerHTML,/대화방 3개/);assert.match(b.element('#list').innerHTML,/삭제된 회원/);
+  assert.equal(b.element('#monitorCount').textContent,'프로필 1명');
+});
+
+test('관리자 검색어는 지역 필터 및 프로필 대화 목록에 보존되고 특수문자는 URL 인코딩된다',async()=>{
+ const requests=[],p={id:'self',nick:'봄',year:1995,gender:'여성',area:'서울 동부',memo:'소개'};
+ const b=browser({pathname:'/codenotekyh',fetchReply:url=>{requests.push(url);if(url==='/api/regions')return {'서울':['동부','서부']};return [];}});
+ b.run("scopes.monitor={query:'100%_ & 봄',regional:true,area:'서울 동부'}");await b.run('monitor()');
+ const first=new URL(requests.at(-1),'https://example.com');assert.equal(first.pathname,'/api/admin/monitor/profiles');assert.equal(first.searchParams.get('q'),'100%_ & 봄');assert.equal(first.searchParams.get('area'),'서울 동부');
+ await b.run('monitorRooms('+JSON.stringify(p)+')');const rooms=new URL(requests.at(-1),'https://example.com');assert.equal(rooms.pathname,'/api/admin/rooms');assert.equal(rooms.searchParams.get('member'),'self');assert.equal(rooms.searchParams.get('q'),'100%_ & 봄');assert.equal(rooms.searchParams.has('area'),false);
+ assert.match(b.element('#list').innerHTML,/검색 결과가 없어요/);
+ await b.element('#clearSearch').handlers.click({});assert.equal(b.run('scopes.monitor.query'),'');assert.equal(new URL(requests.at(-1),'https://example.com').searchParams.has('q'),false);
+});
+
+test('관리자 방 목록은 상대 회원과 종료 상태 및 삭제된 검색 원문을 안전하게 표시한다',async()=>{
+ const p={id:'self',nick:'봄',year:1995,gender:'여성',area:'서울 동부',memo:'소개'};
+ const b=browser({pathname:'/codenotekyh',fetchReply:()=>[{id:'room',firstId:'peer',first:'<img src=x>',firstArea:'경기 남부',firstDeletedAt:123,secondId:'self',second:'봄',secondArea:'서울 동부',closedAt:234,closedReason:'blocked',recent:345,matchingMessages:2,matchSnippet:'<script>별빛</script>',matchDeletedAt:234}]});
+ b.run("scopes.monitor.query='별빛'");await b.run('monitorRooms('+JSON.stringify(p)+')');const html=b.element('#list').innerHTML;
+ assert.match(html,/&lt;img src=x&gt;/);assert.match(html,/종료된 대화 · 차단/);assert.match(html,/내용 2개 일치/);assert.match(html,/삭제된 채팅/);assert.match(html,/&lt;script&gt;<mark>별빛<\/mark>&lt;\/script&gt;/);assert.doesNotMatch(html,/<script>|<img src=x>/);
+});
+
+test('관리자 대화 내용 검색은 이전 검색 결과도 같은 검색어로 요청하고 전체 보기로 해제한다',async()=>{
+ const requests=[],items=Array.from({length:60},(_,i)=>({id:i+20,author:'peer',nick:'상대',sent:100,body:'<b>100%_</b>',visibility:'visible',deleted:true,deletedAt:100}));
+ const b=browser({pathname:'/codenotekyh',fetchReply:url=>{requests.push(url);return requests.length===1?items:[];}});
+ await b.run("conversation('room','대화',true,monitor,null,'',null,'100%_')");
+ assert.equal(new URL(requests[0],'https://example.com').searchParams.get('q'),'100%_');assert.match(b.element('#log').innerHTML,/&lt;b&gt;<mark>100%_<\/mark>&lt;\/b&gt;/);
+ await b.element('#older').handlers.click({});const older=new URL(requests.at(-1),'https://example.com');assert.equal(older.searchParams.get('q'),'100%_');assert.equal(older.searchParams.get('before'),'20');
+ await b.element('#clearSearch').handlers.click({});assert.equal(requests.at(-1),'/api/admin/rooms/room/messages');
 });
 
 test('프로필과 내 대화는 전체로 시작하고 선택한 권역으로 정확히 전환한다',async()=>{
@@ -751,15 +778,15 @@ test('다운로드 조회 실패는 개발중과 구분하고 늦은 응답은 �
   late.run('gate();loginPage()');const html=late.element('#app').innerHTML;release({androidUrl:'https://download.example/app',iosUrl:''});await new Promise(setImmediate);assert.equal(late.element('#app').innerHTML,html);assert.match(html,/다시 로그인/);
 });
 
-test('관리자는 다운로드 주소 두 개를 각각 비워 저장할 수 있고 위험한 URL은 전송하지 않는다',async()=>{
+test('링크세팅은 인증폼과 두 앱 주소를 함께 저장하며 위험한 URL은 전송하지 않는다',async()=>{
   const writes=[];const b=browser({pathname:'/codenotekyh',fetchReply:(url,options)=>{
-    assert.equal(url,'/api/admin/download-links');
-    if(options.method==='GET')return {androidUrl:'https://download.example/android',iosUrl:'https://download.example/ios'};
+    assert.equal(url,'/api/admin/link-settings');
+    if(options.method==='GET')return {url:'https://forms.example/request',androidUrl:'https://download.example/android',iosUrl:'https://download.example/ios'};
     const body=JSON.parse(options.body);writes.push(body);return body;
   }});
-  await b.run('adminDownloadLinks()');const html=b.element('#app').innerHTML;assert.match(html,/id="androidUrl"/);assert.match(html,/id="iosUrl"/);assert.doesNotMatch(html,/<input[^>]*required/);
-  const form=b.element('form');form.values={androidUrl:'',iosUrl:'https://download.example/ios'};
-  await form.handlers.submit({preventDefault(){},currentTarget:form});assert.deepEqual(writes,[{androidUrl:'',iosUrl:'https://download.example/ios'}]);
+  await b.run('adminLinkSettings()');const html=b.element('#app').innerHTML;assert.match(html,/id="androidUrl"/);assert.match(html,/id="iosUrl"/);assert.doesNotMatch(html,/<input[^>]*required/);
+  const form=b.element('form');form.values={url:'https://forms.example/request',androidUrl:'',iosUrl:'https://download.example/ios'};
+  await form.handlers.submit({preventDefault(){},currentTarget:form});assert.deepEqual(writes,[{url:'https://forms.example/request',androidUrl:'',iosUrl:'https://download.example/ios'}]);
   form.values={androidUrl:'javascript:alert(1)',iosUrl:''};await form.handlers.submit({preventDefault(){},currentTarget:form});assert.equal(writes.length,1);assert.match(b.element('#error').textContent,/https:/);
   for(const value of ['https://user:secret@download.example/app','https://download.example/\napp'])assert.throws(()=>b.run(`downloadURL(${JSON.stringify(value)})`));
 });
@@ -840,7 +867,9 @@ test('웹 알림은 네이티브 앱·관리자·보안 연결이 아닌 화면�
 });
 
 const announcementFixture={enabled:true,title:'안내 <제목>',body:'첫째 줄\n<img src=x onerror=alert(1)>',androidEnabled:true,iosEnabled:true,androidUrl:'',iosUrl:'https://apps.example/ios'};
-function announcementMember(b){b.run("stage='member';me={id:'notice-member',nick:'공지 회원'};accountState={stage:'member',profile:me,needsRecoveryCopy:false};paint('프로필 목록','book','회원 화면')");}
+const urgentFixture={enabled:true,title:'긴급 <안내>',body:'중요한 첫 줄\n<img src=x onerror=alert(1)>',revision:'urgent-1',publishedAt:Date.UTC(2026,10,27,12)};
+const noUrgent={enabled:false,title:'긴급공지',body:'',revision:null,publishedAt:null};
+function announcementMember(b){b.run("stage='member';me={id:'notice-member',nick:'공지 회원'};accountState={stage:'member',profile:me,needsRecoveryCopy:false};paint('프로필 목록','book','회원 화면');memberViewReady=true;urgentChecked=true");}
 test('로그인 후 웹 공지는 안전한 본문과 하단 앱 버튼을 표시하며 로그인 전 다운로드 버튼도 유지한다',async()=>{
  const opened=[],requests=[];
  const b=browser({pathname:'/',userAgent:'Mozilla/5.0 Macintosh Chrome',windowProps:{open:(...args)=>opened.push(args)},fetchReply:url=>{requests.push(url);return url==='/api/announcement'?announcementFixture:{androidUrl:'',iosUrl:'https://apps.example/ios'};}});
@@ -1013,6 +1042,177 @@ test('관리자는 공지와 두 버튼 표시 여부 및 공유 다운로드 �
  form.values={enabled:'',title:'',body:'',androidEnabled:'',iosEnabled:'',androidUrl:'',iosUrl:''};await form.handlers.submit({preventDefault(){},currentTarget:form});assert.equal(writes.length,2);assert.equal(writes[1].enabled,false);
 });
 
+test('로그인 완료 후 긴급공지를 먼저 확인하고 닫은 뒤에만 일반 공지를 조회한다',async()=>{
+ const calls=[];let releaseUrgent;
+ const b=browser({pathname:'/',instantSplash:true,urgentReply:(url,options)=>{
+  calls.push(url);assert.equal(options.headers['X-PaperChat-Member'],'self');return new Promise(resolve=>releaseUrgent=resolve);
+ },fetchReply:url=>{
+  calls.push(url);if(url==='/api/people')return [];if(url==='/api/unread')return {total:0};if(url==='/api/announcement')return announcementFixture;
+  return {stage:'member',profile:{id:'self',nick:'회원'},needsRecoveryCopy:false};
+ }});
+ await b.run('start()');await settle();
+ assert.match(b.element('#app').innerHTML,/프로필 목록/);assert.ok(calls.indexOf('/api/people')<calls.indexOf('/api/urgent-announcement'));
+ assert.equal(calls.includes('/api/announcement'),false);
+ releaseUrgent(urgentFixture);await b.run('urgentSync');
+ const urgent=b.run('urgentDialog');assert.equal(urgent.open,true);assert.equal(urgent.parentElement,b.element('body'));
+ assert.equal(calls.includes('/api/announcement'),false);
+ urgent.querySelector('#urgent-close').onclick();await settle();
+ assert.equal(urgent.open,false);assert.equal(b.element('dialog2').open,true);assert.match(b.element('dialog2').innerHTML,/announcement-heading/);
+ assert.equal(calls.filter(url=>url==='/api/announcement').length,1);
+});
+
+test('긴급공지는 웹·설치앱 모두 4시간 숨김을 무시하고 닫기만 제공하며 Esc·네이티브 뒤로가기로 종료되지 않는다',async()=>{
+ for(const userAgent of ['Mozilla/5.0 Macintosh Chrome','Mobile PaperChatAndroid/3','Mobile PaperChatIOS/4']){
+  const calls=[],b=browser({userAgent,urgentReply:urgentFixture,fetchReply:url=>{calls.push(url);return announcementFixture;}});
+  announcementMember(b);const until=String(Date.now()+4*60*60*1000);b.local.set('paperchat.announcement.hiddenUntil',until);
+  await b.run('syncUrgentAnnouncement(true)');const d=b.run('urgentDialog');
+  assert.equal(d.open,true);assert.equal(d.attributes['aria-modal'],'true');assert.match(d.innerHTML,/긴급 &lt;안내&gt;/);assert.match(d.innerHTML,/&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.doesNotMatch(d.innerHTML,/<img|4시간|announcement-hide|announcement-android|announcement-ios/);assert.equal((d.innerHTML.match(/<button\b/g)||[]).length,1);
+  let cancelled=false;d.handlers.cancel({preventDefault(){cancelled=true;}});assert.equal(cancelled,true);assert.equal(d.open,true);
+  assert.equal(b.run('window.paperChatBack()'),true);assert.equal(d.open,true);assert.equal(b.run('urgentSeenRevision'),null);
+  d.querySelector('#urgent-close').onclick();await settle();assert.equal(d.open,false);assert.equal(b.run('urgentSeenRevision'),'urgent-1');
+  assert.equal(b.local.get('paperchat.announcement.hiddenUntil'),until);assert.equal(calls.includes('/api/announcement'),false);
+ }
+});
+
+test('긴급공지 revision은 열린 화면과 닫은 공지의 중복을 막고 같은 내용의 재게시를 다시 표시한다',async()=>{
+ let data={...urgentFixture};const b=browser({urgentReply:()=>data,fetchReply:()=>({...announcementFixture,enabled:false})});
+ announcementMember(b);await b.run('syncUrgentAnnouncement(true)');const first=b.run('urgentDialog');
+ await b.run('syncUrgentAnnouncement(true)');assert.equal(b.run('urgentDialog'),first);assert.equal(b.element('dialog2').open,undefined);
+ first.querySelector('#urgent-close').onclick();await settle();await b.run('syncUrgentAnnouncement(true)');assert.equal(b.run('urgentDialog'),null);
+ data={...urgentFixture,revision:'urgent-2',publishedAt:urgentFixture.publishedAt+1};await b.run('syncUrgentAnnouncement(true)');
+ const second=b.run('urgentDialog');assert.notEqual(second,first);assert.equal(second.open,true);assert.equal(second.dataset.revision,'urgent-2');
+});
+
+test('긴급공지는 일반 모달과 작성 중 입력을 유지하고 앱 화면이 다시 그려져도 body에서 열린 상태를 유지한다',async()=>{
+ const b=browser({urgentReply:urgentFixture,fetchReply:()=>({...announcementFixture,enabled:false})});announcementMember(b);
+ b.run('privacyPage()');const ordinary=b.element('dialog1');b.element('#body').value='작성 중인 글';b.element('#body').selectionStart=2;b.element('#body').selectionEnd=4;
+ const before=b.element('#app').innerHTML,view=b.run('epoch');await b.run('syncUrgentAnnouncement(true)');const urgent=b.run('urgentDialog');
+ assert.equal(ordinary.open,true);assert.equal(urgent.open,true);assert.equal(b.element('#app').innerHTML,before);assert.equal(b.run('epoch'),view);
+ assert.equal(b.element('#body').value,'작성 중인 글');assert.equal(b.element('#body').selectionStart,2);assert.equal(b.element('#body').selectionEnd,4);
+ b.run("paint('다른 회원 화면','book','바뀐 내용')");assert.equal(ordinary.open,false);assert.equal(urgent.open,true);assert.equal(urgent.parentElement,b.element('body'));
+ assert.match(b.element('#app').innerHTML,/바뀐 내용/);urgent.querySelector('#urgent-close').onclick();await settle();
+ assert.equal(urgent.open,false);assert.match(b.element('#app').innerHTML,/바뀐 내용/);
+});
+
+test('접속 중 긴급공지 SSE와 재연결은 최신 공지를 확인하고 이전 연결의 이벤트를 무시한다',async()=>{
+ const {sources,EventSource}=eventStreams();let data=noUrgent,requests=0;
+ const b=browser({EventSource,urgentReply:()=>{requests++;return data;},fetchReply:()=>({stage:'member',memberId:'notice-member',total:0})});announcementMember(b);
+ b.local.set('paperchat.announcement.hiddenUntil',String(Date.now()+60000));b.run('updatePresence()');await settle();
+ data=urgentFixture;sources[0].emit('urgent-announcement',{revision:'urgent-1'});await settle();assert.equal(b.run('urgentDialog.open'),true);assert.equal(requests,1);
+ b.run('urgentDialog').querySelector('#urgent-close').onclick();sources[0].emit('urgent-announcement',{revision:'urgent-1'});await settle();assert.equal(b.run('urgentDialog'),null);
+ b.run('window.paperChatPresence(false)');assert.equal(sources[0].closed,true);const oldCount=requests;
+ data={...urgentFixture,revision:'urgent-2'};sources[0].emit('urgent-announcement',{revision:'urgent-2'});await settle();assert.equal(requests,oldCount);
+ b.run('window.paperChatPresence(true)');await settle();assert.equal(sources.length,2);assert.equal(b.run('urgentDialog.dataset.revision'),'urgent-2');
+ b.run('urgentDialog').querySelector('#urgent-close').onclick();data={...urgentFixture,revision:'urgent-3'};
+ sources[1].emit('open');await settle();assert.equal(b.run('urgentDialog.dataset.revision'),'urgent-3');
+});
+
+test('긴급공지 조회 중 중복 실시간 신호는 마지막 상태를 다시 확인하며 이후 비활성화는 열린 공지를 닫는다',async()=>{
+ const replies=[];let calls=0;const b=browser({urgentReply:()=>{calls++;return new Promise(resolve=>replies.push(resolve));},fetchReply:()=>({...announcementFixture,enabled:false})});announcementMember(b);
+ const first=b.run('syncUrgentAnnouncement(true)');b.run('syncUrgentAnnouncement(true)');b.run('syncUrgentAnnouncement(true)');assert.equal(calls,1);
+ replies.shift()(urgentFixture);await settle();assert.equal(calls,2);assert.equal(b.run('urgentDialog.dataset.revision'),'urgent-1');
+ replies.shift()({...urgentFixture,revision:'urgent-2'});await first;assert.equal(b.run('urgentDialog.dataset.revision'),'urgent-2');assert.equal(calls,2);
+ const open=b.run('urgentDialog'),stopping=b.run('syncUrgentAnnouncement(true)');replies.shift()({...noUrgent,revision:'disabled-3'});await stopping;
+ assert.equal(open.open,false);assert.equal(b.run('urgentDialog'),null);assert.equal(b.run('urgentData.enabled'),false);
+});
+
+test('먼저 요청한 일반 공지가 늦게 도착해도 긴급공지를 덮지 않고 닫은 후 일반 공지를 다시 확인한다',async()=>{
+ let releaseNormal,normalCalls=0;const b=browser({urgentReply:urgentFixture,fetchReply:()=>++normalCalls===1?new Promise(resolve=>releaseNormal=resolve):announcementFixture});
+ announcementMember(b);const normal=b.run('maybeAnnouncement()');await b.run('syncUrgentAnnouncement(true)');const urgent=b.run('urgentDialog');
+ releaseNormal(announcementFixture);await normal;
+ assert.equal(urgent.open,true);assert.equal(b.element('dialog2').open,undefined);assert.equal(b.run('announcementRequested'),false);
+ urgent.querySelector('#urgent-close').onclick();await settle();assert.equal(normalCalls,2);assert.equal(b.element('dialog2').open,true);
+ assert.match(b.element('dialog2').innerHTML,/announcement-heading/);assert.equal(b.run('urgentDialog'),null);
+});
+
+test('로그아웃 뒤 도착한 긴급공지는 표시하지 않고 다음 계정의 새 요청만 반영한다',async()=>{
+ let release,calls=0;const b=browser({pathname:'/',urgentReply:()=>++calls===1?new Promise(resolve=>release=resolve):{...urgentFixture,title:'다음 계정 긴급공지',revision:'urgent-next'},fetchReply:url=>url==='/api/announcement'?{...announcementFixture,enabled:false}:{}});
+ announcementMember(b);b.run('settings()');const old=b.run('syncUrgentAnnouncement(true)');await b.element('#logout').handlers.click({});
+ assert.equal(b.location.redirect,'/');assert.equal(b.run('urgentData'),null);assert.equal(b.run('urgentChecked'),false);
+ announcementMember(b);b.run("me.id='next-member'");b.run('syncUrgentAnnouncement(true)');
+ release({...urgentFixture,title:'이전 계정 긴급공지'});await old;await settle();
+ assert.equal(calls,2);assert.equal(b.run('urgentDialog.open'),true);assert.match(b.run('urgentDialog.innerHTML'),/다음 계정 긴급공지/);assert.doesNotMatch(b.run('urgentDialog.innerHTML'),/이전 계정/);
+});
+
+test('긴급공지 조회 실패·잘못된 응답은 회원 화면과 입력을 유지하고 다음 정상 확인에서 회복한다',async()=>{
+ for(const failed of [{$status:503,$body:{error:'offline'}},{enabled:true,title:'잘못된 응답',body:'revision 없음'}]){
+  let data=failed;const b=browser({urgentReply:()=>data,fetchReply:()=>announcementFixture});announcementMember(b);b.run('urgentChecked=false');b.element('#body').value='계속 작성 중';const html=b.element('#app').innerHTML;
+  await b.run('syncUrgentAnnouncement(true)');assert.equal(b.run('urgentDialog'),null);assert.equal(b.run('urgentChecked'),false);assert.equal(b.run('nextUrgentSync'),0);
+  assert.equal(b.element('#app').innerHTML,html);assert.equal(b.element('#body').value,'계속 작성 중');
+  data=noUrgent;await b.run('syncUrgentAnnouncement(true)');await settle();assert.equal(b.run('urgentChecked'),true);assert.equal(b.element('dialog1').open,true);
+ }
+});
+
+test('긴급공지는 회원 화면 준비 전과 제한·관리자·백그라운드에서 조회하지 않으며 복구코드 화면에서는 우선 표시한다',async()=>{
+ for(const setup of ["stage='gate'","stage='details'","stage='restricted'","stage='policy'","memberViewReady=false","nativeForeground=false"]){
+  let calls=0;const b=browser({urgentReply:()=>{calls++;return urgentFixture;},fetchReply:()=>({})});announcementMember(b);b.run(setup);await b.run('syncUrgentAnnouncement(true)');assert.equal(calls,0);assert.equal(b.run('urgentDialog'),null);
+ }
+ let adminCalls=0;const admin=browser({pathname:'/codenotekyh',urgentReply:()=>{adminCalls++;return urgentFixture;},fetchReply:()=>({})});announcementMember(admin);await admin.run('syncUrgentAnnouncement(true)');assert.equal(adminCalls,0);
+ const b=browser({urgentReply:urgentFixture,fetchReply:()=>({code:'RECOVERY'})});announcementMember(b);b.run('accountState.needsRecoveryCopy=true');await b.run('recoveryPage()');await b.run('syncUrgentAnnouncement(true)');
+ assert.match(b.element('#app').innerHTML,/개인 복구코드/);assert.equal(b.run('urgentDialog.open'),true);
+ b.run('urgentDialog').querySelector('#urgent-close').onclick();await settle();assert.equal(b.element('dialog2').open,undefined);
+});
+
+test('보호 화면으로 잠시 닫힌 긴급공지는 확인 처리하지 않고 앱 복귀 때 다시 표시한다',async()=>{
+ const b=browser({urgentReply:urgentFixture,fetchReply:()=>({...announcementFixture,enabled:false})});announcementMember(b);await b.run('syncUrgentAnnouncement(true)');const first=b.run('urgentDialog');
+ b.run('veil(true)');assert.equal(first.open,false);assert.equal(b.run('urgentSeenRevision'),null);
+ b.run('veil(false)');await b.run('syncUrgentAnnouncement(true)');assert.equal(b.run('urgentDialog.open'),true);assert.notEqual(b.run('urgentDialog'),first);
+});
+
+test('긴급공지와 일반 모달 뒤에 도착한 메시지는 읽지 않고 닫은 뒤 읽음을 재개한다',async()=>{
+ for(const kind of ['urgent','privacy']){
+  const reads=[];let messages=[{id:1,author:'peer',nick:'상대',body:'이미 본 메시지',sent:1,visibility:'visible'}];
+  const b=browser({urgentReply:urgentFixture,fetchReply:(url,options)=>{
+   if(url.endsWith('/messages'))return messages;
+   if(url.endsWith('/read'))reads.push(JSON.parse(options.body).through);
+   if(url==='/api/announcement')return {...announcementFixture,enabled:false};
+   return {total:0};
+  }});
+  announcementMember(b);await b.run("conversation('room','상대',false,rooms,'peer')");assert.deepEqual(reads,[1]);
+  const input=b.element('#body');input.value='보내지 않은 초안';input.selectionStart=2;input.selectionEnd=5;
+  if(kind==='urgent')await b.run('syncUrgentAnnouncement(true)');else b.run('privacyPage()');
+  const dialog=b.run("document.querySelector('dialog[open]')");assert.equal(dialog.open,true);
+  messages=[...messages,{id:2,author:'peer',nick:'상대',body:'모달 뒤에 도착한 메시지',sent:2,visibility:'visible'}];
+  const polling=[...b.intervals.values()].find(timer=>timer.ms===2500);assert.ok(polling);
+  polling.fn();await settle();b.element('#log').handlers.scroll();b.run('chatLayout.resize()');await settle();
+  assert.equal(dialog.open,true);assert.deepEqual(reads,[1]);
+  assert.match(b.element('#log').innerHTML,/모달 뒤에 도착한 메시지/);
+  dialog.querySelector(kind==='urgent'?'#urgent-close':'#privacy-close').onclick();await settle();
+  assert.equal(dialog.open,false);polling.fn();await settle();assert.deepEqual(reads,[1,2]);
+  assert.equal(input.value,'보내지 않은 초안');assert.equal(input.selectionStart,2);assert.equal(input.selectionEnd,5);
+ }
+});
+
+test('긴급공지를 읽는 중 제한 또는 약관 동의 상태가 되면 공지를 닫고 해당 계정 화면으로 전환한다',async()=>{
+ for(const stage of ['restricted','policy']){
+  let urgentCalls=0;
+  const state={stage,memberId:'notice-member',profile:null,restrictedUntil:Date.now()+3600000};
+  const b=browser({urgentReply:()=>{urgentCalls++;return urgentFixture;},fetchReply:url=>
+   url==='/api/state'||url==='/api/status?member=1'?state:{total:0}});
+  announcementMember(b);await b.run('syncUrgentAnnouncement(true)');const dialog=b.run('urgentDialog');
+  assert.equal(dialog.open,true);assert.equal(urgentCalls,1);
+  // Use the ordinary background status check, without veil() closing the modal first.
+  await b.run('pulse()');
+  assert.equal(b.run('stage'),stage);assert.equal(dialog.open,false);assert.equal(b.run('urgentDialog'),null);
+  assert.equal(b.run('urgentSeenRevision'),null);assert.equal(dialog.parentElement,null);
+  assert.match(b.element('#app').innerHTML,stage==='restricted'?/계정 이용 제한/:/이용규칙 확인/);
+  await b.run('syncUrgentAnnouncement(true)');assert.equal(urgentCalls,1);
+ }
+});
+
+test('관리자 긴급공지 폼은 게시 필수값을 검사하고 저장·게시중단 값을 정확히 보낸다',async()=>{
+ const writes=[],b=browser({pathname:'/codenotekyh',fetchReply:(url,options)=>{
+  assert.equal(url,'/api/admin/urgent-announcement');if(options.method==='GET')return urgentFixture;
+  const value=JSON.parse(options.body);writes.push(value);return {...value,revision:'saved-'+writes.length,publishedAt:value.enabled?urgentFixture.publishedAt:null};
+ }});
+ await b.run('adminUrgentAnnouncement()');const html=b.element('#app').innerHTML;assert.match(html,/id="urgentEnabled"/);assert.match(html,/4시간 숨김은 적용되지/);assert.match(html,/같은 내용이라도 다시 게시/);assert.match(html,/긴급 &lt;안내&gt;/);
+ await submitForm(b,{enabled:'on',title:' ',body:'내용'});assert.equal(writes.length,0);assert.match(b.element('#error').textContent,/제목과 내용/);
+ await submitForm(b,{enabled:'on',title:' 긴급 안내 ',body:' 첫 줄\n둘째 줄 '});assert.deepEqual(writes,[{enabled:true,title:'긴급 안내',body:'첫 줄\n둘째 줄'}]);
+ assert.equal(b.element('#urgentTitle').value,'긴급 안내');assert.match(b.element('#urgentPublished').textContent,/마지막 게시/);
+ await submitForm(b,{enabled:'',title:'',body:''});assert.deepEqual(writes[1],{enabled:false,title:'',body:''});assert.match(b.element('#urgentPublished').textContent,/게시가 중단/);
+});
+
 test('키보드 애니메이션 동안 하단을 유지하고 과거 대화 스크롤과 초안은 보존한다',()=>{
  const frames=new Map();let seq=0;const b=browser({windowProps:{requestAnimationFrame:fn=>{frames.set(++seq,fn);return seq;},cancelAnimationFrame:id=>frames.delete(id)},fetchReply:()=>({})});
  const flush=()=>{const jobs=[...frames.values()];frames.clear();for(const fn of jobs)fn();};
@@ -1077,4 +1277,80 @@ test('전송 응답을 기다리며 새로 작성한 문장은 이전 전송 완
  const form=b.element('form'),input=b.element('#body');form.values={body:'첫 번째 메시지'};input.value='첫 번째 메시지';
  const pending=form.handlers.submit({preventDefault(){},currentTarget:form});await new Promise(setImmediate);input.value='이어서 쓰는 다음 메시지';release({});await pending;
  assert.deepEqual(sent,[{body:'첫 번째 메시지'}]);assert.equal(input.value,'이어서 쓰는 다음 메시지');
+});
+
+
+test('검색 강조는 Unicode 소문자 확장·이모지·HTML 원문을 안전하게 유지한다',()=>{
+ const b=browser({fetchReply:()=>({})});
+ assert.equal(b.run("highlighted('İİİ찾을내용','찾을내용')"),'İİİ<mark>찾을내용</mark>');
+ assert.equal(b.run("highlighted('😀İABC <b>abc</b>','abc')"),'😀İ<mark>ABC</mark> &lt;b&gt;<mark>abc</mark>&lt;/b&gt;');
+});
+
+test('회원 메시지에는 개별 신고 버튼이 없고 채팅 상단 프로필 오른쪽에 신고하기를 둔다',async()=>{
+ const b=browser({fetchReply:()=>[]});b.run("stage='member';me={id:'me'}");
+ await b.run("conversation('room','상대',false,rooms,'peer')");
+ assert.match(b.element('.hero').innerHTML,/id="peerProfile"[\s\S]*id="reportConversation"/);
+ for(const expires of [null,Date.now()+99999]){
+  const html=b.run('message('+JSON.stringify({id:1,author:'peer',nick:'상대',body:'안녕',sent:100,visibility:'visible',viewable:1,expires})+',false)');assert.doesNotMatch(html,/data-report|>신고</);
+ }
+});
+
+test('대화 신고는 사진 묶음 대상 방과 사유를 보내며 작성 중인 초안을 유지한다',async()=>{
+ const requests=[];let refreshes=0;
+ const b=browser({fetchReply:(url,opts)=>{requests.push([url,JSON.parse(opts.body)]);return {};}});b.run("stage='member';me={id:'me'};paint('대화','chat','작성중화면');conversationReport('room',async()=>{})");b.element('#body').value='전송하지 않은 초안';
+ const f=b.element('#conversationReportForm');f.values={reason:'괴롭힘·기타 위반'};
+ await f.handlers.submit({preventDefault(){}});
+ assert.deepEqual(requests,[['/api/report',{kind:'conversation',room:'room',reason:'괴롭힘·기타 위반'}]]);assert.equal(b.element('dialog1').open,false);assert.equal(b.element('#body').value,'전송하지 않은 초안');assert.match(b.element('#app').innerHTML,/작성중화면/);
+});
+
+test('대화 신고 중 중복 전송을 막고 실패하면 신고 사유와 초안을 유지한다',async()=>{
+ let release,count=0;const b=browser({fetchReply:()=>{count++;return new Promise(r=>release=r);}});b.run("stage='member';me={id:'me'};conversationReport('room',async()=>{})");b.element('#body').value='초안';const f=b.element('#conversationReportForm');f.values={reason:'괴롭힘·기타 위반'};
+ const pending=f.handlers.submit({preventDefault(){}});await f.handlers.submit({preventDefault(){}});assert.equal(count,1);release({$status:400,$body:{error:'잠시 후 다시 신고해 주세요.'}});await pending;
+ assert.equal(b.element('dialog1').open,true);assert.equal(f.values.reason,'괴롭힘·기타 위반');assert.equal(b.element('#body').value,'초안');assert.match(b.element('#conversationReportError').textContent,/다시 신고/);assert.equal(b.element('[type=submit]').disabled,false);
+});
+
+test('관리자 대화 신고는 묶음 사진과 원래 대화 열람을 함께 제공한다',()=>{
+ const b=browser({pathname:'/codenotekyh',fetchReply:()=>({})});
+ b.run('reviewItem('+JSON.stringify({id:4,nick:'신고된 회원',area:'서울 동부',sender:'peer',reporter:'me',reason:'괴롭힘·기타 위반',conversationRoom:'room',photoCount:2,photos:[{id:10,viewable:1,expires:Date.now()+99999},{id:11,viewable:0,expires:1}],excerpt:'검토할 대화'})+',false)');
+ assert.match(b.element('#app').innerHTML,/대화 신고 검토/);assert.match(b.element('#app').innerHTML,/신고 사진 2장 확인/);assert.match(b.element('#app').innerHTML,/신고된 대화 보기/);
+ b.element('#showPhotos').handlers.click({});assert.match(b.element('#preview').innerHTML,/\/api\/admin\/photos\/10/);assert.doesNotMatch(b.element('#preview').innerHTML,/\/api\/admin\/photos\/11/);assert.match(b.element('#preview').innerHTML,/사진이 만료되었거나 삭제/);
+});
+
+
+test('가입자 현황 전체·지역 선택은 상세 및 페이지 이동에도 유지되고 필터 변경은 첫 페이지로 간다',async()=>{
+ const requests=[],page={items:[{id:'p',nick:'지역회원',area:'서울 동부',status:'active'}],more:true,counts:{active:51,inactive:1,withdrawn:0}};
+ const b=browser({pathname:'/codenotekyh',fetchReply:url=>{requests.push(url);if(url==='/api/regions')return {'서울':['동부','서부'],'경기':['남부','북부']};if(url==='/api/admin/members/p')return {id:'p',nick:'지역회원',status:'active',area:'서울 동부'};return page;}});
+ await b.run('membersPage()');assert.equal(requests.at(-1),'/api/admin/members?offset=0');assert.match(b.element('#app').innerHTML,/aria-pressed="true">전체/);
+ await b.element('#scope-area').handlers.click({});assert.equal(new URL(requests.at(-1),'https://example.com').searchParams.get('area'),'서울 동부');assert.match(b.element('#app').innerHTML,/지역 정보가 남지 않아/);
+ await b.element('#nextPage').handlers.click({});const next=new URL(requests.at(-1),'https://example.com');assert.equal(next.searchParams.get('offset'),'50');assert.equal(next.searchParams.get('area'),'서울 동부');
+ await b.run("memberDetail('p',()=>membersPage(50))");await b.element('#back').handlers.click({});assert.equal(new URL(requests.at(-1),'https://example.com').searchParams.get('area'),'서울 동부');
+ await b.element('#scope-all').handlers.click({});assert.equal(requests.at(-1),'/api/admin/members?offset=0');
+ b.run("scopes.members={regional:true,area:'서울 서부'}");await b.run("membersPage(0,null,'inactive')");assert.equal(new URL(requests.at(-1),'https://example.com').searchParams.get('area'),'서울 서부');assert.equal(new URL(requests.at(-1),'https://example.com').searchParams.get('filter'),'inactive');
+});
+
+test('가입자 지역 조회의 늦은 응답은 나중에 선택한 지역을 덮지 않는다',async()=>{
+ const resolvers=[],page={items:[],more:false,counts:{active:0,inactive:0,withdrawn:0}};
+ const b=browser({pathname:'/codenotekyh',fetchReply:()=>new Promise(resolve=>resolvers.push(resolve))});
+ b.run("regions={'서울':['동부','서부']};scopes.members={regional:true,area:'서울 동부'}");const old=b.run('membersPage()');b.run("scopes.members.area='서울 서부'");const latest=b.run('membersPage()');
+ resolvers[0](page);await old;resolvers[1](page);await latest;assert.match(b.element('#app').innerHTML,/서울 서부/);assert.doesNotMatch(b.element('#app').innerHTML,/서울 동부 · 가입/);
+});
+
+
+test('관리자 메인은 링크세팅으로 통합하고 30일 미접속 메뉴는 가입자 현황 안에 둔다',async()=>{
+ const requests=[],b=browser({pathname:'/codenotekyh',fetchReply:url=>{requests.push(url);return {items:[],more:false,counts:{active:3,inactive:1,withdrawn:0}};}});
+ await b.run('adminHome()');const home=b.element('#app').innerHTML;assert.match(home,/id="linkSettings"/);assert.doesNotMatch(home,/id="url"|id="downloadLinks"|id="inactiveMembers"/);
+ await b.element('#members').handlers.click({});assert.match(b.element('#app').innerHTML,/id="members-all" aria-pressed="true"/);assert.match(b.element('#app').innerHTML,/id="members-inactive"/);
+ await b.element('#members-inactive').handlers.click({});assert.equal(requests.at(-1),'/api/admin/members?offset=0&filter=inactive');assert.match(b.element('#app').innerHTML,/id="members-inactive" aria-pressed="true"/);
+ await b.element('#members-all').handlers.click({});assert.equal(requests.at(-1),'/api/admin/members?offset=0');
+});
+
+
+test('관리자 메인 다섯 메뉴는 지정한 순서이며 일반·긴급공지는 공지설정 안에서 연다',async()=>{
+ const b=browser({pathname:'/codenotekyh',fetchReply:url=>url.includes('urgent')?{enabled:false,title:'긴급공지',body:''}:url.includes('announcement')?{enabled:false,title:'공지',body:'',androidEnabled:false,iosEnabled:false,androidUrl:'',iosUrl:''}: {}});
+ await b.run('adminHome()');const html=b.element('#app').innerHTML;
+ assert.deepEqual([...html.matchAll(/<button id="([^"]+)" class="menu /g)].map(m=>m[1]),['members','monitor','announcements','linkSettings','reset']);
+ assert.match(html,/가입자 현황/);assert.match(html,/대화 모니터링/);assert.match(html,/공지설정/);assert.match(html,/링크관리/);assert.match(html,/서버초기화/);
+ await b.element('#announcements').handlers.click({});assert.match(b.element('#app').innerHTML,/id="announcement"/);assert.match(b.element('#app').innerHTML,/id="urgentAnnouncement"/);
+ await b.element('#urgentAnnouncement').handlers.click({});assert.match(b.element('#app').innerHTML,/긴급공지 설정/);await b.element('#back').handlers.click({});assert.match(b.element('#app').innerHTML,/id="announcement"/);
+ await b.element('#announcement').handlers.click({});await b.element('#back').handlers.click({});assert.match(b.element('#app').innerHTML,/id="urgentAnnouncement"/);
 });

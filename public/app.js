@@ -31,13 +31,14 @@ const paths={
 const icon=n=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[n]||paths.mail}</svg>`;
 let me,regions,stage,activeTimer,epoch=0,currentBack=null,backBusy=false,unreadTotal=0,unreadRequest=0,accountState={};
 let accountRevision=0,bootSerial=0,presenceTimer=null,nativeForeground=window.paperChatNativeForeground!==false,pageForeground=true,lastPresence=null,lastPresenceAt=0;
-let memberEvents=null,roomEventHandler=null,chatLayout=null;
+let memberEvents=null,roomEventHandler=null,chatLayout=null,memberViewReady=false;
 const memberStages=new Set(['member','restricted','policy']);
 const hasMemberSession=()=>memberStages.has(stage);
 const currentMemberId=()=>me?.id||accountState.memberId||null;
 const staleRequest=()=>Object.assign(new Error('화면이 변경되어 이전 요청을 종료했어요.'),{stale:true});
 // Native Android back and the iOS edge gesture share the same screen navigation.
 window.paperChatBack=()=>{
+  if(urgentDialog?.open)return true;
   const dialog=document.querySelector('dialog[open]');
   if(dialog){dialog.close();return true;}
   if(backBusy)return true;
@@ -58,7 +59,7 @@ window.visualViewport?.addEventListener('resize',fitViewport);
 window.visualViewport?.addEventListener('scroll',fitViewport);
 window.addEventListener('resize',fitViewport);
 fitViewport();
-const scopes={people:{},rooms:{},monitor:{}};
+const scopes={people:{},rooms:{},monitor:{},members:{}};
 function resetScopes(){for(const scope of Object.values(scopes)){scope.regional=false;scope.area='';}}
 const draft={nick:'',birthDate:'',gender:'',province:'',district:'',memo:''};
 const err=e=>{if(e?.stale)return;const el=$('#error');if(el)el.textContent=e.message||String(e);};
@@ -71,7 +72,7 @@ async function api(path,body,{keepalive=false}={}) {
   const expectedMember=!admin&&memberId&&!path.startsWith('admin/')&&!['status','key','account/login'].includes(path)?memberId:null;
   const headers=body===undefined?{}:{'Content-Type':'application/json'};
   if(expectedMember)headers['X-PaperChat-Member']=expectedMember;
-  const background=['status','presence','unread','push/device','push/web','push/web-config'].includes(path);
+  const background=['status','presence','unread','push/device','push/web','push/web-config','urgent-announcement'].includes(path);
   const controller=['status','presence'].includes(path)?new AbortController():null;
   const timer=controller?setTimeout(()=>controller.abort(),8000):null;
   let res;
@@ -97,7 +98,8 @@ function clearMemberSession(message=''){
   accountRevision++;bootSerial++;unreadRequest++;
   closeMemberEvents();
   clearInterval(activeTimer);clearInterval(presenceTimer);presenceTimer=null;
-  me=null;accountState={};stage='gate';unreadTotal=0;nextPushSync=0;announcementRequested=false;
+  me=null;accountState={};stage='gate';unreadTotal=0;nextPushSync=0;announcementRequested=false;memberViewReady=false;
+  urgentChecked=false;urgentSeenRevision=null;urgentData=null;nextUrgentSync=0;
   currentBack=null;backBusy=false;lastPresence=null;lastPresenceAt=0;resetScopes();
   for(const key of Object.keys(draft))draft[key]='';
   sessionStorage.clear();closeDialogs();main.replaceChildren();veil(false);gate();
@@ -129,10 +131,12 @@ function syncMemberEvents(){
     if(!change||typeof change.room!=='string')return;
     Promise.resolve(roomEventHandler?.(change)).catch(err);void syncUnread();
   });
+  source.addEventListener('urgent-announcement',()=>{if(current())void syncUrgentAnnouncement(true);});
   source.addEventListener('open',()=>{
     if(!current())return;
     // Fetch changes missed while disconnected without replacing the composer.
     Promise.resolve(roomEventHandler?.({refresh:true})).catch(err);void syncUnread();
+    void syncUrgentAnnouncement(true);
   });
   source.addEventListener('error',()=>{if(current())void pulse();});
 }
@@ -179,7 +183,7 @@ const actions=(...parts)=>`<div class="actions">${parts.join('')}</div>`;
 const notice='<p class="error" id="error" role="alert"></p>';
 function paint(title,mark,body,{sub='',back,wide=false,nav=''}={}) {
   chatLayout?.dispose();chatLayout=null;
-  closeDialogs();
+  closeDialogs(!admin&&stage==='member');
   clearInterval(activeTimer);epoch++;roomEventHandler=null;main.className=wide?'wide':'';
   currentBack=back||(nav&&!nav.includes('id="tab-people" class="active"')?people:null);
   back=currentBack;
@@ -214,7 +218,7 @@ function modal(title,desc,label,fn){
   main.append(d);d.showModal();d.onclose=()=>d.remove();
   d.querySelector('#dismiss').onclick=()=>d.close();d.querySelector('#proceed').onclick=async()=>{d.close();try{await fn();}catch(e){err(e);}};
 }
-function closeDialogs(){document.querySelectorAll('dialog[open]').forEach(d=>d.close());}
+function closeDialogs(keepUrgent=false){document.querySelectorAll('dialog[open]').forEach(d=>{if(!keepUrgent || d!==urgentDialog)d.close();});}
 const rulesCard=(showPrivacy=true)=>`<aside class="letter"><h2>${icon('book')}이용규칙</h2><div class="policy-links">${showPrivacy?act('privacy','개인정보 처리방침','textBtn'):''}<a class="textBtn" href="/support">운영자 문의</a></div><ul>${rules.map(r=>'<li>'+esc(r)+'</li>').join('')}</ul></aside>`;
 function privacyPage(){
   if(document.querySelector('dialog[open]'))return;
@@ -265,6 +269,24 @@ function reportUI(target,back){
     await back();note('신고를 접수했어요.');
   });
 }
+function conversationReport(room,refresh){
+  const view=epoch,revision=accountRevision,d=document.createElement('dialog');d.className='dialog report-dialog';
+  d.setAttribute('aria-labelledby','conversation-report-heading');
+  d.innerHTML=`<h2 id="conversation-report-heading">신고하기</h2><form id="conversationReportForm"><label for="conversationReason">신고 사유</label><select id="conversationReason" name="reason" required><option value="">선택해 주세요</option>${reasons.map(r=>`<option>${esc(r)}</option>`).join('')}</select><p class="note">이 대화방에서 상대가 보낸 사진이 모두 검토 중으로 바뀌어요. 이미 삭제되거나 만료된 사진은 다시 표시되지 않아요.</p><p id="conversationReportError" class="error" role="alert"></p>${actions(act('cancelConversationReport','취소'),btn('신고 접수','danger fill'))}</form>`;
+  d.onclose=()=>d.remove();main.append(d);d.showModal();
+  d.querySelector('#cancelConversationReport').onclick=()=>d.close();
+  const f=d.querySelector('#conversationReportForm'),submit=f.querySelector('[type=submit]'),error=d.querySelector('#conversationReportError');
+  f.addEventListener('submit',async event=>{
+    event.preventDefault();if(submit.disabled)return;submit.disabled=true;error.textContent='';
+    try{
+      await api('report',{kind:'conversation',room,reason:new FormData(f).get('reason')});
+      if(view!==epoch||revision!==accountRevision)return;
+      d.close();await refresh();note('신고를 접수했어요. 상대가 보낸 사진은 검토 중으로 표시돼요.');
+    }catch(e){if(!e.stale&&view===epoch&&revision===accountRevision)error.textContent=e.message;}
+    finally{submit.disabled=false;}
+  });
+}
+
 function blockPeer(id,back){
   modal('사용자 차단','서로의 프로필이 숨겨지고 두 사람의 채팅방이 삭제돼요. 사진은 전송 후 12시간에 만료돼요.','차단하기',async()=>{await api('blocks',{peer:id});await back();note('사용자를 차단했어요.');void syncUnread();});
 }
@@ -316,6 +338,50 @@ function wireDownloads(){
 }
 const announcementHideKey='paperchat.announcement.hiddenUntil',announcementHideDuration=4*60*60*1000;
 let announcementRequested=false;
+let urgentDialog=null,urgentData=null,urgentSeenRevision=null,urgentChecked=false,urgentSync=null,urgentQueued=false,nextUrgentSync=0;
+const urgentEligible=()=>!admin && stage==='member' && Boolean(me?.id) && memberViewReady && !leaving && foregroundVisible();
+function renderUrgentAnnouncement(){
+  if(!urgentEligible())return;
+  const data=urgentData;
+  if(!data?.enabled || data.revision===urgentSeenRevision){urgentDialog?.close();return;}
+  if(urgentDialog?.open && urgentDialog.dataset.revision===data.revision)return;
+  urgentDialog?.close();
+  const d=document.createElement('dialog');urgentDialog=d;d.className='dialog announcement-dialog urgent-dialog';d.dataset.revision=data.revision;
+  d.setAttribute('aria-labelledby','urgent-heading');d.setAttribute('aria-modal','true');
+  d.innerHTML=`<header class="announcement-header" tabindex="0"><p class="urgent-label">긴급공지</p><h2 id="urgent-heading">${esc(data.title)}</h2></header>
+    <div class="announcement-content" tabindex="0">${esc(data.body)}</div>
+    <footer class="announcement-footer"><div class="announcement-buttons">${act('urgent-close','닫기','primary')}</div></footer>`;
+  // Keep the page, composer and any ordinary dialog intact underneath this one.
+  document.body.append(d);
+  d.addEventListener('cancel',event=>event.preventDefault());
+  d.onclose=()=>{if(urgentDialog===d)urgentDialog=null;d.remove();};
+  d.querySelector('#urgent-close').onclick=()=>{
+    urgentSeenRevision=data.revision;d.close();void maybeAnnouncement();
+  };
+  d.showModal();
+}
+async function syncUrgentAnnouncement(force=false){
+  if(!urgentEligible())return;
+  if(urgentSync){if(force)urgentQueued=true;return urgentSync;}
+  if(!force && Date.now()<nextUrgentSync)return;
+  const revision=accountRevision,member=me.id;
+  const current=()=>urgentEligible() && revision===accountRevision && member===me?.id;
+  urgentSync=(async()=>{
+    do{
+      urgentQueued=false;nextUrgentSync=Date.now()+12000;
+      const data=await api('urgent-announcement');if(!current())return;
+      if(typeof data.enabled!=='boolean' || typeof data.title!=='string' || typeof data.body!=='string'
+        || (data.enabled && (typeof data.revision!=='string' || !data.revision)))throw new Error('긴급공지 응답을 확인할 수 없어요.');
+      urgentData=data;urgentChecked=true;renderUrgentAnnouncement();
+    }while(urgentQueued && current());
+  })().catch(()=>{if(current())nextUrgentSync=0;}).finally(()=>{
+    urgentSync=null;
+    if(current())void maybeAnnouncement();
+    // A previous account's request may have finished after a new login.
+    else if(urgentEligible())void syncUrgentAnnouncement(true);
+  });
+  return urgentSync;
+}
 function announcementHidden(){
   try{
     const until=Number(localStorage.getItem(announcementHideKey)),now=Date.now();
@@ -349,9 +415,11 @@ function showAnnouncement(data){
 }
 async function maybeAnnouncement(){
   if(admin || stage!=='member' || !me?.id || accountState.needsRecoveryCopy || announcementRequested || announcementHidden() || leaving)return;
+  if(!urgentChecked || urgentDialog?.open || urgentQueued)return;
   announcementRequested=true;
   try{
     const data=await api('announcement');
+    if(!urgentChecked || urgentDialog?.open || urgentQueued){announcementRequested=false;return;}
     if(!leaving && !announcementHidden())showAnnouncement(data);
   }catch{/* A failed or outdated notice must never interrupt signing in. */}
 }
@@ -599,15 +667,33 @@ async function jpeg(file){
     throw new Error('더 작은 사진을 선택해 주세요.');
   }finally{URL.revokeObjectURL(url);}
 }
-function message(m,isAdmin){
+function highlighted(text,query=''){
+  text=String(text??'');if(!query)return esc(text);
+  const lower=text.toLowerCase(),needle=query.toLowerCase(),starts=[],ends=[],ranges=[];
+  let original=0;
+  for(const character of text){
+    for(let i=0;i<character.toLowerCase().length;i++){starts.push(original);ends.push(original+character.length);}
+    original+=character.length;
+  }
+  let cursor=0,index;
+  while((index=lower.indexOf(needle,cursor))!==-1){
+    const from=starts[index],to=ends[index+needle.length-1],last=ranges.at(-1);
+    if(last&&from<=last[1])last[1]=Math.max(last[1],to);else ranges.push([from,to]);
+    cursor=index+needle.length;
+  }
+  let result='',start=0;
+  for(const [from,to] of ranges){result+=esc(text.slice(start,from))+'<mark>'+esc(text.slice(from,to))+'</mark>';start=to;}
+  return result+esc(text.slice(start));
+}
+function message(m,isAdmin,query=''){
   if(!isAdmin&&(m.deleted||m.visibility==='deleted'))return '';
   const when=new Date(m.sent).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});
   const labels={pending:'사진 검토 중',reported:'신고 접수 · 검토 중',removed:'이용규칙에 따라 삭제되었어요.',expired:'보관 기간이 지난 사진이에요.'};
   const deleted=isAdmin&&m.deleted,photoVisible=m.viewable&&m.expires>Date.now();
-  const body=m.visibility==='removed'?labels.removed:deleted?(m.expires?(photoVisible?`<img draggable="false" alt="삭제된 사진 원본" src="/api/admin/photos/${m.id}">`:labels.expired):esc(m.body)):
-    labels[m.visibility]||(m.expires?(photoVisible?`<img draggable="false" alt="대화 사진" src="/api/${isAdmin?'admin/':''}photos/${m.id}">`:'보관 기간이 지난 사진이에요.'):esc(m.body));
+  const body=m.visibility==='removed'?labels.removed:deleted?(m.expires?(photoVisible?`<img draggable="false" alt="삭제된 사진 원본" src="/api/admin/photos/${m.id}">`:labels.expired):highlighted(m.body,isAdmin?query:'')):
+    labels[m.visibility]||(m.expires?(photoVisible?`<img draggable="false" alt="대화 사진" src="/api/${isAdmin?'admin/':''}photos/${m.id}">`:'보관 기간이 지난 사진이에요.'):highlighted(m.body,isAdmin?query:''));
   const mine=!isAdmin&&m.author===me?.id;
-  return `<article class="msg ${mine?'mine':''}" data-message="${m.id}"><span class="by">${esc(m.nick)}</span>${deleted?`<span class="deleted-label" title="삭제 · ${esc(at(m.deletedAt))}">${m.expires?'삭제된 사진':'삭제된 채팅'}</span>`:''}<div class="bubble msgText">${body}</div><time class="time">${esc(when)}</time>${mine?`<button type="button" class="textBtn danger" data-delete-message="${m.id}">${m.expires?'사진':'메시지'} 삭제</button>`:!isAdmin&&!['reported','removed','expired'].includes(m.visibility)?`<button type="button" class="textBtn" data-report="${m.id}">신고</button>`:''}</article>`;
+  return `<article class="msg ${mine?'mine':''}" data-message="${m.id}"><span class="by">${esc(m.nick)}</span>${deleted?`<span class="deleted-label" title="삭제 · ${esc(at(m.deletedAt))}">${m.expires?'삭제된 사진':'삭제된 채팅'}</span>`:''}<div class="bubble msgText">${body}</div><time class="time">${esc(when)}</time>${mine?`<button type="button" class="textBtn danger" data-delete-message="${m.id}">${m.expires?'사진':'메시지'} 삭제</button>`:''}</article>`;
 }
 function wireChatEnter(composer){
   if(nativeClient || !composer)return;
@@ -661,12 +747,17 @@ function chatProfile(p){
     <div class="peer-profile-body" tabindex="0">${presenceBadge(p)}<p class="sub">${esc(p.year)}년생 · ${esc(p.gender)} · ${esc(p.area)}</p><div class="rule"></div><h3>소개글</h3><p class="memo">${esc(p.memo||'아직 작성된 소개글이 없어요.')}</p></div>`;
   d.onclose=()=>d.remove();main.append(d);d.querySelector('#chat-profile-close').onclick=()=>d.close();d.showModal();
 }
-async function conversation(id,title,isAdmin,back,peer,area='',initialVersion=null){
+async function conversation(id,title,isAdmin,back,peer,area='',initialVersion=null,searchQuery=''){
+  const query=isAdmin?String(searchQuery).trim():'';
   const endpoint=(isAdmin?'admin/':'')+'rooms/'+encodeURIComponent(id)+'/messages';
+  const messagePath=before=>endpoint+((query||before)?'?'+new URLSearchParams({...query?{q:query}:{},...before?{before}: {}}).toString():'');
   const composer=`<form class="compose paper"><label class="sr-only" for="body">메시지</label><textarea id="body" name="body" maxlength="2000" rows="1" placeholder="전하고 싶은 말을 적어주세요."></textarea><input hidden class="off" id="photo" type="file" accept="image/*">${actions(act('attach',icon('photo')+'사진','secondary'),btn('보내기'))}</form>`;
-  paint(title,'chat',`<div class="chat-tools">${act('older','이전 메시지','textBtn')}${isAdmin?'':act('block','상대 차단','textBtn danger')+act('leaveRoom','채팅 나가기','textBtn danger')}</div><div class="log" id="log"></div>${isAdmin?'':composer}`,{back,sub:[area,isAdmin?'운영자 열람 화면':'사진은 전송 즉시 표시되며 12시간 뒤 만료돼요.'].filter(Boolean).join(' · ')});
+  paint(title,'chat',`${isAdmin?monitorSearch(query,'이 대화 내용 검색','roomSearch'):''}<div class="chat-tools">${act('older',query?'이전 검색 결과':'이전 메시지','textBtn')}${isAdmin?'':act('block','상대 차단','textBtn danger')+act('leaveRoom','채팅 나가기','textBtn danger')}</div><div class="log" id="log"></div>${isAdmin?'':composer}`,{back,sub:[area,isAdmin?'운영자 열람 화면':'사진은 전송 즉시 표시되며 12시간 뒤 만료돼요.'].filter(Boolean).join(' · ')});
   main.className='chat-screen';fitViewport();
-  const reopen=()=>conversation(id,title,isAdmin,back,peer,area,roomVersion);
+  if(isAdmin){
+    form(async f=>{await conversation(id,title,true,back,peer,area,null,String(f.get('query')??'').trim());});
+    on('#clearSearch','click',()=>conversation(id,title,true,back,peer,area));
+  }
   if(!isAdmin){
     on('#block','click',()=>blockPeer(peer,()=>returnToRooms()));
     on('#leaveRoom','click',()=>modal('채팅 나가기','나와 상대방의 채팅방이 모두 삭제돼요. 사진은 전송 후 12시간에 만료돼요.','나가기',async()=>{
@@ -674,7 +765,6 @@ async function conversation(id,title,isAdmin,back,peer,area='',initialVersion=nu
       await returnToRooms('채팅방에서 나왔어요.');
     }));
     on('#log','click',e=>{
-      const target=e.target.closest('[data-report]');if(target)return reportUI({kind:'message',message:Number(target.dataset.report)},reopen);
       const deletion=e.target.closest('[data-delete-message]');if(deletion){
         const messageId=Number(deletion.dataset.deleteMessage),m=items.get(messageId);
         if(!m||m.author!==me?.id)return;
@@ -688,12 +778,13 @@ async function conversation(id,title,isAdmin,back,peer,area='',initialVersion=nu
     });
   }
   let roomVersion=initialVersion,lastEventVersion=Number(initialVersion)||0;
-  const v=epoch,log=$('#log'),deletedLocally=new Set();let items=new Map(),signature='',busy=false,more=true,readThrough=0,reading=false,oldestCursor=null,loaded=false,renderedOnce=false,closing=false;
+  const v=epoch,log=$('#log'),deletedLocally=new Set();let items=new Map(),signature='',busy=false,refreshQueued=false,more=true,readThrough=0,reading=false,oldestCursor=null,loaded=false,renderedOnce=false,closing=false;
   const layout=chatLayout=followChatLayout(log,isAdmin?null:$('#body'),()=>v===epoch&&!closing,()=>void markRead());
   if(!isAdmin && peer){
-    $('.hero').insertAdjacentHTML('beforeend',act('peerProfile','상대 프로필','peer-profile-button'));
+    $('.hero').insertAdjacentHTML('beforeend','<div class="chat-peer-actions">'+act('peerProfile','상대 프로필','peer-profile-button')+act('reportConversation','신고하기','peer-profile-button danger')+'</div>');
     $('.hero').classList.add('has-peer-profile');
     on('#peerProfile','click',async()=>{const p=await roomRequest('people/'+encodeURIComponent(peer));if(v===epoch&&!closing)chatProfile(p);});
+    on('#reportConversation','click',()=>conversationReport(id,refresh));
   }
   function removeMessage(messageId){
     deletedLocally.add(messageId);items.delete(messageId);signature='';
@@ -709,6 +800,7 @@ async function conversation(id,title,isAdmin,back,peer,area='',initialVersion=nu
     lastEventVersion=Math.max(lastEventVersion,version);
     if(change.closed)return returnToRooms('종료된 채팅방이에요. 내 대화로 돌아왔어요.');
     if(Number.isSafeInteger(change.deletedMessage)&&change.deletedMessage>0)removeMessage(change.deletedMessage);
+    return refresh();
   };
   async function returnToRooms(message=''){
     if(v!==epoch||closing)return;
@@ -728,7 +820,7 @@ async function conversation(id,title,isAdmin,back,peer,area='',initialVersion=nu
   }
   const merge=messages=>{for(const m of messages){oldestCursor=oldestCursor===null?m.id:Math.min(oldestCursor,m.id);if(!isAdmin&&(m.deleted||m.visibility==='deleted'||deletedLocally.has(m.id)))items.delete(m.id);else items.set(m.id,m);}};
   async function markRead(){
-    if(isAdmin||!foregroundVisible()||v!==epoch||reading||log.clientHeight<=0||log.scrollHeight-log.scrollTop-log.clientHeight>40)return;
+    if(isAdmin||!foregroundVisible()||document.querySelector('dialog[open]')||v!==epoch||reading||log.clientHeight<=0||log.scrollHeight-log.scrollTop-log.clientHeight>40)return;
     const through=Math.max(0,...[...items.values()].filter(m=>!m.deleted&&!['reported','removed','pending','expired','deleted'].includes(m.visibility)).map(m=>m.id));
     if(through<=readThrough)return;
     reading=true;
@@ -736,10 +828,10 @@ async function conversation(id,title,isAdmin,back,peer,area='',initialVersion=nu
     catch{/* Retry after the next visible refresh. */}finally{reading=false;}
   }
   async function refresh(earlier=false){
-    if(busy || v!==epoch)return;busy=true;
+    if(v!==epoch)return;if(busy){if(!earlier)refreshQueued=true;return;}busy=true;
     try {
       let ids=[...items.keys()];const before=earlier?oldestCursor:null;
-      const data=await roomRequest(endpoint+(before?'?before='+before:''));
+      const data=await roomRequest(messagePath(before));
       if(v!==epoch)return;
       const firstLoad=!renderedOnce;
       if(roomVersion!==null && roomVersion!==data.roomVersion){
@@ -755,7 +847,7 @@ async function conversation(id,title,isAdmin,back,peer,area='',initialVersion=nu
       if(!earlier && ids.length && data.length===60 && data[0].id>Math.max(...ids)){
         let cursor=data[0].id;
         while(cursor>Math.max(...ids)){
-          const page=await roomRequest(endpoint+'?before='+cursor);if(v!==epoch)return;
+          const page=await roomRequest(messagePath(cursor));if(v!==epoch)return;
           merge(page);
           if(page.length<60)break;cursor=page[0].id;
         }
@@ -763,13 +855,13 @@ async function conversation(id,title,isAdmin,back,peer,area='',initialVersion=nu
       const ordered=[...items.values()].sort((a,b)=>a.id-b.id);
       const next=ordered.map(m=>[m.id,m.visibility,m.nick,m.deleted,m.deletedAt,(m.expires&&(!m.viewable||m.expires<=Date.now()))?1:0].join(':')).join(',');
       if(next!==signature || !ordered.length){
-        signature=next;log.innerHTML=ordered.map(m=>message(m,isAdmin)).join('')||'<p class="empty">아직 대화가 없어요.</p>';renderedOnce=true;
+        signature=next;log.innerHTML=ordered.map(m=>message(m,isAdmin,query)).join('')||'<p class="empty">'+(query?'검색한 내용이 없어요.':'아직 대화가 없어요.')+'</p>';renderedOnce=true;
         if(earlier)log.scrollTop+=log.scrollHeight-height;else if(atEnd||firstLoad)layout.bottom();
       }
       $('#older').hidden=!more;$('#older').classList.toggle('off',!more);
       await markRead();
     }catch(e){if(e.stale)return;if(v===epoch && [401,403,404].includes(e.status)){items.clear();log.replaceChildren();clearInterval(activeTimer);if(!isAdmin){$('#body').value='';void pulse(true);}else if(e.status===401)adminLogin();}throw e;}
-    finally{busy=false;}
+    finally{busy=false;if(refreshQueued&&v===epoch){refreshQueued=false;void refresh().catch(err);}}
   }
   on('#older','click',()=>refresh(true));
   if(!isAdmin){
@@ -789,7 +881,7 @@ async function conversation(id,title,isAdmin,back,peer,area='',initialVersion=nu
   await refresh();if(v===epoch)activeTimer=setInterval(()=>{if(foregroundVisible())refresh().catch(err);},2500);
 }
 const at=t=>t?new Date(t).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'}):'기록 없음';
-let adminPrivate=false;
+let adminPrivate=false,memberDirectoryRequest=0;
 // Refresh only while the same administrative screen is open. Never keep showing
 // a withdrawn member's contact card after the service has removed it.
 function watchDirectory(path,initial,render,expiry){
@@ -820,11 +912,20 @@ function deleteMember(m,done){
   });
 }
 async function membersPage(offset=0,page=null,filter=''){
-  const path='admin/members?offset='+offset+(filter?'&filter='+encodeURIComponent(filter):'');
-  page??=await api(path);
+  const request=++memberDirectoryRequest,scope=scopes.members;
+  if(scope.regional){
+    regions||=await api('regions');if(request!==memberDirectoryRequest)return;
+    if(!knownArea(scope.area)){const region=Object.keys(regions)[0];scope.area=region+' '+regions[region][0];}
+  }
+  const path='admin/members?offset='+offset+(filter?'&filter='+encodeURIComponent(filter):'')+(scope.regional?'&area='+encodeURIComponent(scope.area):'');
+  page??=await api(path);if(request!==memberDirectoryRequest)return;
   const itemLabel=m=>m.status==='withdrawn'?'탈퇴 · '+at(m.expires)+' 삭제 예정':m.area+' · '+(m.online?'접속 중':'최근 접속 '+at(m.lastSeen));
   const reopen=()=>membersPage(offset,null,filter);
-  paint(filter==='inactive'?'30일 미접속 회원':'가입자 현황','book',`<p class="counts">가입 중 <strong>${page.counts.active}명</strong> · 30일 미접속 <strong>${page.counts.inactive||0}명</strong> · 탈퇴 후 24시간 이내 <strong>${page.counts.withdrawn}명</strong></p><section class="paper"><div class="rows">${page.items.map(m=>`<div class="member-row">${row(m.id,m.nick,itemLabel(m))}${m.status==='withdrawn'?'':`<button type="button" class="textBtn danger" data-delete-member="${esc(m.id)}" aria-label="${esc(m.nick)} 회원 삭제">회원 삭제</button>`}</div>`).join('')||'<p class="empty">해당하는 회원이 없어요.</p>'}</div></section>${actions(offset?act('prevPage','이전 목록'):'',page.more?act('nextPage','다음 목록'):'')}`,{back:adminHome,sub:filter==='inactive'?'마지막 접속 후 30일 이상 지난 회원이에요.':'회원을 선택하면 출생연도, 성별, 지역과 소개글을 볼 수 있어요.'});
+  paint(filter==='inactive'?'30일 미접속 회원':'가입자 현황','book',`<section class="paper"><div class="scope-switch" role="group" aria-label="가입자 상태"><button type="button" id="members-all" aria-pressed="${filter!=='inactive'}">전체 현황</button><button type="button" id="members-inactive" aria-pressed="${filter==='inactive'}">30일 미접속자</button></div><div class="rule"></div>${scopeControls(scope)}</section><p class="counts">${scope.regional?esc(scope.area)+' · ':''}가입 중 <strong>${page.counts.active}명</strong> · 30일 미접속 <strong>${page.counts.inactive||0}명</strong>${scope.regional?'':' · 탈퇴 후 24시간 이내 <strong>'+page.counts.withdrawn+'명</strong>'}</p>${scope.regional?'<p class="note">탈퇴 회원은 지역 정보가 남지 않아 전체 목록에서 확인할 수 있어요.</p>':''}<section class="paper"><div class="rows">${page.items.map(m=>`<div class="member-row">${row(m.id,m.nick,itemLabel(m))}${m.status==='withdrawn'?'':`<button type="button" class="textBtn danger" data-delete-member="${esc(m.id)}" aria-label="${esc(m.nick)} 회원 삭제">회원 삭제</button>`}</div>`).join('')||'<p class="empty">해당하는 회원이 없어요.</p>'}</div></section>${actions(offset?act('prevPage','이전 목록'):'',page.more?act('nextPage','다음 목록'):'')}`,{back:adminHome,sub:filter==='inactive'?'마지막 접속 후 30일 이상 지난 회원이에요.':'회원을 선택하면 출생연도, 성별, 지역과 소개글을 볼 수 있어요.'});
+  on('#members-all','click',()=>membersPage());on('#members-inactive','click',()=>membersPage(0,null,'inactive'));
+  on('#scope-all','click',()=>{scope.regional=false;return membersPage(0,null,filter);});
+  on('#scope-area','click',()=>{scope.regional=true;return membersPage(0,null,filter);});
+  if(scope.regional)wirePicker(scope.area,()=>{scope.area=areaOf();void membersPage(0,null,filter).catch(err);});
   watchDirectory(path,page,next=>membersPage(offset,next,filter),Math.min(...page.items.filter(i=>i.expires).map(i=>i.expires)));
   rows(page.items,m=>memberDetail(m.id,reopen));
   document.querySelectorAll('[data-delete-member]').forEach(el=>el.onclick=()=>{const m=page.items.find(i=>i.id===el.dataset.deleteMember);if(m)deleteMember(m,reopen);});
@@ -851,7 +952,7 @@ async function memberDetail(id,back,m=null){
 }
 async function reviewList(){
   const data=await api('admin/review');
-  const reports=data.reports.map(i=>row('r'+i.id,i.nick+' · '+(i.message?'메시지':'프로필'),i.reason+' · '+at(i.created))).join('');
+  const reports=data.reports.map(i=>row('r'+i.id,i.nick+' · '+(i.conversationRoom?'대화 · 사진 '+i.photoCount+'장':i.message?'메시지':'프로필'),i.reason+' · '+at(i.created))).join('');
   paint('신고 검토','book',`<section class="letter"><p>사진은 전송 즉시 표시돼요. 신고된 콘텐츠만 검토하며, 신고 인정 3회마다 24시간 이용을 제한해요.</p></section><section class="paper"><h2>접수된 신고</h2><div class="rows">${reports||'접수된 신고가 없어요.'}</div></section>${actions(act('reloadQueue','새로고침'))}`,{back:monitor});
   for(const el of document.querySelectorAll('.row'))el.onclick=()=>{
     const key=el.dataset.id,photo=key.startsWith('p'),id=Number(key.slice(1));
@@ -860,10 +961,14 @@ async function reviewList(){
   on('#reloadQueue','click',reviewList);
 }
 function reviewItem(item,isPhoto){
-  const picture=isPhoto?item.id:item.photo;
+  const picture=isPhoto?item.id:item.photo,conversationPhotos=item.photos||[];
   const outcome=async action=>{await api('admin/review',{kind:isPhoto?'photo':'report',id:item.id,action});await reviewList();note('검토 결과를 반영했어요.');};
-  paint(isPhoto?'사진 검토':'신고 검토','mail',`<section class="paper"><h2>${esc(item.nick)}</h2><p>${isPhoto||item.message?'보낸 회원':'프로필 작성자'} · ${esc(item.area)}</p>${actions(act('sender','가입자 정보 보기','secondary'),isPhoto?'':act('reporter','신고자 정보 보기'))}<div class="rule"></div><p>${esc(isPhoto?'사진 만료 · '+at(item.expires):item.reason)}</p>${item.excerpt?`<p class="memo">${esc(item.excerpt)}</p>`:''}${picture?act('showPhoto','검토용 사진 열기'):''}<div id="preview"></div>${isPhoto?actions('<button disabled type="button" id="approve" class="primary">사진 승인</button>',act('deny','사진 거절','danger')):actions(act('dismissReport','신고 거부 · 복원'),act('acceptReport','신고 인정 · 벌점 1점','danger'))}<p class="note">신고를 인정하면 위반 콘텐츠를 삭제하고 작성자에게 벌점 1점을 부여해요. 3점마다 24시간 이용을 제한해요. 같은 콘텐츠에 대한 벌점은 중복 부과하지 않아요.</p></section>`,{back:reviewList});
+  paint(isPhoto?'사진 검토':item.conversationRoom?'대화 신고 검토':'신고 검토','mail',`<section class="paper"><h2>${esc(item.nick)}</h2><p>${isPhoto||item.message||item.conversationRoom?'보낸 회원':'프로필 작성자'} · ${esc(item.area)}</p>${actions(act('sender','가입자 정보 보기','secondary'),isPhoto?'':act('reporter','신고자 정보 보기'))}<div class="rule"></div><p>${esc(isPhoto?'사진 만료 · '+at(item.expires):item.reason)}</p>${item.excerpt?`<p class="memo">${esc(item.excerpt)}</p>`:''}${item.conversationRoom?actions(act('showConversation','신고된 대화 보기','secondary'),conversationPhotos.length?act('showPhotos','신고 사진 '+item.photoCount+'장 확인'): ''):''}${picture?act('showPhoto','검토용 사진 열기'):''}<div id="preview"></div>${isPhoto?actions('<button disabled type="button" id="approve" class="primary">사진 승인</button>',act('deny','사진 거절','danger')):actions(act('dismissReport','신고 거부 · 복원'),act('acceptReport','신고 인정 · 벌점 1점','danger'))}<p class="note">신고를 인정하면 위반 콘텐츠를 삭제하고 작성자에게 벌점 1점을 부여해요. 3점마다 24시간 이용을 제한해요. 같은 콘텐츠에 대한 벌점은 중복 부과하지 않아요.</p></section>`,{back:reviewList});
   const reopen=()=>reviewItem(item,isPhoto);
+  on('#showConversation','click',()=>conversation(item.conversationRoom,item.nick+'님의 신고 대화',true,reopen,null,item.area));
+  on('#showPhotos','click',()=>{
+    $('#preview').innerHTML='<div class="review-gallery">'+conversationPhotos.map(photo=>`<figure>${photo.viewable&&photo.expires>Date.now()?`<img class="reviewPhoto" src="/api/admin/photos/${photo.id}" alt="${photo.deletedAt?'삭제된 사진 원본':'신고된 사진'}" loading="lazy">`:'<p class="note">사진이 만료되었거나 삭제되었어요.</p>'}<figcaption>${photo.deletedAt?'삭제된 사진 · ':''}사진 ${photo.id} · ${esc(at(photo.expires))} 만료</figcaption></figure>`).join('')+'</div>';
+  });
   on('#sender','click',()=>memberDetail(item.sender,reopen));on('#reporter','click',()=>memberDetail(item.reporter,reopen));
   on('#showPhoto','click',()=>{
     const button=$('#showPhoto'),img=new Image();button.disabled=true;img.alt='운영자 검토 사진';img.className='reviewPhoto';
@@ -873,45 +978,45 @@ function reviewItem(item,isPhoto){
   });
   on('#approve','click',()=>outcome('approve'));on('#deny','click',()=>modal('사진 거절','사진을 삭제하고 상대에게 공개하지 않아요.','거절하기',()=>outcome('reject')));
   on('#dismissReport','click',()=>outcome('dismiss'));
-  on('#acceptReport','click',()=>modal('신고 인정','위반 콘텐츠를 삭제하고 작성자에게 벌점 1점을 부여할까요? 3점이 되면 24시간 이용을 제한해요.','신고 인정',()=>outcome('accept')));
+  on('#acceptReport','click',()=>modal('신고 인정',item.conversationRoom?(item.photoCount?'이 신고에 포함된 사진을 삭제하고 작성자에게 벌점 1점을 부여할까요?':'신고 당시 메시지를 삭제하고 작성자에게 벌점 1점을 부여할까요?')+' 3점이 되면 24시간 이용을 제한해요.':'위반 콘텐츠를 삭제하고 작성자에게 벌점 1점을 부여할까요? 3점이 되면 24시간 이용을 제한해요.','신고 인정',()=>outcome('accept')));
 }
 async function adminHome(){
   try{await api('admin/settings');}catch(e){if(e.status===401){adminLogin();return;}throw e;}
   adminPrivate=true;
-  paint('운영자 관리실','settings',`<div class="grid adminGrid">${menu('url','mail','인증폼 주소','발급 신청서 연결') }${menu('downloadLinks','photo','앱 다운로드 링크','PC 웹의 Android·iPhone 다운로드 주소')}${menu('announcement','book','공지 설정','공지 내용·앱 다운로드 버튼 관리')}${menu('monitor','chat','대화 모니터링','전체·지역별 대화 열람')}${menu('members','book','가입자 현황','가입·탈퇴 회원 조회')}${menu('inactiveMembers','book','30일 미접속 회원','최근 접속 확인·회원 삭제')}${menu('reset','bin','서버 초기화','서비스 데이터 전체 삭제','destructive')}</div>${act('out','관리자 로그아웃','textBtn')}`,{wide:true});
-  on('#members','click',()=>membersPage());on('#inactiveMembers','click',()=>membersPage(0,null,'inactive'));on('#url','click',adminURL);on('#downloadLinks','click',adminDownloadLinks);on('#announcement','click',adminAnnouncement);on('#monitor','click',monitor);on('#reset','click',reset);on('#out','click',async()=>{await api('admin/logout',{});adminLogin();});
+  paint('운영자 관리실','settings',`<div class="grid adminGrid">${menu('members','book','가입자 현황','전체·지역별·30일 미접속 회원')}${menu('monitor','chat','대화 모니터링','프로필별 대화·내용 검색')}${menu('announcements','book','공지설정','일반공지·긴급공지 관리')}${menu('linkSettings','mail','링크관리','인증폼·Android·iPhone 다운로드 주소')}${menu('reset','bin','서버초기화','서비스 데이터 전체 삭제','destructive')}</div>${act('out','관리자 로그아웃','textBtn')}`,{wide:true});
+  on('#members','click',()=>membersPage());on('#monitor','click',monitor);on('#announcements','click',adminAnnouncements);on('#linkSettings','click',adminLinkSettings);on('#reset','click',reset);on('#out','click',async()=>{await api('admin/logout',{});adminLogin();});
 }
 function adminLogin(){
-  adminPrivate=false;scopes.monitor={};
+  adminPrivate=false;scopes.monitor={};scopes.members={};memberDirectoryRequest++;
   paint('관리자 로그인','key',`<form class="paper">${field('key','관리자 보안키','type="password" autocomplete="current-password" maxlength="256"')}<p class="note">발급 서버에서 승인한 관리자 보안키를 입력해 주세요.</p>${actions(btn('로그인'))}</form>`);
   form(async f=>{await api('admin/login',{key:f.get('key')});await adminHome();});
 }
-async function adminURL(){
-  const c=await api('admin/settings');
-  paint('인증폼 주소','mail',`<form class="paper">${field('url','발급 신청서 URL',`type="url" placeholder="https://" value="${esc(c.url)}"`)}<p class="note">저장하면 앱의 발급 신청 버튼에 바로 반영돼요.</p>${actions(btn('주소 저장'))}</form>`,{back:adminHome});
-  form(async f=>{await api('admin/settings',{url:f.get('url')});note('인증폼 주소를 저장했어요.');});
-}
-async function adminDownloadLinks(){
-  const links=await api('admin/download-links');
+async function adminLinkSettings(){
+  const links=await api('admin/link-settings');
   const input=(id,label)=>`<div class="field"><label for="${id}">${label}</label><input id="${id}" name="${id}" type="url" maxlength="2048" placeholder="https://" value="${esc(links[id])}"></div>`;
-  paint('앱 다운로드 링크','photo',`<form class="paper">${input('androidUrl','Android 앱 다운로드 URL')}${input('iosUrl','iPhone 앱 다운로드 URL')}<p class="note">https:// 링크를 입력해 주세요. 비워서 저장하면 해당 링크가 삭제되고 PC 웹에서 ‘아직 개발 진행중이에요.’라고 안내해요. 변경 사항은 인증키 화면을 다시 열 때 반영돼요.</p>${actions(btn('링크 저장'))}</form>`,{back:adminHome});
+  paint('링크관리','mail',`<form class="paper"><h2>인증폼</h2>${input('url','발급 신청서 URL')}<p class="note">회원이 인증키 발급을 신청할 주소예요.</p><div class="rule"></div><h2>앱 다운로드</h2>${input('androidUrl','Android 앱 다운로드 URL')}${input('iosUrl','iPhone 앱 다운로드 URL')}<p class="note">https:// 링크를 입력해 주세요. 다운로드 주소를 비워두면 ‘아직 개발 진행중이에요.’라고 안내해요. 다운로드 주소는 로그인 화면과 공지에 함께 적용됩니다.</p>${actions(btn('링크 저장'))}</form>`,{back:adminHome});
   form(async f=>{
-    const values={androidUrl:downloadURL(String(f.get('androidUrl')??'')),iosUrl:downloadURL(String(f.get('iosUrl')??''))};
-    const saved=await api('admin/download-links',values);
-    $('#androidUrl').value=saved.androidUrl;$('#iosUrl').value=saved.iosUrl;note('앱 다운로드 링크를 저장했어요.');
+    const values=Object.fromEntries(['url','androidUrl','iosUrl'].map(key=>[key,downloadURL(String(f.get(key)??''))]));
+    const saved=await api('admin/link-settings',values);
+    for(const key of ['url','androidUrl','iosUrl'])$('#'+key).value=saved[key];note('링크를 저장했어요.');
   });
 }
+function adminAnnouncements(){
+  paint('공지설정','book',`<div class="grid">${menu('announcement','book','일반공지','내용·다운로드 버튼·4시간 숨김')}${menu('urgentAnnouncement','mail','긴급공지','접속 중 즉시 표시·닫기만 제공')}</div>`,{back:adminHome});
+  on('#announcement','click',adminAnnouncement);on('#urgentAnnouncement','click',adminUrgentAnnouncement);
+}
+
 async function adminAnnouncement(){
   const data=await api('admin/announcement');
   const toggle=(id,title)=>`<label class="check"><input id="${id}" name="${id}" type="checkbox" ${data[id]?'checked':''}><span>${title}</span></label>`;
   const input=(id,title)=>`<div class="field"><label for="${id}">${title}</label><input id="${id}" name="${id}" type="url" maxlength="2048" placeholder="https://" value="${esc(data[id])}"></div>`;
-  paint('공지 설정','book',`<form class="paper">${toggle('enabled','공지 표시')}
+  paint('일반 공지 설정','book',`<form class="paper">${toggle('enabled','일반 공지 표시')}
     <div class="field"><label for="announcementTitle">공지 제목</label><input id="announcementTitle" name="title" maxlength="120" value="${esc(data.title)}"></div>
     <div class="field"><label for="announcementBody">공지 내용</label><textarea id="announcementBody" name="body" maxlength="20000" rows="8" placeholder="회원에게 안내할 내용을 입력해 주세요.">${esc(data.body)}</textarea></div>
     <p class="note">로그인 완료 후 가운데 정렬된 공지가 표시돼요. 긴 내용은 스크롤할 수 있으며, ‘4시간 보지않기’는 해당 브라우저에 적용돼요.</p><div class="rule"></div>
     ${toggle('androidEnabled','공지에 안드로이드앱 버튼 표시')}${input('androidUrl','안드로이드앱 다운로드 URL')}<div class="rule"></div>
     ${toggle('iosEnabled','공지에 아이폰앱 버튼 표시')}${input('iosUrl','아이폰앱 다운로드 URL')}
-    <p class="note">켜기·끄기는 공지 안의 버튼에만 적용돼요. 앱에서는 설정에 관계없이 다운로드 버튼을 표시하지 않아요. 다운로드 주소는 로그인 화면과 함께 사용해요. 주소를 비워두면 ‘아직 개발 진행중이에요.’라고 안내해요. 저장한 공지는 다음 로그인 또는 로그인 상태에서 새로고침할 때 반영됩니다.</p>${actions(btn('공지 저장'))}</form>`,{back:adminHome});
+    <p class="note">켜기·끄기는 공지 안의 버튼에만 적용돼요. 앱에서는 설정에 관계없이 다운로드 버튼을 표시하지 않아요. 다운로드 주소는 로그인 화면과 함께 사용해요. 주소를 비워두면 ‘아직 개발 진행중이에요.’라고 안내해요. 저장한 공지는 다음 로그인 또는 로그인 상태에서 새로고침할 때 반영됩니다.</p>${actions(btn('공지 저장'))}</form>`,{back:adminAnnouncements});
   form(async f=>{
     const values={enabled:f.get('enabled')==='on',title:String(f.get('title')??'').trim(),body:String(f.get('body')??'').trim(),
       androidEnabled:f.get('androidEnabled')==='on',iosEnabled:f.get('iosEnabled')==='on',
@@ -922,20 +1027,82 @@ async function adminAnnouncement(){
     $('#androidUrl').value=saved.androidUrl;$('#iosUrl').value=saved.iosUrl;note('공지를 저장했어요.');
   });
 }
-function monitor(){
-  const participants=r=>r.first+' ('+r.firstArea+') · '+r.second+' ('+r.secondArea+')';
-  return scopedDirectory('monitor','admin/rooms','대화 모니터링','chat',
-    r=>row(r.id,participants(r),[r.closedAt?'종료된 대화 · '+(r.closedReason==='blocked'?'차단':'채팅 나가기'):'',r.recent?at(r.recent):'새 대화'].filter(Boolean).join(' · ')),
-    r=>conversation(r.id,r.first+' · '+r.second,true,monitor,null,participants(r)),
-    regional=>regional?'이 지역의 회원이 참여한 대화가 없어요.':'아직 대화가 없어요.',
-    {back:adminHome,sub:'지역별 목록에는 두 참여자 중 한 명이라도 선택한 지역에 속한 대화가 표시돼요.',
-     extra:actions(act('reviewQueue','사진·신고 검토','primary')),wireExtra:()=>on('#reviewQueue','click',reviewList),live:true});
+async function adminUrgentAnnouncement(){
+  const data=await api('admin/urgent-announcement');
+  paint('긴급공지 설정','mail',`<form class="paper">
+    <label class="check"><input type="checkbox" id="urgentEnabled" name="enabled" ${data.enabled?'checked':''}><span>긴급공지 게시</span></label>
+    <div class="field"><label for="urgentTitle">긴급공지 제목</label><input id="urgentTitle" name="title" maxlength="120" value="${esc(data.title)}"></div>
+    <div class="field"><label for="urgentBody">긴급공지 내용</label><textarea id="urgentBody" name="body" maxlength="20000" rows="8">${esc(data.body)}</textarea></div>
+    <p class="note">켜고 저장하면 접속 중인 회원에게 즉시 표시돼요. 미접속 회원은 다음 로그인 때 일반 공지보다 먼저 확인해요. 긴급공지에는 ‘닫기’만 표시되며, 일반 공지의 4시간 숨김은 적용되지 않아요.</p>
+    <p class="note">같은 내용이라도 다시 게시하면 새 긴급공지로 표시돼요. 게시를 끄고 저장하면 공지가 중단됩니다. 게시 중에는 다음 로그인이나 새로고침 때 다시 표시돼요.</p>
+    <p class="note" id="urgentPublished">${data.publishedAt?'마지막 게시 · '+esc(at(data.publishedAt)):'아직 게시된 긴급공지가 없어요.'}</p>
+    ${actions(btn('긴급공지 저장·적용'))}</form>`,{back:adminAnnouncements});
+  form(async f=>{
+    const enabled=f.get('enabled')==='on',title=String(f.get('title')??'').trim(),body=String(f.get('body')??'').trim();
+    if(enabled && (!title || !body))throw new Error('긴급공지를 게시하려면 제목과 내용을 입력해 주세요.');
+    const saved=await api('admin/urgent-announcement',{enabled,title,body});
+    $('#urgentTitle').value=saved.title;$('#urgentBody').value=saved.body;
+    $('#urgentPublished').textContent=saved.publishedAt?'마지막 게시 · '+at(saved.publishedAt):'긴급공지 게시가 중단됐어요.';
+    note(saved.enabled?'긴급공지를 게시했어요.':'긴급공지 게시를 중단했어요.');
+  });
+}
+function monitorSearch(query,label='닉네임 또는 대화 내용 검색',id='monitorSearch'){
+  return `<form class="monitor-search" role="search"><label for="${id}">${esc(label)}</label><div class="search-controls"><input id="${id}" name="query" type="search" maxlength="200" value="${esc(query)}" placeholder="검색어를 입력해 주세요." autocomplete="off">${btn('검색')}${act('clearSearch','전체 보기')}</div>${query?`<p class="note">‘${esc(query)}’ 검색 결과</p>`:''}</form>`;
+}
+function monitor(){return monitorDirectory();}
+function monitorRooms(profile){return monitorDirectory(profile);}
+async function monitorDirectory(profile=null){
+  const scope=scopes.monitor,query=scope.query||'',isProfileList=!profile;
+  const profileHeader=profile?`<section class="paper"><h2>${esc(profile.nick)}${profile.deletedAt?' · 삭제된 회원':''}</h2><p class="sub">${esc(profile.year)}년생 · ${esc(profile.gender)} · ${esc(profile.area)}</p><details class="monitor-intro"><summary>소개글 보기</summary><p class="memo">${esc(profile.memo)}</p></details></section>`:'';
+  paint(profile?profile.nick+'님의 대화':'대화 모니터링','chat',
+    (isProfileList?actions(act('reviewQueue','사진·신고 검토','secondary')):profileHeader)+
+    `<section class="paper">${isProfileList?scopeControls(scope)+'<div class="rule"></div>':''}${monitorSearch(query,isProfileList?'닉네임 또는 대화 내용 검색':'닉네임 또는 이 회원의 대화 내용 검색')}<p id="monitorCount" class="note" aria-live="polite"></p><div id="list" class="rows monitor-list"></div></section>`,
+    {back:isProfileList?adminHome:monitor,sub:isProfileList?'프로필을 선택하면 해당 회원의 대화방을 볼 수 있어요. 삭제된 기록도 검색에 포함돼요.':'대화방을 선택하면 채팅 내용을 볼 수 있어요.'});
+  const view=epoch,list=$('#list'),count=$('#monitorCount');let request=0,pending=false,signature='';
+  const reopen=()=>monitorDirectory(profile);
+  on('#reviewQueue','click',reviewList);
+  on('#scope-all','click',()=>{scope.regional=false;return reopen();});
+  on('#scope-area','click',()=>{scope.regional=true;return reopen();});
+  form(async f=>{scope.query=String(f.get('query')??'').trim();await reopen();});
+  on('#clearSearch','click',()=>{scope.query='';return reopen();});
+  function profileRow(p){
+    const rooms=query?`대화방 ${p.matchedRoomCount}개 일치 / 전체 ${p.roomCount}개`:`대화방 ${p.roomCount}개`;
+    return `<button type="button" class="row profile-row monitor-profile" data-id="${esc(p.id)}"><span><strong>${highlighted(p.nick,query)}</strong>${p.deletedAt?'<span class="deleted-label">삭제된 회원</span>':''}<small>${esc(p.area+' · '+p.year+'년생 · '+p.gender)}</small><span class="profile-memo">${esc(p.memo)}</span><span class="room-count">${esc(rooms)}</span><small>${p.recent?'최근 대화 · '+esc(at(p.recent)):'아직 메시지 없음'}</small></span>${icon('arrow')}</button>`;
+  }
+  function roomRow(r){
+    const first=r.firstId===profile.id,nick=first?r.second:r.first,area=first?r.secondArea:r.firstArea,deleted=first?r.secondDeletedAt:r.firstDeletedAt;
+    const state=r.closedAt?'종료된 대화 · '+(r.closedReason==='blocked'?'차단':'채팅 나가기'):'대화방';
+    return `<button type="button" class="row" data-id="${esc(r.id)}"><span><strong>${highlighted(nick,query)}</strong>${deleted?'<span class="deleted-label">삭제된 회원</span>':''}<small>${esc(area+' · '+state)}</small><small>${esc(r.recent?at(r.recent):'아직 메시지 없음')}</small>${query&&r.matchingMessages?`<span class="room-count">내용 ${r.matchingMessages}개 일치</span><span class="match-snippet">${r.matchDeletedAt?'<span class="deleted-label">삭제된 채팅</span>':''}${highlighted(r.matchSnippet,query)}</span>`:''}</span>${icon('arrow')}</button>`;
+  }
+  async function refresh(fromTimer=false){
+    if(fromTimer&&pending)return;const serial=++request;pending=true;
+    const params=new URLSearchParams();if(query)params.set('q',query);
+    if(isProfileList&&scope.regional)params.set('area',scope.area);
+    if(profile)params.set('member',profile.id);
+    const path=(isProfileList?'admin/monitor/profiles':'admin/rooms')+(params.size?'?'+params:'');
+    try{
+      const items=await api(path);if(view!==epoch||serial!==request)return;
+      const next=JSON.stringify(items);if(next===signature)return;signature=next;
+      count.textContent=(query?'검색 결과 · ':'')+(isProfileList?'프로필 '+items.length+'명':'대화방 '+items.length+'개');
+      list.innerHTML=items.map(isProfileList?profileRow:roomRow).join('')||'<p class="empty">'+(query?'검색 결과가 없어요.':isProfileList?'대화 중인 프로필이 없어요.':'대화방이 없어요.')+'</p>';
+      rows(items,isProfileList?monitorRooms:r=>conversation(r.id,r.first+' · '+r.second,true,reopen,null,r.first+' ('+r.firstArea+') · '+r.second+' ('+r.secondArea+')',null,r.matchingMessages?query:''));
+    }catch(e){
+      if(view!==epoch||serial!==request||e.stale)return;
+      if(e.status===401){adminLogin();return;}list.replaceChildren();signature='';count.textContent='';err(e);
+    }finally{if(serial===request)pending=false;}
+  }
+  if(isProfileList&&scope.regional){
+    regions||=await api('regions');if(view!==epoch)return;
+    wirePicker(knownArea(scope.area)?scope.area:'',()=>{scope.area=areaOf();list.replaceChildren();signature='';void refresh();});scope.area=areaOf();
+  }
+  await refresh();if(view===epoch)activeTimer=setInterval(()=>{if(foregroundVisible())void refresh(true);},4000);
 }
 function reset(){
   paint('서버 초기화','bin',`<form class="paper"><p>회원, 프로필, 대화, 사진, 로그인 정보, 탈퇴 후 24시간 현황, 실명·전화번호, 신고·제재·차단·동의 기록과 발급 폼 주소, 앱 다운로드 링크, 공지 설정까지 모두 지워요. 사용자 앱은 다음 연결 때 초기화됩니다.</p>${field('key','로그인한 관리자 보안키','type="password" maxlength="256" autocomplete="current-password"')}${field('confirm','확인을 위해 ‘전체 삭제’ 입력','autocomplete="off"')}${actions(btn('전체 삭제','danger fill'))}</form>`,{back:adminHome});
   form(async f=>{await api('admin/reset',{key:f.get('key'),confirm:f.get('confirm')});note('가입 중 0명 · 탈퇴 현황 0명으로 초기화했어요.');adminLogin();});
 }
 async function boot(){
+  memberViewReady=false;
   const revision=accountRevision,serial=++bootSerial;
   const s=await api('state');if(revision!==accountRevision||serial!==bootSerial)return;
   if(s.stage==='gate'&&hasMemberSession()){clearMemberSession('사용자 정보가 없거나 로그인이 종료되었어요. 다시 인증해 주세요.');return;}
@@ -945,12 +1112,12 @@ async function boot(){
     requestWebPushPermission();void syncWebPush(true);
     await syncUnread();
     if(revision!==accountRevision||serial!==bootSerial||stage!=='member')return;
-    if(s.needsRecoveryCopy){await recoveryPage();return;}
+    if(s.needsRecoveryCopy){await recoveryPage();if(revision===accountRevision&&serial===bootSerial){memberViewReady=true;void syncUrgentAnnouncement(true);}return;}
     void syncPush(true);
     if(new URLSearchParams(location.search).get('inbox')==='1'){
       history.replaceState(null,'',memberPath);await rooms();
     }else await people();
-    if(revision===accountRevision && serial===bootSerial && stage==='member')void maybeAnnouncement();
+    if(revision===accountRevision && serial===bootSerial && stage==='member'){memberViewReady=true;void syncUrgentAnnouncement(true);}
     return;
   }
   if(stage==='details'){Object.assign(draft,{nick:s.nick,gender:s.gender});await regionStep();return;}
@@ -984,7 +1151,7 @@ function pulse(protect=false){
         if(status.stage==='gate'){clearMemberSession('사용자 정보가 없거나 로그인이 종료되었어요. 다시 인증해 주세요.');return;}
         else await boot();
       }
-      if(status.stage==='member'){void syncPush(protect);void syncUnread();}
+      if(status.stage==='member'){void syncPush(protect);void syncUnread();void syncUrgentAnnouncement(protect);}
       if(foregroundVisible())veil(false);
     }catch(e){if(!leaving&&!e.stale)veil(true,'서버에 연결하면 계정 상태를 다시 확인해요.');}
     finally{pulseTask=null;}

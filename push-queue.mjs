@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { transaction } from './store.mjs';
+import { transaction, openMessageReportSQL } from './store.mjs';
 import { reject } from './providers.mjs';
 import { webSubscription } from './web-push.mjs';
 
@@ -44,7 +44,7 @@ export function pushQueue(db, provider, safety) {
       AND r.closed_at IS NULL AND m.deleted_at IS NULL
       AND m.id>COALESCE((SELECT through FROM room_reads WHERE room=r.id AND member=s.member),0)
       AND ((m.body IS NOT NULL AND v.state IS NULL) OR (v.state='approved' AND m.photo IS NOT NULL AND m.expires>?))
-      AND NOT EXISTS(SELECT 1 FROM reports WHERE message=m.id AND status='open')`,message,device,session,now,now);
+      AND NOT ${openMessageReportSQL('m.id')}`,message,device,session,now,now);
     if(!row || safety.memberStage(row.member)!=='member' || safety.memberStage(row.author)!=='member')return false;
     try{safety.pairAllowed(row.member,row.author);return true;}catch{return false;}
   }
@@ -64,7 +64,7 @@ export function pushQueue(db, provider, safety) {
       LEFT JOIN reviews v ON v.message=m.id WHERE j.id=? AND j.expires>? AND s.expires>?
       AND m.deleted_at IS NULL AND r.closed_at IS NULL
       AND ((m.body IS NOT NULL AND v.state IS NULL) OR (v.state='approved' AND m.photo IS NOT NULL AND m.expires>?))
-      AND NOT EXISTS (SELECT 1 FROM reports WHERE message=m.id AND status='open')`,id,now,now,now);
+      AND NOT ${openMessageReportSQL('m.id')}`,id,now,now,now);
     if (!row || safety.memberStage(row.member)!=='member' || safety.memberStage(row.author)!=='member') return false;
     try { safety.pairAllowed(row.member,row.author); return true; } catch { return false; }
   }
