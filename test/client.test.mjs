@@ -3,12 +3,13 @@ import assert from 'node:assert/strict';
 import { createContext,runInContext } from 'node:vm';
 import { readFileSync } from 'node:fs';
 import { policyVersion,reasons,rules } from '../public/rules.js';
+import { privacyEffectiveDate,privacyIntro,privacySections } from '../public/privacy.js';
 
 // Exercise the actual WebView controller with an isolated DOM and HTTP adapter.
 // The real native shells use the same controller.
 const script=readFileSync(new URL('../public/app.js',import.meta.url),'utf8')
-  .replace(/^import [^\n]+\n/,'').replace('start().catch(', 'Promise.resolve().catch(');
-function browser({version,search='',userAgent='',pathname='/app',EventSource,fetchReply}){
+  .replace(/^import [^\n]+\n/gm,'').replace('start().catch(', 'Promise.resolve().catch(');
+function browser({version,search='',userAgent='',pathname='/app',EventSource,instantSplash=false,fetchReply}){
   const nodes=new Map(),local=new Map(),session=new Map(),intervals=new Map(),events=new Map();let timerId=0,dialogId=0;
   if(version)local.set('paperchat.reset',version);
   function element(k){
@@ -29,15 +30,16 @@ function browser({version,search='',userAgent='',pathname='/app',EventSource,fet
     return nodes.get(k);
   }
   const storage=map=>({getItem:k=>map.get(k)||null,setItem:(k,v)=>map.set(k,v),clear:()=>map.clear()});
-  const location={pathname,search,replace(url){this.redirect=url;}};
-  const ctx=createContext({document:{querySelector:s=>s==='dialog[open]'?[...nodes.values()].find(el=>el.open)||null:element(s),querySelectorAll:()=>[],createElement:tag=>element(tag+ ++dialogId),hidden:false,addEventListener:(name,fn)=>events.set(name,fn)},navigator:{userAgent},
-    location,window:{EventSource,addEventListener:(name,fn)=>events.set(name,fn),scrollTo(){}},setInterval:(fn,ms)=>{const id=++timerId;intervals.set(id,{fn,ms});return id;},clearInterval:id=>intervals.delete(id),setTimeout:()=>7,clearTimeout,AbortController,
-    policyVersion,reasons,rules,sessionStorage:storage(session),localStorage:storage(local),
+  const location={pathname,search,replacements:[],replace(url){this.redirect=url;this.replacements.push(url);}};
+  const history={replaceState(state,title,url){this.replaced=url;}};
+  const ctx=createContext({document:{querySelector:s=>s==='dialog[open]'?[...nodes.values()].find(el=>el.open)||null:element(s),querySelectorAll:s=>s==='dialog[open]'?[...nodes.values()].filter(el=>el.open):[],createElement:tag=>element(tag+ ++dialogId),hidden:false,addEventListener:(name,fn)=>events.set(name,fn)},navigator:{userAgent},
+    location,history,matchMedia:()=>({matches:true}),window:{EventSource,addEventListener:(name,fn)=>events.set(name,fn),scrollTo(){}},setInterval:(fn,ms)=>{const id=++timerId;intervals.set(id,{fn,ms});return id;},clearInterval:id=>intervals.delete(id),setTimeout:(fn,ms)=>{if(instantSplash&&ms<=1300)queueMicrotask(fn);return 7;},clearTimeout,AbortController,
+    policyVersion,reasons,rules,privacyEffectiveDate,privacyIntro,privacySections,sessionStorage:storage(session),localStorage:storage(local),
     Option:class { constructor(text,value){this.text=text;this.value=value;} },
     FormData:class { constructor(form){this.form=form;}get(key){return this.form.values?.[key]??'';} },
     URLSearchParams,fetch:async(url,options)=>{const r=await fetchReply(url,options),status=r?.$status||200;return {ok:status>=200&&status<300,status,headers:{get:k=>k==='X-Service-Version'?r?.version:k==='X-Room-Version'?r?.$roomVersion:null},json:async()=>r?.$body??r};}});
   runInContext(script,ctx);
-  return {run:code=>runInContext(code,ctx),element,local,location,session,intervals,events};
+  return {run:code=>runInContext(code,ctx),element,local,location,history,session,intervals,events};
 }
 test('열린 앱에서 초기화를 감지하면 현재 화면과 가입 초안을 지우고 사용자 정보 없음 안내로 이동한다',async()=>{
   const b=browser({version:'old',fetchReply:()=>({version:'fresh',stage:'gate'})});
@@ -48,6 +50,79 @@ test('열린 앱에서 초기화를 감지하면 현재 화면과 가입 초안�
   assert.equal(b.run('me'),null);assert.equal(b.run('draft.memo'),'');assert.equal(b.local.get('paperchat.reset'),'fresh');
   const reloaded=browser({version:'fresh',search:'?reset=1',fetchReply:()=>({version:'fresh',stage:'gate'})});
   await reloaded.run('boot()');assert.match(reloaded.element('#error').textContent,/등록된 사용자 정보가 없습니다/);
+});
+
+test('웹 루트와 앱 호환 경로는 회원 인증·프로필 화면으로 시작하고 관리자 API를 호출하지 않는다',async()=>{
+  for(const pathname of ['/','/app'])for(const signedIn of [false,true]){
+    const requests=[];
+    const b=browser({pathname,instantSplash:true,fetchReply:url=>{
+      requests.push(url);
+      if(url==='/api/people')return [];
+      if(url==='/api/unread')return {total:0};
+      return signedIn?{stage:'member',profile:{id:'self',nick:'회원',area:'서울 동부'}}:{stage:'gate'};
+    }});
+    await b.run('start()');
+    assert.equal(b.run('admin'),false);assert.equal(b.run('memberPath'),pathname);
+    assert.equal(requests[0],'/api/status?member=1');assert.ok(requests.includes('/api/state'));
+    assert.equal(requests.some(url=>url.startsWith('/api/admin/')),false);
+    assert.match(b.element('#app').innerHTML,signedIn?/프로필 목록/:/인증키를 입력해 주세요/);
+    assert.equal(b.location.redirect,undefined);
+  }
+});
+
+test('관리자 화면은 정확한 새 경로에서만 시작하며 로그아웃 후에도 경로를 유지한다',async()=>{
+  const requests=[];
+  const b=browser({pathname:'/codenotekyh',fetchReply:url=>{requests.push(url);return {};}});
+  await b.run('start()');
+  assert.equal(b.run('admin'),true);assert.deepEqual(requests,['/api/status','/api/admin/settings']);
+  assert.match(b.element('#app').innerHTML,/운영자 관리실/);
+  await b.element('#out').handlers.click({});
+  assert.equal(requests.at(-1),'/api/admin/logout');assert.match(b.element('#app').innerHTML,/관리자 로그인/);
+  assert.equal(b.location.pathname,'/codenotekyh');assert.equal(b.location.redirect,undefined);
+  for(const pathname of ['/admin','/admin/','/codenotekyh-extra'])assert.equal(browser({pathname,fetchReply:()=>({})}).run('admin'),false);
+});
+
+test('회원 로그아웃과 탈퇴는 웹 루트 및 앱 경로를 각각 유지한다',async()=>{
+  for(const pathname of ['/','/app'])for(const action of ['logout','withdraw']){
+    const requests=[];
+    const b=browser({pathname,fetchReply:(url,options)=>{requests.push([url,JSON.parse(options.body)]);return {};}});
+    b.run("stage='member';me={id:'self',nick:'회원'};settings()");
+    await b.element('#'+action).handlers.click({});
+    if(action==='withdraw')await b.element('#proceed').onclick();
+    assert.deepEqual(requests,[['/api/'+action,action==='withdraw'?{confirm:true}:{}]]);
+    assert.equal(b.location.redirect,pathname);
+  }
+});
+
+test('서버 초기화는 현재 회원 또는 관리자 진입 경로로 돌아간다',async()=>{
+  for(const pathname of ['/','/app','/codenotekyh']){
+    const b=browser({pathname,version:'old',fetchReply:()=>({version:'fresh',stage:'gate'})});
+    b.element('#app').innerHTML='이전 화면';b.run("draft.memo='작성 중'");
+    await b.run('pulse(true)');
+    assert.equal(b.location.redirect,pathname+'?reset=1');assert.equal(b.element('#app').innerHTML,'');assert.equal(b.run('draft.memo'),'');
+  }
+});
+
+test('알림 진입의 inbox query를 지울 때 웹 루트와 앱 경로를 유지한다',async()=>{
+  for(const pathname of ['/','/app']){
+    const requests=[];
+    const b=browser({pathname,search:'?inbox=1',fetchReply:url=>{
+      requests.push(url);if(url==='/api/rooms')return [];if(url==='/api/unread')return {total:0};
+      return {stage:'member',profile:{id:'self',nick:'회원'}};
+    }});
+    await b.run('boot()');
+    assert.equal(b.history.replaced,pathname);assert.match(b.element('#app').innerHTML,/내 대화/);
+    assert.ok(requests.includes('/api/rooms'));assert.equal(requests.includes('/api/people'),false);
+  }
+});
+
+test('일반 브라우저는 네이티브 푸시 연결을 요청하거나 설정 기능을 노출하지 않는다',async()=>{
+  for(const pathname of ['/','/app']){
+    const requests=[];const b=browser({pathname,userAgent:'Mozilla/5.0',fetchReply:url=>{requests.push(url);return {};}});
+    b.run("stage='member';me={id:'self',nick:'회원'};settings()");await b.run('syncPush(true)');
+    assert.deepEqual(requests,[]);assert.equal(b.location.href,undefined);
+    assert.doesNotMatch(b.element('#app').innerHTML+b.element('#sections').innerHTML,/push-settings|push-check|캡처가 차단|스크린샷이 차단/);
+  }
 });
 
 test('네이티브 뒤로가기는 상세에서 목록으로 이동하고 첫 화면에서는 종료를 요청하지 않는다',async()=>{
@@ -131,6 +206,53 @@ test('규칙 동의 문구와 설정 카드',()=>{
   assert.doesNotMatch(b.element('#app').innerHTML+b.element('#sections').innerHTML,/채팅 알림|push-settings|push-check/);
 });
 
+test('개인정보 처리방침은 공유 원문의 모든 문단을 앱 안에서 표시한다',async()=>{
+  const b=browser({fetchReply:()=>{throw new Error('정책을 읽는 데 요청이 필요하지 않음');}});
+  b.run('gate()');assert.match(b.element('#app').innerHTML,/id="privacy"[^>]*>개인정보 처리방침/);
+  await b.element('#privacy').handlers.click({});
+  const dialog=b.element('dialog1');assert.equal(dialog.open,true);
+  assert.equal(dialog.attributes['aria-labelledby'],'privacy-title');
+  const escape=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const intro=Array.isArray(privacyIntro)?privacyIntro:[privacyIntro];
+  for(const value of [privacyEffectiveDate,...intro,...privacySections.flatMap(s=>[s.title,...s.paragraphs||[],...s.bullets||[]])])assert.ok(dialog.innerHTML.includes(escape(value)),String(value));
+  assert.doesNotMatch(dialog.innerHTML,/<iframe|target="_blank"/);
+  assert.equal(b.location.href,undefined);assert.equal(b.location.redirect,undefined);
+});
+
+test('가입 중 정책을 열고 네이티브 뒤로가기를 해도 입력·동의·화면 이벤트가 유지된다',async()=>{
+  for(const screen of ['gate()','memo()']){
+    const b=browser({fetchReply:()=>({})});
+    b.run("draft.nick='봄';draft.province='서울';draft.district='동부';draft.memo='초안'");b.run(screen);
+    b.element('#code').value='입력 중인 키';b.element('#memo').value='저장 전 소개글';b.element('input[type=checkbox]').checked=true;
+    const html=b.element('#app').innerHTML,view=b.run('epoch'),back=b.run('currentBack'),handler=b.element('form').handlers.submit;
+    await b.element('#privacy').handlers.click({});
+    assert.equal(b.run('epoch'),view);assert.equal(b.run('currentBack'),back);
+    assert.equal(b.run('window.paperChatBack()'),true);assert.equal(b.element('dialog1').open,false);
+    assert.equal(b.element('#app').innerHTML,html);assert.equal(b.element('form').handlers.submit,handler);
+    assert.equal(b.element('#code').value,'입력 중인 키');assert.equal(b.element('#memo').value,'저장 전 소개글');assert.equal(b.element('input[type=checkbox]').checked,true);
+    assert.equal(b.run('draft.memo'),'초안');assert.equal(b.run('draft.district'),'동부');
+  }
+});
+
+test('설정의 독립 개인정보 버튼을 닫으면 설정 화면과 계정 상태를 유지한다',async()=>{
+  const b=browser({fetchReply:()=>({})});
+  b.run("stage='member';me={id:'a',nick:'가을',year:1995,gender:'여성',area:'서울 동부',memo:'소개'};settings()");
+  assert.match(b.element('#app').innerHTML,/<button id="privacy" class="menu /);
+  assert.equal((b.element('#app').innerHTML.match(/id="privacy"/g)||[]).length,1);
+  assert.doesNotMatch(b.element('#sections').innerHTML,/id="privacy"/);
+  const html=b.element('#app').innerHTML,view=b.run('epoch');
+  await b.element('#privacy').handlers.click({});b.element('#privacy-close').onclick();
+  assert.equal(b.element('dialog1').open,false);assert.equal(b.element('#app').innerHTML,html);assert.equal(b.run('epoch'),view);assert.equal(b.run('stage'),'member');
+});
+
+test('정책을 읽는 중 계정이 폐기되면 닫고 이전 설정 대신 인증 화면으로 돌아간다',async()=>{
+  const b=browser({fetchReply:()=>({stage:'gate'})});
+  b.run("stage='member';me={id:'a',nick:'이전 회원'};settings();privacyPage()");assert.equal(b.element('dialog1').open,true);
+  await b.run('pulse(true)');
+  assert.equal(b.element('dialog1').open,false);assert.equal(b.run('stage'),'gate');assert.equal(b.run('me'),null);
+  assert.match(b.element('#app').innerHTML,/인증키를 입력해 주세요/);assert.doesNotMatch(b.element('#app').innerHTML,/이전 회원/);
+});
+
 test('관리자 대화 목록은 전체로 열리고 참여자별 지역을 구분한다',async()=>{
   const paths=[];
   const b=browser({fetchReply:url=>{paths.push(url);return [{id:'r',first:'가을',firstArea:'경기도 이천시',second:'겨울',secondArea:'서울특별시 중구'}];}});
@@ -185,6 +307,87 @@ test('회원 401은 민감 상태를 비우며 늦은 정상 응답도 이전 �
   assert.equal(b.run('currentBack'),null);assert.match(b.element('#app').innerHTML,/인증키를 입력해 주세요/);assert.doesNotMatch(b.element('#app').innerHTML,/차단 회원|개인 정보/);
 });
 
+test('회원 요청에는 화면 계정 헤더를 보내고 상태 확인·의도한 로그인·관리자 요청에서는 제외한다',async()=>{
+  const requests=[];const b=browser({pathname:'/',fetchReply:(url,options)=>{requests.push([url,options.headers]);return {};}});
+  b.run("stage='member';me={id:'account-a'}");
+  await b.run("api('profile',{area:'서울 동부',memo:'소개'})");await b.run("api('state')");
+  await b.run("api('status')");await b.run("api('key',{code:'signup'})");await b.run("api('account/login',{code:'recovery'})");await b.run("api('admin/settings')");
+  assert.equal(requests[0][1]['X-PaperChat-Member'],'account-a');assert.equal(requests[0][1]['Content-Type'],'application/json');
+  assert.equal(requests[1][1]['X-PaperChat-Member'],'account-a');assert.equal(requests[1][1]['Content-Type'],undefined);
+  for(const [,headers] of requests.slice(2))assert.equal(headers['X-PaperChat-Member'],undefined);
+});
+
+test('다른 탭에서 로그인 계정이 바뀌면 같은 member 상태여도 화면·초안·실시간 연결을 비우고 현재 경로를 다시 연다',async()=>{
+  for(const pathname of ['/','/app'])for(const memberId of ['account-b',null]){
+    const {sources,EventSource}=eventStreams();
+    const b=browser({pathname,EventSource,fetchReply:url=>url.startsWith('/api/status')?{stage:memberId?'member':'gate',memberId}:{total:0}});
+    b.run("stage='member';me={id:'account-a',nick:'이전 계정'};accountState={profile:me};draft.memo='전송 전 초안';unreadTotal=4;settings();updatePresence()");await settle();
+    b.session.set('draft','이전 비밀');
+    await b.run('pulse(true)');
+    assert.equal(b.location.redirect,pathname);assert.equal(b.location.replacements.length,1);assert.equal(sources[0].closed,true);
+    assert.equal(b.element('#app').innerHTML,'');assert.equal(b.element('#app').inert,true);assert.equal(b.element('#lockscreen').hidden,false);
+    assert.equal(b.run('me'),null);assert.equal(b.run('draft.memo'),'');assert.equal(b.run('unreadTotal'),0);assert.equal(b.run('Object.keys(accountState).length'),0);assert.equal(b.session.size,0);
+    await b.run('pulse(true)');assert.equal(b.location.replacements.length,1);
+  }
+});
+
+test('계정 식별자가 같거나 아직 없는 이전 응답은 현재 회원 화면을 불필요하게 초기화하지 않는다',async()=>{
+  for(const status of [{stage:'member',memberId:'account-a'},{stage:'member'}]){
+    const b=browser({pathname:'/',fetchReply:url=>url.startsWith('/api/status')?status:{total:0}});
+    b.run("stage='member';me={id:'account-a',nick:'현재 회원'};settings()");
+    await b.run('pulse(true)');assert.equal(b.location.redirect,undefined);assert.equal(b.run('me.id'),'account-a');assert.match(b.element('#app').innerHTML,/현재 회원/);
+  }
+});
+
+test('프로필이 없는 제한·규칙동의 계정도 state의 회원 식별자로 요청을 묶고 다른 계정으로 바뀌면 비운다',async()=>{
+  for(const stage of ['restricted','policy']){
+    let memberId='account-a';const requests=[];
+    const b=browser({pathname:'/',fetchReply:(url,options)=>{
+      requests.push([url,options.headers]);
+      return {stage,memberId,profile:null,restrictedUntil:12345};
+    }});
+    await b.run('boot()');assert.equal(b.run('me'),null);assert.equal(b.run('currentMemberId()'),'account-a');
+    await b.run("api('account/recovery')");
+    assert.equal(requests.find(([url])=>url==='/api/account/recovery')[1]['X-PaperChat-Member'],'account-a');
+    memberId='account-b';await b.run('pulse(true)');
+    assert.equal(b.location.redirect,'/');assert.equal(b.element('#app').innerHTML,'');assert.equal(b.run('currentMemberId()'),null);
+    assert.equal(requests.find(([url])=>url==='/api/status?member=1')[1]['X-PaperChat-Member'],undefined);
+  }
+});
+
+test('계정 변경으로 거부된 변경 요청은 즉시 내용을 숨기고 늦은 성공 응답 및 중복 요청을 무시한다',async()=>{
+  let finishBlocks;const conflicts=[],requests=[];
+  const {sources,EventSource}=eventStreams();
+  const b=browser({pathname:'/',EventSource,fetchReply:(url,options)=>{
+    requests.push([url,options.headers]);
+    if(url==='/api/blocks')return new Promise(resolve=>{finishBlocks=resolve;});
+    if(url==='/api/profile')return new Promise(resolve=>{conflicts.push(resolve);});
+    return {total:0};
+  }});
+  b.run("stage='member';me={id:'account-a',nick:'이전 계정'};settings();updatePresence();draft.memo='이전 초안'");await settle();
+  const oldView=b.run('blockedList()');
+  const first=b.run("api('profile',{area:'서울 동부',memo:'잘못 저장하면 안 됨'})"),second=b.run("api('profile',{area:'서울 동부',memo:'동시 요청'})");
+  const rejection={$status:409,$body:{error:'로그인 계정이 변경되었어요.',code:'ACCOUNT_CHANGED'}};
+  conflicts[0](rejection);await assert.rejects(first,e=>e.stale===true);
+  assert.equal(b.element('#app').innerHTML,'');assert.equal(b.element('#lockscreen').hidden,false);assert.equal(sources[0].closed,true);
+  assert.equal(b.run('me'),null);assert.equal(b.run('draft.memo'),'');assert.equal(b.location.redirect,'/');
+  conflicts[1](rejection);await assert.rejects(second,e=>e.stale===true);
+  finishBlocks([{id:'old-peer',nick:'늦은 예전 계정 목록'}]);await assert.rejects(oldView,e=>e.stale===true);
+  assert.equal(b.location.replacements.length,1);assert.equal(b.element('#app').innerHTML,'');
+  const before=requests.length;await assert.rejects(b.run("api('profile',{area:'서울 동부',memo:'다시 시도'})"),e=>e.stale===true);assert.equal(requests.length,before);
+  for(const [,headers] of requests)assert.equal(headers['X-PaperChat-Member'],'account-a');
+});
+
+test('관리자 화면은 일반 회원 계정 변경 응답과 헤더 바인딩의 영향을 받지 않는다',async()=>{
+  const requests=[];const b=browser({pathname:'/codenotekyh',fetchReply:(url,options)=>{
+    requests.push([url,options.headers]);return url==='/api/status'?{stage:'member',memberId:'account-b',adminSignedIn:true}:{$status:409,$body:{error:'관리자 요청 오류',code:'ACCOUNT_CHANGED'}};
+  }});
+  b.run("me={id:'account-a'};adminLogin()");const html=b.element('#app').innerHTML;
+  await b.run('pulse(true)');await assert.rejects(b.run("api('admin/settings',{url:'https://example.com'})"),e=>e.status===409&&!e.stale);
+  assert.equal(b.location.redirect,undefined);assert.equal(b.element('#app').innerHTML,html);assert.equal(b.run('me.id'),'account-a');
+  for(const [,headers] of requests)assert.equal(headers['X-PaperChat-Member'],undefined);
+});
+
 test('부팅 중 미독 응답을 기다리다 회원이 삭제되어도 가입 화면을 유지한다',async()=>{
   let finishUnread;
   const b=browser({fetchReply:url=>{
@@ -200,10 +403,10 @@ test('부팅 중 미독 응답을 기다리다 회원이 삭제되어도 가입 
 });
 
 test('로그인 실패와 관리자 401은 회원 삭제 초기화로 처리하지 않는다',async()=>{
-  for(const pathname of ['/app','/admin']){
+  for(const pathname of ['/','/app','/codenotekyh']){
     const b=browser({pathname,fetchReply:()=>({$status:401,$body:{error:'코드 확인'}})});
-    b.run(pathname==='/admin'?'adminLogin()':'loginPage()');const html=b.element('#app').innerHTML;
-    await assert.rejects(b.run(pathname==='/admin'?"api('admin/settings')":"api('account/login',{code:'wrong'})"),e=>e.status===401&&!e.stale);
+    b.run(pathname==='/codenotekyh'?'adminLogin()':'loginPage()');const html=b.element('#app').innerHTML;
+    await assert.rejects(b.run(pathname==='/codenotekyh'?"api('admin/settings')":"api('account/login',{code:'wrong'})"),e=>e.status===401&&!e.stale);
     assert.equal(b.element('#app').innerHTML,html);
   }
 });
@@ -256,13 +459,13 @@ test('문서 숨김과 pagehide는 offline을 전송하고 pageshow는 온라인
   b.events.get('pageshow')({persisted:false});await settle();assert.deepEqual(requests.at(-1),['/api/presence',{online:true}]);
 });
 
-test('내 메시지 삭제는 원본 보관을 확인하고 즉시 제거하며 늦은 폴링에도 다시 나타나지 않는다',async()=>{
+test('내 메시지 삭제는 양쪽에서 사라짐을 확인하고 즉시 제거하며 늦은 폴링에도 다시 나타나지 않는다',async()=>{
   const own={id:1,author:'a',nick:'나',body:'삭제할 메시지',sent:1};const requests=[];
   const b=browser({fetchReply:(url,options)=>{requests.push([url,options.body]);if(url.includes('/messages'))return [own];return {total:0};}});
   b.run("stage='member';me={id:'a'}");await b.run("conversation('r','대화',false,rooms,'b')");
   assert.match(b.element('#log').innerHTML,/data-delete-message="1"/);
   await b.element('#log').handlers.click({target:{closest:s=>s==='[data-delete-message]'?{dataset:{deleteMessage:'1'}}:null}});
-  assert.match(b.element('dialog1').innerHTML,/관리자는 원래 대화에서 확인/);assert.match(b.element('dialog1').innerHTML,/사진은 전송 후 12시간/);
+  assert.match(b.element('dialog1').innerHTML,/양쪽 대화에서 사라져요/);assert.match(b.element('dialog1').innerHTML,/사진은 전송 후 12시간/);assert.doesNotMatch(b.element('dialog1').innerHTML,/관리자|운영자/);
   await b.element('#proceed').onclick();assert.doesNotMatch(b.element('#log').innerHTML,/삭제할 메시지/);
   assert.ok(requests.some(([url,body])=>url==='/api/messages/1/delete'&&body==='{"confirm":true}'));
   b.intervals.get(b.run('activeTimer')).fn();await settle();assert.doesNotMatch(b.element('#log').innerHTML,/삭제할 메시지/);
@@ -284,7 +487,7 @@ test('상대방 삭제 tombstone은 기존 대화에서 사라지며 삭제만 �
 });
 
 test('관리자는 기존 대화에서 삭제된 채팅·사진을 구분하며 만료 사진은 열지 않는다',async()=>{
-  const b=browser({pathname:'/admin',fetchReply:()=>[
+  const b=browser({pathname:'/codenotekyh',fetchReply:()=>[
     {id:4,room:'r',author:'a',nick:'보낸이',body:'보관할 원문',sent:1,deleted:true,deletedAt:2},
     {id:5,room:'r',author:'a',nick:'보낸이',expires:Date.now()+60000,viewable:1,visibility:'visible',sent:1,deleted:true,deletedAt:2},
     {id:6,room:'r',author:'a',nick:'보낸이',expires:1,viewable:1,visibility:'visible',sent:1,deleted:true,deletedAt:2}
@@ -297,7 +500,7 @@ test('관리자는 기존 대화에서 삭제된 채팅·사진을 구분하며 
 });
 
 test('관리자는 30일 미접속 목록과 상세에서 회원 삭제를 확인하고 목록으로 돌아온다',async()=>{
-  const paths=[];const b=browser({pathname:'/admin',fetchReply:(url,options)=>{
+  const paths=[];const b=browser({pathname:'/codenotekyh',fetchReply:(url,options)=>{
     paths.push([url,options.body]);
     if(url==='/api/admin/members/a')return {id:'a',nick:'오래된 회원',status:'active',lastSeen:1,online:false};
     if(url.endsWith('/delete'))return {};

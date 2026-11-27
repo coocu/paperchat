@@ -65,6 +65,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
       const req=Readable.from(body===undefined?[]:[Buffer.from(JSON.stringify(body))]);
       req.method=body===undefined?'GET':'POST';req.url=path;req.socket={remoteAddress:options.ip||'test-local'};
       req.headers={'content-type':'application/json',origin:options.origin||origin,'user-agent':options.userAgent||'test-browser',cookie:[...cookies].map(([k,v])=>k+'='+v).join('; ')};
+      if(options.memberId!==undefined)req.headers['x-paperchat-member']=options.memberId;
       const result=await new Promise((done,reject)=>{
         const headers={};
         const res={status:200,getHeader(k){return headers[k.toLowerCase()];},setHeader(k,v){headers[k.toLowerCase()]=v;},writeHead(n,h){this.status=n;Object.entries(h||{}).forEach(([k,v])=>this.setHeader(k,v));},
@@ -133,19 +134,34 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     db.prepare('DELETE FROM members WHERE id=?').run(member);
     registry.delete(code);
   });
-  await t.test('서버 첫 화면과 모바일 진입점, 승인 전 운영자 자료 접근을 구분한다',async()=>{
-    for(const path of ['/','/admin/','/?inbox=1','/app','/app/','/identity-return']) {
-      const r=await nobody(path);assert.equal(r.status,302);assert.equal(r.headers.location,'/admin');
+  await t.test('일반 웹과 앱은 회원 화면을 열고 관리자 새 경로도 API 인증을 우회하지 않는다',async()=>{
+    const browsers=['test-browser','Mozilla/5.0 Chrome/144 Safari/537.36','iPhone AppleWebKit/605.1 Mobile/15 Safari/604.1'];
+    const shells=['Mobile PaperChatIOS/3','WebView PaperChatAndroid/2','iPhone AppleWebKit/605.1 Mobile/15'];
+    for(const userAgent of [...browsers,...shells]) {
+      for(const path of ['/','/?inbox=1','/app','/app?inbox=1','/codenotekyh']) {
+        const r=await nobody(path,undefined,{userAgent});
+        assert.equal(r.status,200);assert.match(r.headers['content-type'],/^text\/html/);assert.equal(r.headers.location,undefined);
+        assert.match(String(r.body),/app\.js/);
+      }
+      for(const path of ['/app','/codenotekyh']) {
+        const r=await nobody(path+'/?inbox=1&return=%2Fprivacy',undefined,{userAgent});
+        assert.equal(r.status,302);assert.equal(r.headers.location,path+'?inbox=1&return=%2Fprivacy');
+      }
+      for(const path of ['/admin','/admin/','/admin?next=1','/admin/?next=1']) {
+        const r=await nobody(path,undefined,{userAgent});
+        assert.equal(r.status,404);assert.equal(r.headers.location,undefined);assert.doesNotMatch(JSON.stringify(r.body),/codenotekyh/);
+      }
+      for(const path of ['/api/admin/members','/api/admin/review','/api/admin/rooms?area=x','/api/admin/photos/1'])
+        assert.equal((await nobody(path,undefined,{userAgent})).status,401);
+      const destination=shells.includes(userAgent)?'/app':'/';
+      const returned=await nobody('/identity-return?inbox=1&result=ok',undefined,{userAgent});
+      assert.equal(returned.status,302);assert.equal(returned.headers.location,destination+'?inbox=1&result=ok');
+      const missing=await nobody('/apply',undefined,{userAgent});
+      assert.equal(missing.status,303);assert.equal(missing.headers.location,destination+'?form=unavailable');
     }
-    assert.equal((await nobody('/admin')).status,200);
-    for(const userAgent of ['Mobile PaperChatIOS/3','WebView PaperChatAndroid/2','iPhone AppleWebKit/605.1 Mobile/15']){
-      assert.equal((await nobody('/app',undefined,{userAgent})).status,200);
-      assert.equal((await nobody('/identity-return',undefined,{userAgent})).headers.location,'/app');
-      assert.equal((await nobody('/app/?inbox=1',undefined,{userAgent})).headers.location,'/app?inbox=1');
-    }
-    assert.equal((await nobody('/?inbox=1',undefined,{userAgent:'WebView PaperChatAndroid/2'})).headers.location,'/app?inbox=1');
-    for(const path of ['/api/admin/members','/api/admin/review','/api/admin/rooms?area=x','/api/admin/photos/1'])
-      assert.equal((await nobody(path,undefined,{userAgent:'WebView PaperChatAndroid/2'})).status,401);
+    for(const path of ['/admin','/admin/'])assert.equal((await nobody(path,{})).status,404);
+    assert.equal((await nobody('/api/admin/login',{key:adminKey},{origin:'https://other.example'})).status,403);
+    assert.equal((await nobody('/api/admin/members')).status,401);
     assert.equal((await nobody('/health')).body.ok,true);
     assert.equal((await nobody('/api/public-info')).body.appName,'종이편지');
   });
@@ -245,6 +261,50 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.deepEqual((await a('/api/state')).body.profile,old);
   });
   let room,photo;
+  await t.test('다른 탭의 계정 쿠키로 바뀌면 오래된 회원 요청을 변경 전에 거부한다',async()=>{
+    const oldMember=(await a('/api/state')).body.profile;
+    const current=client();
+    assert.equal((await pass(current,'새 탭 회원','DI-tab-switch')).status,200);
+    await current('/api/register',{area:'서울 중부',memo:'변경 전 소개글',policy:policyVersion});
+    const member=(await current('/api/state')).body.profile;
+    recovery.set('DI-tab-switch',(await current('/api/account/recovery')).body.code);
+    const sharedRoom=(await current('/api/room',{peer:oldMember.id})).body.id;
+    const stale={memberId:oldMember.id},fresh={memberId:member.id};
+    assert.equal((await current('/api/status',undefined,stale)).body.memberId,member.id);
+    assert.equal((await nobody('/api/status')).body.memberId,null);
+    const changed={error:'다른 탭에서 로그인 정보가 변경됐어요. 다시 연결해 주세요.',code:'ACCOUNT_CHANGED'};
+    for(const [path,body] of [
+      ['/api/state',undefined],['/api/people',undefined],['/api/events',undefined],
+      ['/api/rooms/'+sharedRoom+'/messages',{body:'오래된 탭의 메시지'}],
+      ['/api/profile',{area:'부산 전체',memo:'오래된 탭의 소개글'}],
+      ['/api/logout',{}],['/api/withdraw',{confirm:true}]
+    ]) {
+      const response=await current(path,body,stale);
+      assert.equal(response.status,409);assert.deepEqual(response.body,changed);
+      assert.equal(response.headers['set-cookie'],undefined);
+    }
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages WHERE room=?').get(sharedRoom).n,0);
+    assert.deepEqual((await current('/api/state',undefined,fresh)).body.profile,member);
+    assert.equal((await current('/api/state',undefined,fresh)).body.memberId,member.id);
+    assert.equal((await current('/api/state')).body.profile.id,member.id); // Older shells omit the header.
+    assert.equal((await current('/api/profile',{area:'부산 전체',memo:'정상 변경'},fresh)).status,200);
+    assert.equal((await current('/api/rooms/'+sharedRoom+'/messages',{body:'현재 계정 메시지'},fresh)).status,200);
+    assert.equal(db.prepare('SELECT author,body FROM messages WHERE room=?').get(sharedRoom).author,member.id);
+    assert.equal((await current('/api/logout',{},fresh)).status,200);
+    assert.equal((await current('/api/status',undefined,fresh)).body.memberId,null);
+    assert.equal((await current('/api/state',undefined,fresh)).status,409);
+    assert.equal((await current('/api/state')).body.stage,'gate');
+    assert.equal((await current('/api/state')).body.memberId,null);
+    assert.equal((await pass(current,'','DI-tab-switch')).status,200);
+    assert.equal((await current('/api/profile',{area:'제주 전체',memo:'다른 출처 요청'},{...fresh,origin:'https://other.example'})).status,403);
+    assert.equal((await current('/api/admin/settings',undefined,stale)).status,401);
+    assert.equal((await admin('/api/admin/settings',undefined,stale)).status,200);
+    assert.equal((await current('/api/withdraw',{confirm:true},fresh)).status,200);
+    assert.equal((await current('/api/status')).body.memberId,null);
+    assert.equal(db.prepare('SELECT 1 FROM members WHERE id=?').get(member.id),undefined);
+    assert.deepEqual((await a('/api/state')).body.profile,oldMember);
+    db.prepare('DELETE FROM departures WHERE id=?').run(member.id);
+  });
   const android={platform:'android',token:'abcd:android-token-for-test'};
   const iphone={platform:'ios-dev',token:'abcd'.repeat(16)};
   await t.test('플랫폼별 발송 설정 상태를 기기 등록과 별개로 조회한다',async()=>{
@@ -458,6 +518,9 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     db.prepare('DELETE FROM acceptances WHERE member=?').run(C.id);
     server.emit('close');server=makeServer(cfg,providers);
     assert.equal((await c('/api/state')).body.stage,'policy');
+    assert.equal((await c('/api/state',undefined,{memberId:C.id})).body.memberId,C.id);
+    assert.equal((await c('/api/state')).body.profile,null);
+    assert.equal((await c('/api/status')).body.memberId,C.id);
     assert.equal((await c('/api/state')).body.needsRecoveryCopy,true);
     assert.equal((await c('/api/account/recovery')).body.code,recovery.get('DI-C'));
     assert.equal((await c('/api/people?area='+encodeURIComponent(C.area))).status,403);
@@ -516,6 +579,9 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
       }
       assert.equal((await c('/api/people')).status,403);
       await pass(c,'','DI-C');assert.equal((await c('/api/state')).body.stage,'restricted');
+      assert.equal((await c('/api/state',undefined,{memberId:C.id})).body.memberId,C.id);
+      assert.equal((await c('/api/state')).body.profile,null);
+      assert.equal((await c('/api/status')).body.memberId,C.id);
       if(cycle===0){
         now+=24*hour-1;assert.equal((await c('/api/status')).body.stage,'restricted');
         now+=1;assert.equal((await c('/api/status')).body.stage,'member');
@@ -564,8 +630,8 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.equal((await admin('/api/admin/members/'+oldMember)).status,404);
     assert.deepEqual((await admin('/api/admin/members')).body,{items:[],more:false,counts:{active:0,inactive:0,withdrawn:0}});
     assert.deepEqual((await admin('/api/admin/review')).body,{photos:[],reports:[]});
-    assert.match(String((await nobody('/apply')).body),/발급 주소/);
-    assert.match((await nobody('/apply',undefined,{userAgent:'WebView PaperChatAndroid/2'})).headers.location,/unavailable/);
+    assert.equal((await nobody('/apply')).headers.location,'/?form=unavailable');
+    assert.equal((await nobody('/apply',undefined,{userAgent:'WebView PaperChatAndroid/2'})).headers.location,'/app?form=unavailable');
   });
 });
 

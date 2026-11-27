@@ -12,6 +12,7 @@ import { pushProvider } from './push-provider.mjs';
 import { pushQueue } from './push-queue.mjs';
 import { moderation, checkText } from './moderation.mjs';
 import { policyVersion } from './public/rules.js';
+import { renderPrivacyPage } from './privacy.mjs';
 import { regions, normalizeArea } from './regions.mjs';
 
 function directoryArea(url) {
@@ -22,7 +23,7 @@ function directoryArea(url) {
   return area;
 }
 const profileCols='id,nick,year,gender,area,memo';
-const assets=new Map(Object.entries({'/app':'index.html','/admin':'index.html','/privacy':'privacy.html','/support':'support.html','/app.js':'app.js','/theme.css':'theme.css','/icon.svg':'icon.svg','/headings.woff':'headings.woff','/rules.js':'rules.js'}));
+const assets=new Map(Object.entries({'/':'index.html','/app':'index.html','/codenotekyh':'index.html','/support':'support.html','/app.js':'app.js','/theme.css':'theme.css','/icon.svg':'icon.svg','/headings.woff':'headings.woff','/rules.js':'rules.js','/privacy.js':'privacy.js'}));
 const type={html:'text/html',js:'text/javascript',css:'text/css',svg:'image/svg+xml',woff:'font/woff'};
 const token=()=>randomBytes(32).toString('hex');
 const digest=s=>createHash('sha256').update(s).digest();
@@ -254,15 +255,19 @@ export function makeServer(config, upstream=providers) {
     const ip=(process.env.RENDER==='true'?String(req.headers['x-forwarded-for']||'').split(',').at(-1).trim():'')||req.socket.remoteAddress;
     if(!post && req.method!=='GET') reject(405,'허용되지 않은 요청이에요.');
     const ok=(data={})=>finish(res,200,data);
-    // Select the UI only. Each data API checks its own session and permissions.
+    // Browser and native shells share the member UI. Each data API still checks
+    // its own session; the administrator page's location grants no permission.
     const ua=req.headers['user-agent'] || '';
     const native=/\bPaperChat(?:Android|IOS)\/\d+\b/.test(ua);
     // Support previously installed iOS shells until they adopt the app marker.
     const oldWebView=/AppleWebKit\//.test(ua) && /Mobile\//.test(ua) && !/Safari\//.test(ua);
     const mobile=native || oldWebView;
-    if(!post && (p==='/' || p==='/admin/' || p==='/app/' || (p==='/app' && !mobile) || p==='/identity-return')) {
-      const destination=mobile && p!=='/admin/' ? '/app'+u.search : '/admin';
-      res.writeHead(302,{Location:destination,Vary:'User-Agent'});return res.end();
+    if(p==='/admin' || p==='/admin/')reject(404,'페이지를 찾을 수 없어요.');
+    if(!post && (p==='/app/' || p==='/codenotekyh/')) {
+      res.writeHead(302,{Location:p.slice(0,-1)+u.search});return res.end();
+    }
+    if(!post && p==='/identity-return') {
+      res.writeHead(302,{Location:(mobile?'/app':'/')+u.search,Vary:'User-Agent'});return res.end();
     }
     if(!post && p==='/api/push/availability') {
       const available=platform=>Boolean(delivery.enabled(platform));
@@ -274,8 +279,9 @@ export function makeServer(config, upstream=providers) {
       let supportUrl='';
       try {const url=new URL(process.env.SUPPORT_URL || '');if(url.protocol==='https:' && !url.username && !url.password)supportUrl=url.href;}catch{}
       return ok({supportEmail:/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)?email:'',supportUrl,
-        operator:String(process.env.OPERATOR_NAME || '').trim(),appName:'종이편지'});
+        operator:String(process.env.OPERATOR_NAME || 'CodeNote').trim(),appName:'종이편지'});
     }
+    if(!post && p==='/privacy')return finish(res,200,renderPrivacyPage(),'text/html; charset=utf-8');
     if(!post && assets.has(p)) {
       const file=assets.get(p);
       return finish(res,200,readFileSync(new URL('./public/'+file,import.meta.url)),type[file.split('.').at(-1)]+'; charset=utf-8');
@@ -287,8 +293,7 @@ export function makeServer(config, upstream=providers) {
     if(!post && p==='/apply') {
       const link=configURL();
       if(!link) {
-        if(!mobile)return finish(res,200,'아직 등록된 인증키 발급 주소가 없습니다. 앱으로 돌아가 주세요.','text/plain; charset=utf-8');
-        res.writeHead(303,{Location:'/app?form=unavailable'});return res.end();
+        res.writeHead(303,{Location:(mobile?'/app':'/')+'?form=unavailable',Vary:'User-Agent'});return res.end();
       }
       res.writeHead(303,{Location:link});return res.end();
     }
@@ -301,7 +306,23 @@ export function makeServer(config, upstream=providers) {
       if(!s && /(?:^|;\s*)pc_user=/.test(req.headers.cookie||''))cookie(res,'pc_user','',0);
       const identity=s?.kind==='member'?get('SELECT identity FROM members WHERE id=?',s.member)?.identity:null;
       return ok({version:revision,adminSignedIn,stage:s?.kind==='member'?safety.memberStage(s.member):(s?.kind||'gate'),
+        memberId:s?.kind==='member'?s.member:null,
         ...(identity?safety.penalty(identity):{})});
+    }
+    let b={};
+    if(post) {
+      if(req.headers.origin!==base) reject(403,'요청 출처를 확인할 수 없어요.');
+      b=await payload(req);
+      if(revision!==resetVersion()) reject(409,'서버가 초기화됐어요.');
+    }
+    // Browser tabs share cookies but keep separate page state. An old tab must
+    // never act on the account most recently selected in another tab.
+    const expectedMember=req.headers['x-paperchat-member'];
+    if(p.startsWith('/api/') && !p.startsWith('/api/admin/') && p!=='/api/status' && expectedMember!==undefined) {
+      const s=sessions(req),currentMember=s?.kind==='member'?s.member:null;
+      if(expectedMember!==currentMember)return finish(res,409,{
+        error:'다른 탭에서 로그인 정보가 변경됐어요. 다시 연결해 주세요.',code:'ACCOUNT_CHANGED'
+      });
     }
     if(!post && p==='/api/events') {
       const s=need(req,'member',true),stream={session:s.id,member:s.member,res};
@@ -310,12 +331,6 @@ export function makeServer(config, upstream=providers) {
       res.on('close',()=>streams.delete(stream));
       res.write(': connected\n\n');
       return;
-    }
-    let b={};
-    if(post) {
-      if(req.headers.origin!==base) reject(403,'요청 출처를 확인할 수 없어요.');
-      b=await payload(req);
-      if(revision!==resetVersion()) reject(409,'서버가 초기화됐어요.');
     }
     if(p.startsWith('/api/admin/') && p!=='/api/admin/login' && p!=='/api/admin/logout') {
       const s=need(req,'admin');
@@ -355,6 +370,7 @@ export function makeServer(config, upstream=providers) {
         needsRecoveryCopy=!get('SELECT saved FROM account_keys WHERE member=?',s.member)?.saved;
       }
       return ok({stage,nick:s?.nick||'',year:s?.year,gender:s?.gender,needsRecoveryCopy,
+        memberId:s?.kind==='member'?s.member:null,
         ...(s?.kind==='member'?safety.penalty(get('SELECT identity FROM members WHERE id=?',s.member).identity):{}),
         profile:stage==='member'?get('SELECT '+profileCols+' FROM members WHERE id=?',s.member):null});
     }
