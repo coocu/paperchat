@@ -31,7 +31,7 @@ const paths={
 const icon=n=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[n]||paths.mail}</svg>`;
 let me,regions,stage,activeTimer,epoch=0,currentBack=null,backBusy=false,unreadTotal=0,unreadRequest=0,accountState={};
 let accountRevision=0,bootSerial=0,presenceTimer=null,nativeForeground=window.paperChatNativeForeground!==false,pageForeground=true,lastPresence=null,lastPresenceAt=0;
-let memberEvents=null,roomEventHandler=null;
+let memberEvents=null,roomEventHandler=null,chatLayout=null;
 const memberStages=new Set(['member','restricted','policy']);
 const hasMemberSession=()=>memberStages.has(stage);
 const currentMemberId=()=>me?.id||accountState.memberId||null;
@@ -52,6 +52,7 @@ function fitViewport(){
   if(!height)return;
   document.documentElement.style.setProperty('--app-height',height+'px');
   document.documentElement.style.setProperty('--app-top',(viewport?.offsetTop||0)+'px');
+  chatLayout?.resize();
 }
 window.visualViewport?.addEventListener('resize',fitViewport);
 window.visualViewport?.addEventListener('scroll',fitViewport);
@@ -177,6 +178,7 @@ function field(id,title,opts=''){return `<div class="field"><label for="${id}">$
 const actions=(...parts)=>`<div class="actions">${parts.join('')}</div>`;
 const notice='<p class="error" id="error" role="alert"></p>';
 function paint(title,mark,body,{sub='',back,wide=false,nav=''}={}) {
+  chatLayout?.dispose();chatLayout=null;
   closeDialogs();
   clearInterval(activeTimer);epoch++;roomEventHandler=null;main.className=wide?'wide':'';
   currentBack=back||(nav&&!nav.includes('id="tab-people" class="active"')?people:null);
@@ -321,18 +323,19 @@ function announcementHidden(){
   }catch{return false;}
 }
 function showAnnouncement(data){
-  if(admin || nativeClient || stage!=='member' || !me?.id || accountState.needsRecoveryCopy || !data?.enabled || typeof data.title!=='string' || typeof data.body!=='string' || document.querySelector('dialog[open]'))return;
-  const links={androidUrl:downloadURL(data.androidUrl),iosUrl:downloadURL(data.iosUrl)};
+  if(admin || stage!=='member' || !me?.id || accountState.needsRecoveryCopy || !data?.enabled || typeof data.title!=='string' || typeof data.body!=='string' || document.querySelector('dialog[open]'))return;
+  const showAndroid=!nativeClient && data.androidEnabled,showIos=!nativeClient && data.iosEnabled;
+  const links=nativeClient?{}:{androidUrl:downloadURL(data.androidUrl),iosUrl:downloadURL(data.iosUrl)};
   const d=document.createElement('dialog');d.className='dialog announcement-dialog';
   d.setAttribute('aria-labelledby','announcement-heading');
-  const appButtons=(data.androidEnabled?act('announcement-android','안드로이드앱','secondary'):'')+(data.iosEnabled?act('announcement-ios','아이폰앱','secondary'):'');
+  const appButtons=(showAndroid?act('announcement-android','안드로이드앱','secondary'):'')+(showIos?act('announcement-ios','아이폰앱','secondary'):'');
   d.innerHTML=`<header class="announcement-header" tabindex="0"><h2 id="announcement-heading">${esc(data.title)}</h2></header>
     <div class="announcement-content" tabindex="0">${esc(data.body)}</div>
     <footer class="announcement-footer">${appButtons?`<div class="announcement-buttons" aria-label="앱 다운로드">${appButtons}</div><p id="announcement-status" class="note" role="status" aria-live="polite"></p>`:''}
       <div class="announcement-buttons">${act('announcement-hide','4시간 보지않기')}${act('announcement-close','닫기','primary')}</div>
     </footer>`;
   d.onclose=()=>d.remove();main.append(d);
-  for(const [enabled,selector,key] of [[data.androidEnabled,'#announcement-android','androidUrl'],[data.iosEnabled,'#announcement-ios','iosUrl']])if(enabled)d.querySelector(selector).onclick=()=>{
+  for(const [enabled,selector,key] of [[showAndroid,'#announcement-android','androidUrl'],[showIos,'#announcement-ios','iosUrl']])if(enabled)d.querySelector(selector).onclick=()=>{
     const status=d.querySelector('#announcement-status');
     if(!links[key]){status.textContent='아직 개발 진행중이에요.';return;}
     status.textContent='';window.open(links[key],'_blank','noopener,noreferrer');
@@ -345,7 +348,7 @@ function showAnnouncement(data){
   d.querySelector('#announcement-close').onclick=()=>d.close();d.showModal();
 }
 async function maybeAnnouncement(){
-  if(admin || nativeClient || stage!=='member' || !me?.id || accountState.needsRecoveryCopy || announcementRequested || announcementHidden() || leaving)return;
+  if(admin || stage!=='member' || !me?.id || accountState.needsRecoveryCopy || announcementRequested || announcementHidden() || leaving)return;
   announcementRequested=true;
   try{
     const data=await api('announcement');
@@ -606,6 +609,44 @@ function message(m,isAdmin){
   const mine=!isAdmin&&m.author===me?.id;
   return `<article class="msg ${mine?'mine':''}" data-message="${m.id}"><span class="by">${esc(m.nick)}</span>${deleted?`<span class="deleted-label" title="삭제 · ${esc(at(m.deletedAt))}">${m.expires?'삭제된 사진':'삭제된 채팅'}</span>`:''}<div class="bubble msgText">${body}</div><time class="time">${esc(when)}</time>${mine?`<button type="button" class="textBtn danger" data-delete-message="${m.id}">${m.expires?'사진':'메시지'} 삭제</button>`:!isAdmin&&!['reported','removed','expired'].includes(m.visibility)?`<button type="button" class="textBtn" data-report="${m.id}">신고</button>`:''}</article>`;
 }
+function followChatLayout(log,composer,current,onVisible){
+  let following=true,frame=null,disposed=false,height=log.clientHeight;
+  const schedule=window.requestAnimationFrame?.bind(window)||(fn=>{fn();return null;});
+  const alive=()=>!disposed && current();
+  function resize(){
+    if(!alive() || frame!==null)return;
+    frame=schedule(()=>{
+      frame=null;if(!alive())return;
+      height=log.clientHeight;
+      if(following && height>0)log.scrollTop=log.scrollHeight;
+      if(height>0)onVisible();
+    });
+  }
+  function bottom(){following=true;resize();}
+  log.addEventListener('scroll',()=>{
+    if(!alive())return;
+    // Resizing can itself dispatch scroll. Keep the previous anchor until the
+    // new layout settles instead of mistaking a shorter viewport for scrolling up.
+    if(frame!==null || height!==log.clientHeight){resize();return;}
+    following=log.scrollHeight-log.scrollTop-log.clientHeight<=40;
+    if(log.clientHeight>0)onVisible();
+  });
+  log.addEventListener('load',resize,true);
+  // An intentional history scroll takes precedence over a queued keyboard frame.
+  log.addEventListener('wheel',event=>{if(alive() && event.deltaY<0)following=false;},{passive:true});
+  log.addEventListener('touchmove',()=>{if(alive())following=false;},{passive:true});
+  composer?.addEventListener('focus',bottom);
+  const observer=typeof window.ResizeObserver==='function'?new window.ResizeObserver(resize):null;
+  observer?.observe(log);
+  return {resize,bottom,following:()=>following,dispose(){disposed=true;observer?.disconnect();if(frame!==null)window.cancelAnimationFrame?.(frame);frame=null;}};
+}
+function chatProfile(p){
+  if(document.querySelector('dialog[open]'))return;
+  const d=document.createElement('dialog');d.className='dialog peer-profile-dialog';d.setAttribute('aria-labelledby','chat-profile-heading');
+  d.innerHTML=`<header class="peer-profile-header"><h2 id="chat-profile-heading">${esc(p.nick)}</h2>${act('chat-profile-close','닫기')}</header>
+    <div class="peer-profile-body" tabindex="0">${presenceBadge(p)}<p class="sub">${esc(p.year)}년생 · ${esc(p.gender)} · ${esc(p.area)}</p><div class="rule"></div><h3>소개글</h3><p class="memo">${esc(p.memo||'아직 작성된 소개글이 없어요.')}</p></div>`;
+  d.onclose=()=>d.remove();main.append(d);d.querySelector('#chat-profile-close').onclick=()=>d.close();d.showModal();
+}
 async function conversation(id,title,isAdmin,back,peer,area='',initialVersion=null){
   const endpoint=(isAdmin?'admin/':'')+'rooms/'+encodeURIComponent(id)+'/messages';
   const composer=`<form class="compose paper"><label class="sr-only" for="body">메시지</label><textarea id="body" name="body" maxlength="2000" rows="1" placeholder="전하고 싶은 말을 적어주세요."></textarea><input hidden class="off" id="photo" type="file" accept="image/*">${actions(act('attach',icon('photo')+'사진','secondary'),btn('보내기'))}</form>`;
@@ -633,7 +674,13 @@ async function conversation(id,title,isAdmin,back,peer,area='',initialVersion=nu
     });
   }
   let roomVersion=initialVersion,lastEventVersion=Number(initialVersion)||0;
-  const v=epoch,log=$('#log'),deletedLocally=new Set();let items=new Map(),signature='',busy=false,more=true,readThrough=0,reading=false,oldestCursor=null,loaded=false,closing=false;
+  const v=epoch,log=$('#log'),deletedLocally=new Set();let items=new Map(),signature='',busy=false,more=true,readThrough=0,reading=false,oldestCursor=null,loaded=false,renderedOnce=false,closing=false;
+  const layout=chatLayout=followChatLayout(log,isAdmin?null:$('#body'),()=>v===epoch&&!closing,()=>void markRead());
+  if(!isAdmin && peer){
+    $('.hero').insertAdjacentHTML('beforeend',act('peerProfile','상대 프로필','peer-profile-button'));
+    $('.hero').classList.add('has-peer-profile');
+    on('#peerProfile','click',async()=>{const p=await roomRequest('people/'+encodeURIComponent(peer));if(v===epoch&&!closing)chatProfile(p);});
+  }
   function removeMessage(messageId){
     deletedLocally.add(messageId);items.delete(messageId);signature='';
     log.querySelector(`[data-message="${messageId}"]`)?.remove();
@@ -667,26 +714,26 @@ async function conversation(id,title,isAdmin,back,peer,area='',initialVersion=nu
   }
   const merge=messages=>{for(const m of messages){oldestCursor=oldestCursor===null?m.id:Math.min(oldestCursor,m.id);if(!isAdmin&&(m.deleted||m.visibility==='deleted'||deletedLocally.has(m.id)))items.delete(m.id);else items.set(m.id,m);}};
   async function markRead(){
-    if(isAdmin||!foregroundVisible()||v!==epoch||reading||log.scrollHeight-log.scrollTop-log.clientHeight>40)return;
+    if(isAdmin||!foregroundVisible()||v!==epoch||reading||log.clientHeight<=0||log.scrollHeight-log.scrollTop-log.clientHeight>40)return;
     const through=Math.max(0,...[...items.values()].filter(m=>!m.deleted&&!['reported','removed','pending','expired','deleted'].includes(m.visibility)).map(m=>m.id));
     if(through<=readThrough)return;
     reading=true;
     try{await roomRequest('rooms/'+encodeURIComponent(id)+'/read',{through});readThrough=through;await syncUnread();}
     catch{/* Retry after the next visible refresh. */}finally{reading=false;}
   }
-  log.addEventListener('scroll',()=>void markRead());
   async function refresh(earlier=false){
     if(busy || v!==epoch)return;busy=true;
     try {
       let ids=[...items.keys()];const before=earlier?oldestCursor:null;
       const data=await roomRequest(endpoint+(before?'?before='+before:''));
       if(v!==epoch)return;
+      const firstLoad=!renderedOnce;
       if(roomVersion!==null && roomVersion!==data.roomVersion){
         items.clear();ids=[];signature='';oldestCursor=null;loaded=false;
         if(earlier){busy=false;return await refresh();}
       }
       roomVersion=data.roomVersion;
-      const atEnd=log.scrollHeight-log.scrollTop-log.clientHeight<40,height=log.scrollHeight;
+      const atEnd=layout.following(),height=log.scrollHeight;
       if(earlier||!loaded)more=data.length===60;
       loaded=true;
       merge(data);
@@ -702,8 +749,8 @@ async function conversation(id,title,isAdmin,back,peer,area='',initialVersion=nu
       const ordered=[...items.values()].sort((a,b)=>a.id-b.id);
       const next=ordered.map(m=>[m.id,m.visibility,m.nick,m.deleted,m.deletedAt,(m.expires&&(!m.viewable||m.expires<=Date.now()))?1:0].join(':')).join(',');
       if(next!==signature || !ordered.length){
-        signature=next;log.innerHTML=ordered.map(m=>message(m,isAdmin)).join('')||'<p class="empty">아직 대화가 없어요.</p>';
-        if(earlier)log.scrollTop+=log.scrollHeight-height;else if(atEnd||!ids.length)log.scrollTop=log.scrollHeight;
+        signature=next;log.innerHTML=ordered.map(m=>message(m,isAdmin)).join('')||'<p class="empty">아직 대화가 없어요.</p>';renderedOnce=true;
+        if(earlier)log.scrollTop+=log.scrollHeight-height;else if(atEnd||firstLoad)layout.bottom();
       }
       $('#older').hidden=!more;$('#older').classList.toggle('off',!more);
       await markRead();
@@ -837,13 +884,13 @@ async function adminAnnouncement(){
   const data=await api('admin/announcement');
   const toggle=(id,title)=>`<label class="check"><input id="${id}" name="${id}" type="checkbox" ${data[id]?'checked':''}><span>${title}</span></label>`;
   const input=(id,title)=>`<div class="field"><label for="${id}">${title}</label><input id="${id}" name="${id}" type="url" maxlength="2048" placeholder="https://" value="${esc(data[id])}"></div>`;
-  paint('공지 설정','book',`<form class="paper">${toggle('enabled','웹에 공지 표시')}
+  paint('공지 설정','book',`<form class="paper">${toggle('enabled','공지 표시')}
     <div class="field"><label for="announcementTitle">공지 제목</label><input id="announcementTitle" name="title" maxlength="120" value="${esc(data.title)}"></div>
     <div class="field"><label for="announcementBody">공지 내용</label><textarea id="announcementBody" name="body" maxlength="20000" rows="8" placeholder="회원에게 안내할 내용을 입력해 주세요.">${esc(data.body)}</textarea></div>
     <p class="note">로그인 완료 후 가운데 정렬된 공지가 표시돼요. 긴 내용은 스크롤할 수 있으며, ‘4시간 보지않기’는 해당 브라우저에 적용돼요.</p><div class="rule"></div>
     ${toggle('androidEnabled','공지에 안드로이드앱 버튼 표시')}${input('androidUrl','안드로이드앱 다운로드 URL')}<div class="rule"></div>
     ${toggle('iosEnabled','공지에 아이폰앱 버튼 표시')}${input('iosUrl','아이폰앱 다운로드 URL')}
-    <p class="note">켜기·끄기는 공지 안의 버튼에만 적용돼요. 다운로드 주소는 로그인 화면과 함께 사용해요. 주소를 비워두면 ‘아직 개발 진행중이에요.’라고 안내해요. 저장한 공지는 다음 로그인 또는 로그인 상태에서 새로고침할 때 반영됩니다.</p>${actions(btn('공지 저장'))}</form>`,{back:adminHome});
+    <p class="note">켜기·끄기는 공지 안의 버튼에만 적용돼요. 앱에서는 설정에 관계없이 다운로드 버튼을 표시하지 않아요. 다운로드 주소는 로그인 화면과 함께 사용해요. 주소를 비워두면 ‘아직 개발 진행중이에요.’라고 안내해요. 저장한 공지는 다음 로그인 또는 로그인 상태에서 새로고침할 때 반영됩니다.</p>${actions(btn('공지 저장'))}</form>`,{back:adminHome});
   form(async f=>{
     const values={enabled:f.get('enabled')==='on',title:String(f.get('title')??'').trim(),body:String(f.get('body')??'').trim(),
       androidEnabled:f.get('androidEnabled')==='on',iosEnabled:f.get('iosEnabled')==='on',

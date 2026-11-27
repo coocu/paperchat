@@ -236,6 +236,11 @@ export function makeServer(config, upstream=providers) {
       GROUP BY r.id ORDER BY recent DESC,r.id`,member,member,member,area,area,Date.now(),member,member)
       .map(room=>({...room,...activity(room.peer),unread:unread(member,room.id),version:roomVersion(room.id)}));
   }
+  function peopleList(member,area=null,peer=null) {
+    return all('SELECT '+profileCols+' FROM members p WHERE (? IS NULL OR p.area=?) AND (? IS NULL OR p.id=?) AND p.id<>? AND '+visiblePeer+
+      ' ORDER BY (SELECT last_seen FROM member_activity WHERE member=p.id) DESC,p.id',area,area,peer,peer,member,Date.now(),member,member)
+      .map(profile=>({...profile,...activity(profile.id),profileVersion:safety.profileContent(profile.id)}));
+  }
   const messageColumns=`m.id,m.room,m.author,p.nick,p.area,m.sent,m.body,m.expires,m.deleted_at AS deletedAt,
     v.state,
     (m.photo IS NOT NULL AND m.expires>?) AS live,
@@ -583,9 +588,13 @@ export function makeServer(config, upstream=providers) {
     if(!post && p==='/api/people') {
       const s=need(req,'member');
       const area=directoryArea(u);
-      return ok(all('SELECT '+profileCols+' FROM members p WHERE (? IS NULL OR p.area=?) AND p.id<>? AND '+visiblePeer+
-        ' ORDER BY (SELECT last_seen FROM member_activity WHERE member=p.id) DESC,p.id',area,area,s.member,Date.now(),s.member,s.member)
-        .map(member=>({...member,...activity(member.id),profileVersion:safety.profileContent(member.id)})));
+      return ok(peopleList(s.member,area));
+    }
+    const person=p.match(/^\/api\/people\/([a-f0-9-]+)$/);
+    if(!post && person) {
+      const s=need(req,'member'),profile=peopleList(s.member,null,person[1])[0];
+      if(!profile)reject(404,'상대 프로필을 찾을 수 없어요.');
+      return ok(profile);
     }
     if(!post && p==='/api/rooms') {
       const s=need(req,'member'),area=directoryArea(u);

@@ -15,7 +15,7 @@ function browser({version,search='',userAgent='',pathname='/app',EventSource,ins
   function element(k){
     if(!nodes.has(k))nodes.set(k,{
       innerHTML:'',textContent:'',hidden:true,handlers:{},options:[],value:'',attributes:{},scrollHeight:100,scrollTop:100,clientHeight:100,
-      classList:{toggle(){}},
+      classList:{toggle(){},add(){},remove(){}},
       querySelector(selector){
         if(selector.startsWith('[data-message='))return {remove:()=>{this.innerHTML=this.innerHTML.replace(new RegExp('<article[^>]*data-message="'+selector.match(/"(\d+)"/)[1]+'"[\\s\\S]*?</article>'),'');}};
         return element(selector);
@@ -879,13 +879,15 @@ test('4시간 숨김은 브라우저 저장소에 남고 재접속시 유지되�
  for(const stored of ['bad',String(Date.now()+10*60*60*1000)]){const broken=browser({fetchReply:()=>announcementFixture});announcementMember(broken);broken.local.set(key,stored);await broken.run('maybeAnnouncement()');assert.equal(broken.element('dialog1').open,true);}
 });
 
-test('로그인한 PC·모바일 웹은 공지를 조회하지만 네이티브 앱과 관리자 화면은 조회하지 않는다',async()=>{
+test('웹과 네이티브 앱은 같은 공지를 표시하고 앱의 다운로드 버튼만 숨긴다',async()=>{
  for(const input of [{userAgent:'Mozilla/5.0 Macintosh Chrome'},{userAgent:'Mozilla/5.0 Android SamsungBrowser Mobile'},{userAgent:'Mozilla/5.0 iPhone Mobile Safari'}]){
   const b=browser({...input,fetchReply:()=>announcementFixture});announcementMember(b);await b.run('maybeAnnouncement()');assert.equal(b.element('dialog1').open,true);
  }
- for(const input of [{userAgent:'PaperChatAndroid/3'},{userAgent:'PaperChatIOS/4'},{windowProps:{paperChatNativeForeground:true}},{windowProps:{webkit:{messageHandlers:{paperChatPush:{}}}}},{pathname:'/codenotekyh'}]){
-  const requests=[],b=browser({...input,fetchReply:url=>{requests.push(url);return announcementFixture;}});announcementMember(b);await b.run('maybeAnnouncement()');assert.deepEqual(requests,[]);assert.equal(b.element('dialog1').open,undefined);
+ for(const input of [{userAgent:'PaperChatAndroid/3'},{userAgent:'PaperChatIOS/4'},{windowProps:{paperChatNativeForeground:true}},{windowProps:{webkit:{messageHandlers:{paperChatPush:{}}}}}]){
+  const requests=[],b=browser({...input,fetchReply:url=>{requests.push(url);return announcementFixture;}});announcementMember(b);await b.run('maybeAnnouncement()');assert.deepEqual(requests,['/api/announcement']);assert.equal(b.element('dialog1').open,true);
+  assert.doesNotMatch(b.element('dialog1').innerHTML,/announcement-android|announcement-ios/);assert.match(b.element('dialog1').innerHTML,/announcement-hide/);assert.match(b.element('dialog1').innerHTML,/announcement-close/);
  }
+ const requests=[],admin=browser({pathname:'/codenotekyh',fetchReply:url=>requests.push(url)});announcementMember(admin);await admin.run('maybeAnnouncement()');assert.deepEqual(requests,[]);
 });
 
 test('공지 비활성·조회 실패는 회원 화면을 유지하고 지연 응답은 종료된 로그인 화면을 덮지 않는다',async()=>{
@@ -1009,4 +1011,44 @@ test('관리자는 공지와 두 버튼 표시 여부 및 공유 다운로드 �
  await form.handlers.submit({preventDefault(){},currentTarget:form});assert.deepEqual(writes,[{enabled:true,title:'알림',body:'안내 내용',androidEnabled:false,iosEnabled:true,androidUrl:'',iosUrl:'https://apps.example/new'}]);
  form.values.title=' ';await form.handlers.submit({preventDefault(){},currentTarget:form});assert.equal(writes.length,1);assert.match(b.element('#error').textContent,/제목과 내용/);
  form.values={enabled:'',title:'',body:'',androidEnabled:'',iosEnabled:'',androidUrl:'',iosUrl:''};await form.handlers.submit({preventDefault(){},currentTarget:form});assert.equal(writes.length,2);assert.equal(writes[1].enabled,false);
+});
+
+test('키보드 애니메이션 동안 하단을 유지하고 과거 대화 스크롤과 초안은 보존한다',()=>{
+ const frames=new Map();let seq=0;const b=browser({windowProps:{requestAnimationFrame:fn=>{frames.set(++seq,fn);return seq;},cancelAnimationFrame:id=>frames.delete(id)},fetchReply:()=>({})});
+ const flush=()=>{const jobs=[...frames.values()];frames.clear();for(const fn of jobs)fn();};
+ const log=b.element('#log'),composer=b.element('#body');log.scrollHeight=2000;log.clientHeight=600;log.scrollTop=1400;composer.value='아직 작성 중';composer.selectionStart=3;composer.selectionEnd=5;
+ b.run('var visible=0;var layout=followChatLayout($("#log"),$("#body"),()=>true,()=>visible++)');
+ for(const height of [500,400,300]){log.clientHeight=height;b.run('layout.resize()');log.handlers.scroll();flush();assert.equal(log.scrollTop,2000);}
+ log.scrollTop=350;log.handlers.wheel({deltaY:-10});log.handlers.scroll();log.clientHeight=250;b.run('layout.resize()');flush();assert.equal(log.scrollTop,350);
+ log.scrollHeight=2200;log.handlers.load();flush();assert.equal(log.scrollTop,350);
+ composer.handlers.focus();flush();assert.equal(log.scrollTop,2200);
+ assert.equal(composer.value,'아직 작성 중');assert.equal(composer.selectionStart,3);assert.equal(composer.selectionEnd,5);
+ log.scrollHeight=2500;log.handlers.load();flush();assert.equal(log.scrollTop,2500);
+ b.run('layout.resize();layout.dispose()');assert.equal(frames.size,0);
+});
+
+test('예약된 키보드 스크롤은 방 이동 후 적용되지 않고 사용자 스크롤이 우선한다',()=>{
+ const frames=[];const b=browser({windowProps:{requestAnimationFrame:fn=>{frames.push(fn);return frames.length;}},fetchReply:()=>({})});const log=b.element('#log');
+ log.scrollHeight=1000;log.clientHeight=300;log.scrollTop=700;
+ b.run('var sameRoom=true;var layout=followChatLayout($("#log"),null,()=>sameRoom,()=>{})');b.run('layout.resize()');b.run('sameRoom=false');log.scrollTop=50;frames.shift()();assert.equal(log.scrollTop,50);
+ b.run('sameRoom=true;layout.bottom()');log.handlers.touchmove({});log.scrollTop=80;frames.shift()();assert.equal(log.scrollTop,80);
+});
+
+test('키보드로 목록 높이가 0이면 읽음 처리하지 않는다',async()=>{
+ const requests=[],b=browser({fetchReply:url=>{requests.push(url);if(url.endsWith('/messages'))return [{id:1,author:'b',body:'안 보이는 메시지',sent:1,visibility:'visible'}];return {total:0};}});
+ b.run("stage='member';me={id:'a'}");b.element('#log').clientHeight=0;
+ await b.run("conversation('r','상대',false,rooms,'b')");assert.equal(requests.some(u=>u.endsWith('/read')),false);
+});
+
+test('채팅방 상대 프로필은 최신 공개 정보를 모달로 보여주고 입력 초안을 유지한다',async()=>{
+ const requests=[],b=browser({fetchReply:url=>{requests.push(url);if(url==='/api/people/b')return {id:'b',nick:'상대 <닉네임>',year:1995,gender:'여성',area:'서울 동부',memo:'변경한 소개글 <script>',online:true};if(url.endsWith('/messages'))return [];return {total:0};}});
+ b.run("stage='member';me={id:'a'}");await b.run("conversation('r','상대',false,rooms,'b')");b.element('#body').value='작성중인 대화';const html=b.element('#log').innerHTML;
+ await b.element('#peerProfile').handlers.click({});assert.ok(requests.includes('/api/people/b'));
+ const d=b.element('dialog1');assert.equal(d.open,true);assert.match(d.innerHTML,/서울 동부/);assert.match(d.innerHTML,/변경한 소개글 &lt;script&gt;/);assert.match(d.innerHTML,/1995년생/);assert.equal(b.element('#body').value,'작성중인 대화');assert.equal(b.element('#log').innerHTML,html);
+ b.element('#chat-profile-close').onclick();assert.equal(d.open,false);assert.equal(b.element('#body').value,'작성중인 대화');
+});
+
+test('다른 화면으로 이동한 뒤 도착한 상대 프로필 응답은 표시하지 않는다',async()=>{
+ let release;const b=browser({fetchReply:url=>url==='/api/people/b'?new Promise(r=>release=r):url.endsWith('/messages')?[]:{total:0}});
+ b.run("stage='member';me={id:'a'}");await b.run("conversation('r','상대',false,rooms,'b')");const pending=b.element('#peerProfile').handlers.click({});b.run('settings()');release({id:'b',nick:'이전 상대',memo:'이전 정보'});await pending;assert.equal(b.element('dialog1').open,undefined);assert.match(b.element('#app').innerHTML,/내 설정/);
 });
