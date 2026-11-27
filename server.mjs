@@ -255,6 +255,21 @@ export function makeServer(config, upstream=providers) {
     return data.reverse().map(m=>presentMessage(m,admin));
   }
   function configURL(){return get("SELECT value FROM settings WHERE name='form'")?.value||'';}
+  function downloadLinks() {
+    return {androidUrl:get("SELECT value FROM settings WHERE name='download_android'")?.value||'',
+      iosUrl:get("SELECT value FROM settings WHERE name='download_ios'")?.value||''};
+  }
+  function downloadURL(value) {
+    if(typeof value!=='string')reject(400,'다운로드 주소를 문자열로 입력해 주세요.');
+    const input=value.trim();
+    if(!input)return '';
+    if(input.length>2048 || !/^https:\/\//i.test(input) || /[\u0000-\u001f\u007f]/.test(input))
+      reject(400,'2048자 이하의 올바른 HTTPS 다운로드 주소를 입력해 주세요.');
+    let url;try{url=new URL(input);}catch{reject(400,'올바른 HTTPS 다운로드 주소를 입력해 주세요.');}
+    if(url.protocol!=='https:' || !url.hostname || url.username || url.password || url.href.length>2048)
+      reject(400,'자격증명이 없는 2048자 이하의 HTTPS 다운로드 주소를 입력해 주세요.');
+    return url.href;
+  }
   async function handle(req,res) {
     const u=new URL(req.url,base), p=u.pathname, post=req.method==='POST';
     res.setHeader('Cache-Control','no-store, private');
@@ -290,6 +305,7 @@ export function makeServer(config, upstream=providers) {
       return ok({supportEmail:/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)?email:'',supportUrl,
         operator:String(process.env.OPERATOR_NAME || 'CodeNote').trim(),appName:'종이편지'});
     }
+    if(!post && p==='/api/download-links')return ok(downloadLinks());
     if(!post && p==='/privacy')return finish(res,200,renderPrivacyPage(),'text/html; charset=utf-8');
     if(!post && assets.has(p)) {
       const file=assets.get(p);
@@ -715,6 +731,19 @@ export function makeServer(config, upstream=providers) {
         return ok();
       }
       if(p==='/api/admin/settings' && !post) return ok({url:configURL()});
+      if(p==='/api/admin/download-links') {
+        if(!post)return ok(downloadLinks());
+        if(Object.keys(b).length!==2 || !Object.hasOwn(b,'androidUrl') || !Object.hasOwn(b,'iosUrl'))
+          reject(400,'Android와 iPhone 다운로드 주소만 함께 입력해 주세요.');
+        const androidUrl=downloadURL(b.androidUrl),iosUrl=downloadURL(b.iosUrl);
+        transaction(db,()=>{
+          for(const [name,value] of [['download_android',androidUrl],['download_ios',iosUrl]]) {
+            if(value)run('INSERT INTO settings VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value',name,value);
+            else run('DELETE FROM settings WHERE name=?',name);
+          }
+        });
+        return ok({androidUrl,iosUrl});
+      }
       if(p==='/api/admin/settings' && post) {
         let url;try {url=new URL(string(b.url,1,2048,'URL'));}catch{reject(400,'올바른 HTTPS 주소를 입력해 주세요.');}
         if(url.protocol!=='https:' || url.username || url.password) reject(400,'올바른 HTTPS 주소를 입력해 주세요.');

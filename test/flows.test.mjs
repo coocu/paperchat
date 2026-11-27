@@ -265,6 +265,54 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.deepEqual((await a('/api/state')).body.profile,old);
   });
   let room,photo;
+  await t.test('앱 다운로드 주소는 승인된 관리자만 함께 저장하고 공개 조회·재시작·삭제에 반영한다',async()=>{
+    const path='/api/admin/download-links',publicPath='/api/download-links',empty={androidUrl:'',iosUrl:''};
+    const initial=await nobody(publicPath);
+    assert.equal(initial.status,200);assert.deepEqual(initial.body,empty);assert.match(initial.headers['cache-control'],/no-store/);
+    for(const client of [nobody,a]){
+      assert.equal((await client(path)).status,401);
+      assert.equal((await client(path,empty)).status,401);
+    }
+    assert.equal((await admin(path,empty,{origin:'https://other.example'})).status,403);
+    const checks=registryLookups.length;
+    assert.deepEqual((await admin(path)).body,empty);
+    assert.equal(registryLookups.length,checks+1);
+    const urls={androidUrl:'https://downloads.example/app.apk?version=4&source=pc',iosUrl:'https://apps.apple.com/kr/app/id123456789'};
+    const saved=await admin(path,{androidUrl:'  '+urls.androidUrl+'  ',iosUrl:' '+urls.iosUrl+' '});
+    assert.equal(saved.status,200);assert.deepEqual(saved.body,urls);
+    assert.deepEqual((await nobody(publicPath)).body,urls);
+    assert.deepEqual((await admin(path)).body,urls);
+    assert.equal((await admin('/api/admin/settings')).body.url,'https://two.example/apply');
+    for(const invalid of [null,1,[],{},'http://example.com/a','ftp://example.com/a','javascript:alert(1)',
+      '//example.com/a','https:example.com/a','https://','https://user:password@example.com/a',
+      'https://user@example.com/a','https://exa\nmple.com/a','https://example.com/'+ 'a'.repeat(2048)]) {
+      const response=await admin(path,{androidUrl:'https://replacement.example/app.apk',iosUrl:invalid});
+      assert.equal(response.status,400);assert.deepEqual((await nobody(publicPath)).body,urls);
+    }
+    for(const invalid of [{},{androidUrl:urls.androidUrl},{iosUrl:urls.iosUrl},{...urls,extra:'unwanted'},
+      {androidUrl:123,iosUrl:urls.iosUrl},{androidUrl:'https://[invalid',iosUrl:urls.iosUrl}]) {
+      assert.equal((await admin(path,invalid)).status,400);assert.deepEqual((await nobody(publicPath)).body,urls);
+    }
+    server.emit('close');server=makeServer(cfg,providers);
+    assert.deepEqual((await nobody(publicPath)).body,urls);
+    assert.deepEqual((await admin(path)).body,urls);
+    assert.equal((await admin('/api/admin/settings')).body.url,'https://two.example/apply');
+    assert.deepEqual((await admin(path,{androidUrl:urls.androidUrl,iosUrl:' \n '})).body,{androidUrl:urls.androidUrl,iosUrl:''});
+    assert.equal(db.prepare("SELECT 1 FROM settings WHERE name='download_ios'").get(),undefined);
+    assert.deepEqual((await admin(path,{androidUrl:' ',iosUrl:urls.iosUrl})).body,{androidUrl:'',iosUrl:urls.iosUrl});
+    assert.deepEqual((await admin(path,empty)).body,empty);
+    assert.deepEqual((await nobody(publicPath)).body,empty);
+    assert.equal((await admin('/api/admin/settings')).body.url,'https://two.example/apply');
+    await admin(path,urls);
+    const temporary=client(),temporaryKey='codenote-downloads-kyh-'+randomBytes(8).toString('hex');
+    registry.set(temporaryKey,{status:'approved',token:'download-admin'});
+    assert.equal((await temporary('/api/admin/login',{key:temporaryKey},{ip:'download-admin'})).status,200);
+    registry.set(temporaryKey,{status:'expired',token:'revoked'});
+    assert.equal((await temporary(path,empty)).status,401);
+    assert.equal((await temporary(path)).status,401);
+    assert.deepEqual((await nobody(publicPath)).body,urls);
+    registry.delete(temporaryKey);
+  });
   await t.test('다른 탭의 계정 쿠키로 바뀌면 오래된 회원 요청을 변경 전에 거부한다',async()=>{
     const oldMember=(await a('/api/state')).body.profile;
     const current=client();
@@ -634,6 +682,7 @@ test('인증 게이트, 복원, 지역 대화와 유효기간',async t=>{
     assert.equal((await admin('/api/admin/members/'+oldMember)).status,404);
     assert.deepEqual((await admin('/api/admin/members')).body,{items:[],more:false,counts:{active:0,inactive:0,withdrawn:0}});
     assert.deepEqual((await admin('/api/admin/review')).body,{photos:[],reports:[]});
+    assert.deepEqual((await nobody('/api/download-links')).body,{androidUrl:'',iosUrl:''});
     assert.equal((await nobody('/apply')).headers.location,'/?form=unavailable');
     assert.equal((await nobody('/apply',undefined,{userAgent:'WebView PaperChatAndroid/2'})).headers.location,'/app?form=unavailable');
   });

@@ -4,6 +4,13 @@ const main=document.querySelector('#app');
 const adminPath='/codenotekyh';
 const admin=location.pathname===adminPath;
 const memberPath=location.pathname==='/app'?'/app':'/';
+const desktopDownloads=(()=>{
+  const ua=navigator.userAgent||'',platform=navigator.platform||'';
+  if(/PaperChat(?:Android|IOS)/i.test(ua)||window.webkit?.messageHandlers?.paperChatPush||typeof window.paperChatNativeForeground==='boolean')return false;
+  if(navigator.userAgentData?.mobile||/Mobile|iPhone|iPad|iPod|Android/i.test(ua))return false;
+  if((/Macintosh/i.test(ua)||platform==='MacIntel')&&navigator.maxTouchPoints>1)return false;
+  return /Windows|Macintosh|X11|Linux|CrOS/i.test(ua);
+})();
 if(admin)document.title='종이편지 · 운영자 관리실';
 const $=s=>document.querySelector(s);
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -265,12 +272,43 @@ async function blockedList(){
 function gate(){
   paint('인증키를 입력해 주세요','key',`<form class="paper">${field('code','발급받은 일반 인증키','autocomplete="off" maxlength="256" aria-describedby="error" placeholder="인증키 입력"')}${notice}${actions(btn('인증하고 계속'))}</form>
     ${act('existing','기존 회원 로그인','secondary')}
+    ${desktopDownloads?'<section class="download-options" aria-label="모바일 앱 다운로드"><div class="download-buttons"><button type="button" id="download-android" disabled>Android 앱 다운로드</button><button type="button" id="download-ios" disabled>iPhone 앱 다운로드</button></div><p id="download-status" class="note" role="status" aria-live="polite"></p><button type="button" id="download-retry" class="textBtn" hidden>다시 시도</button></section>':''}
     <aside class="letter"><h2>${icon('mail')}인증키 발급 안내</h2><p>현재 승인된 인증키로 다음 가입 단계로 이동해요. 같은 인증키를 사용해도 회원 계정은 각각 만들어져요. 기존 계정은 개인 복구코드로 로그인해 주세요.</p><div class="rule"></div><a class="btn forest" href="/apply">발급 신청서 열기</a></aside>
     ${rulesCard()}`);
   on('#existing','click',loginPage);
   form(async f=>{await api('key',{code:f.get('code')});nick();});
+  if(desktopDownloads)wireDownloads();
   if(new URLSearchParams(location.search).has('reset'))err(new Error('서버가 초기화되어 등록된 사용자 정보가 없습니다. 다시 가입해 주세요.'));
   if(new URLSearchParams(location.search).has('form'))err(new Error('등록된 발급 주소가 없어요.'));
+}
+function downloadURL(value){
+  if(typeof value!=='string')throw new Error('다운로드 링크를 확인하지 못했어요.');
+  const link=value.trim();if(!link)return '';
+  let parsed;try{parsed=new URL(link);}catch{throw new Error('https://로 시작하는 올바른 링크를 입력해 주세요.');}
+  if(link.length>2048||/[\u0000-\u001f\u007f]/.test(link)||parsed.protocol!=='https:'||!parsed.hostname||parsed.username||parsed.password)throw new Error('https://로 시작하는 올바른 링크를 입력해 주세요.');
+  return parsed.href;
+}
+function wireDownloads(){
+  const view=epoch,revision=accountRevision,status=$('#download-status'),retry=$('#download-retry');
+  const buttons=[$('#download-android'),$('#download-ios')];let links=null,loading=false;
+  const current=()=>view===epoch&&revision===accountRevision&&!leaving;
+  const load=async()=>{
+    if(!current()||loading)return;
+    loading=true;links=null;retry.hidden=true;buttons.forEach(button=>button.disabled=true);status.textContent='다운로드 링크를 확인하고 있어요.';
+    try{
+      const data=await api('download-links');
+      if(!current())return;
+      links={androidUrl:downloadURL(data.androidUrl),iosUrl:downloadURL(data.iosUrl)};
+      buttons.forEach(button=>button.disabled=false);status.textContent='';
+    }catch(e){if(current()&&!e.stale){status.textContent='다운로드 링크를 불러오지 못했어요. 다시 시도해 주세요.';retry.hidden=false;}}
+    finally{loading=false;}
+  };
+  for(const [selector,key] of [['#download-android','androidUrl'],['#download-ios','iosUrl']])on(selector,'click',()=>{
+    if(!current()||!links)return;
+    if(!links[key]){status.textContent='아직 개발 진행중이에요.';return;}
+    status.textContent='';window.open(links[key],'_blank','noopener,noreferrer');
+  });
+  on('#download-retry','click',load);void load();
 }
 function nick(){
   paint('어떻게 불러드릴까요?','pen',`<form class="paper">${field('nick','닉네임',`value="${esc(draft.nick)}" maxlength="24" placeholder="대화에서 사용할 이름"`)}${actions(btn('다음'))}</form>`,{back:()=>{draft.nick=$('#nick').value;gate();}});
@@ -680,8 +718,8 @@ function reviewItem(item,isPhoto){
 async function adminHome(){
   try{await api('admin/settings');}catch(e){if(e.status===401){adminLogin();return;}throw e;}
   adminPrivate=true;
-  paint('운영자 관리실','settings',`<div class="grid adminGrid">${menu('url','mail','인증폼 주소','발급 신청서 연결') }${menu('monitor','chat','대화 모니터링','전체·지역별 대화 열람')}${menu('members','book','가입자 현황','가입·탈퇴 회원 조회')}${menu('inactiveMembers','book','30일 미접속 회원','최근 접속 확인·회원 삭제')}${menu('reset','bin','서버 초기화','서비스 데이터 전체 삭제','destructive')}</div>${act('out','관리자 로그아웃','textBtn')}`,{wide:true});
-  on('#members','click',()=>membersPage());on('#inactiveMembers','click',()=>membersPage(0,null,'inactive'));on('#url','click',adminURL);on('#monitor','click',monitor);on('#reset','click',reset);on('#out','click',async()=>{await api('admin/logout',{});adminLogin();});
+  paint('운영자 관리실','settings',`<div class="grid adminGrid">${menu('url','mail','인증폼 주소','발급 신청서 연결') }${menu('downloadLinks','photo','앱 다운로드 링크','PC 웹의 Android·iPhone 다운로드 주소')}${menu('monitor','chat','대화 모니터링','전체·지역별 대화 열람')}${menu('members','book','가입자 현황','가입·탈퇴 회원 조회')}${menu('inactiveMembers','book','30일 미접속 회원','최근 접속 확인·회원 삭제')}${menu('reset','bin','서버 초기화','서비스 데이터 전체 삭제','destructive')}</div>${act('out','관리자 로그아웃','textBtn')}`,{wide:true});
+  on('#members','click',()=>membersPage());on('#inactiveMembers','click',()=>membersPage(0,null,'inactive'));on('#url','click',adminURL);on('#downloadLinks','click',adminDownloadLinks);on('#monitor','click',monitor);on('#reset','click',reset);on('#out','click',async()=>{await api('admin/logout',{});adminLogin();});
 }
 function adminLogin(){
   adminPrivate=false;scopes.monitor={};
@@ -693,6 +731,16 @@ async function adminURL(){
   paint('인증폼 주소','mail',`<form class="paper">${field('url','발급 신청서 URL',`type="url" placeholder="https://" value="${esc(c.url)}"`)}<p class="note">저장하면 앱의 발급 신청 버튼에 바로 반영돼요.</p>${actions(btn('주소 저장'))}</form>`,{back:adminHome});
   form(async f=>{await api('admin/settings',{url:f.get('url')});note('인증폼 주소를 저장했어요.');});
 }
+async function adminDownloadLinks(){
+  const links=await api('admin/download-links');
+  const input=(id,label)=>`<div class="field"><label for="${id}">${label}</label><input id="${id}" name="${id}" type="url" maxlength="2048" placeholder="https://" value="${esc(links[id])}"></div>`;
+  paint('앱 다운로드 링크','photo',`<form class="paper">${input('androidUrl','Android 앱 다운로드 URL')}${input('iosUrl','iPhone 앱 다운로드 URL')}<p class="note">https:// 링크를 입력해 주세요. 비워서 저장하면 해당 링크가 삭제되고 PC 웹에서 ‘아직 개발 진행중이에요.’라고 안내해요. 변경 사항은 인증키 화면을 다시 열 때 반영돼요.</p>${actions(btn('링크 저장'))}</form>`,{back:adminHome});
+  form(async f=>{
+    const values={androidUrl:downloadURL(String(f.get('androidUrl')??'')),iosUrl:downloadURL(String(f.get('iosUrl')??''))};
+    const saved=await api('admin/download-links',values);
+    $('#androidUrl').value=saved.androidUrl;$('#iosUrl').value=saved.iosUrl;note('앱 다운로드 링크를 저장했어요.');
+  });
+}
 function monitor(){
   const participants=r=>r.first+' ('+r.firstArea+') · '+r.second+' ('+r.secondArea+')';
   return scopedDirectory('monitor','admin/rooms','대화 모니터링','chat',
@@ -703,7 +751,7 @@ function monitor(){
      extra:actions(act('reviewQueue','사진·신고 검토','primary')),wireExtra:()=>on('#reviewQueue','click',reviewList),live:true});
 }
 function reset(){
-  paint('서버 초기화','bin',`<form class="paper"><p>회원, 프로필, 대화, 사진, 로그인 정보, 탈퇴 후 24시간 현황, 실명·전화번호, 신고·제재·차단·동의 기록과 발급 폼 주소까지 모두 지워요. 사용자 앱은 다음 연결 때 초기화됩니다.</p>${field('key','로그인한 관리자 보안키','type="password" maxlength="256" autocomplete="current-password"')}${field('confirm','확인을 위해 ‘전체 삭제’ 입력','autocomplete="off"')}${actions(btn('전체 삭제','danger fill'))}</form>`,{back:adminHome});
+  paint('서버 초기화','bin',`<form class="paper"><p>회원, 프로필, 대화, 사진, 로그인 정보, 탈퇴 후 24시간 현황, 실명·전화번호, 신고·제재·차단·동의 기록과 발급 폼 주소, 앱 다운로드 링크까지 모두 지워요. 사용자 앱은 다음 연결 때 초기화됩니다.</p>${field('key','로그인한 관리자 보안키','type="password" maxlength="256" autocomplete="current-password"')}${field('confirm','확인을 위해 ‘전체 삭제’ 입력','autocomplete="off"')}${actions(btn('전체 삭제','danger fill'))}</form>`,{back:adminHome});
   form(async f=>{await api('admin/reset',{key:f.get('key'),confirm:f.get('confirm')});note('가입 중 0명 · 탈퇴 현황 0명으로 초기화했어요.');adminLogin();});
 }
 async function boot(){

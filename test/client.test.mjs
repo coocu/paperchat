@@ -9,7 +9,7 @@ import { privacyEffectiveDate,privacyIntro,privacySections } from '../public/pri
 // The real native shells use the same controller.
 const script=readFileSync(new URL('../public/app.js',import.meta.url),'utf8')
   .replace(/^import [^\n]+\n/gm,'').replace('start().catch(', 'Promise.resolve().catch(');
-function browser({version,search='',userAgent='',pathname='/app',EventSource,instantSplash=false,fetchReply}){
+function browser({version,search='',userAgent='',pathname='/app',EventSource,instantSplash=false,navigatorProps={},windowProps={},fetchReply}){
   const nodes=new Map(),local=new Map(),session=new Map(),intervals=new Map(),events=new Map();let timerId=0,dialogId=0;
   if(version)local.set('paperchat.reset',version);
   function element(k){
@@ -32,12 +32,12 @@ function browser({version,search='',userAgent='',pathname='/app',EventSource,ins
   const storage=map=>({getItem:k=>map.get(k)||null,setItem:(k,v)=>map.set(k,v),clear:()=>map.clear()});
   const location={pathname,search,replacements:[],replace(url){this.redirect=url;this.replacements.push(url);}};
   const history={replaceState(state,title,url){this.replaced=url;}};
-  const ctx=createContext({document:{querySelector:s=>s==='dialog[open]'?[...nodes.values()].find(el=>el.open)||null:element(s),querySelectorAll:s=>s==='dialog[open]'?[...nodes.values()].filter(el=>el.open):[],createElement:tag=>element(tag+ ++dialogId),hidden:false,addEventListener:(name,fn)=>events.set(name,fn)},navigator:{userAgent},
-    location,history,matchMedia:()=>({matches:true}),window:{EventSource,addEventListener:(name,fn)=>events.set(name,fn),scrollTo(){}},setInterval:(fn,ms)=>{const id=++timerId;intervals.set(id,{fn,ms});return id;},clearInterval:id=>intervals.delete(id),setTimeout:(fn,ms)=>{if(instantSplash&&ms<=1300)queueMicrotask(fn);return 7;},clearTimeout,AbortController,
+  const ctx=createContext({document:{querySelector:s=>s==='dialog[open]'?[...nodes.values()].find(el=>el.open)||null:element(s),querySelectorAll:s=>s==='dialog[open]'?[...nodes.values()].filter(el=>el.open):[],createElement:tag=>element(tag+ ++dialogId),hidden:false,addEventListener:(name,fn)=>events.set(name,fn)},navigator:{userAgent,...navigatorProps},
+    location,history,matchMedia:()=>({matches:true}),window:{EventSource,addEventListener:(name,fn)=>events.set(name,fn),scrollTo(){},...windowProps},setInterval:(fn,ms)=>{const id=++timerId;intervals.set(id,{fn,ms});return id;},clearInterval:id=>intervals.delete(id),setTimeout:(fn,ms)=>{if(instantSplash&&ms<=1300)queueMicrotask(fn);return 7;},clearTimeout,AbortController,
     policyVersion,reasons,rules,privacyEffectiveDate,privacyIntro,privacySections,sessionStorage:storage(session),localStorage:storage(local),
     Option:class { constructor(text,value){this.text=text;this.value=value;} },
     FormData:class { constructor(form){this.form=form;}get(key){return this.form.values?.[key]??'';} },
-    URLSearchParams,fetch:async(url,options)=>{const r=await fetchReply(url,options),status=r?.$status||200;return {ok:status>=200&&status<300,status,headers:{get:k=>k==='X-Service-Version'?r?.version:k==='X-Room-Version'?r?.$roomVersion:null},json:async()=>r?.$body??r};}});
+    URL,URLSearchParams,fetch:async(url,options)=>{const r=await fetchReply(url,options),status=r?.$status||200;return {ok:status>=200&&status<300,status,headers:{get:k=>k==='X-Service-Version'?r?.version:k==='X-Room-Version'?r?.$roomVersion:null},json:async()=>r?.$body??r};}});
   runInContext(script,ctx);
   return {run:code=>runInContext(code,ctx),element,local,location,history,session,intervals,events};
 }
@@ -712,4 +712,54 @@ test('프로필 신고는 본 버전을 보내며 변경된 소개글이면 최�
   await b.element('#report').handlers.click({});await submitForm(b,{reason:'괴롭힘·기타 위반'});
   assert.deepEqual(requests.find(([url])=>url==='/api/report')[1],{kind:'profile',peer:'peer',profileVersion:'seen-version',reason:'괴롭힘·기타 위반'});
   assert.match(b.element('#app').innerHTML,/프로필 목록/);assert.doesNotMatch(b.element('#app').innerHTML,/봤던 소개글/);assert.match(b.element('#error').textContent,/내용을 다시 확인한 뒤 신고/);
+});
+
+test('PC 다운로드 버튼은 기존 회원 로그인 아래에서 빈 주소를 안내하고 설정 주소를 안전한 새 창으로 연다',async()=>{
+  const requests=[],opened=[];
+  const b=browser({pathname:'/',userAgent:'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) Safari/605.1',windowProps:{open:(...args)=>opened.push(args)},fetchReply:url=>{requests.push(url);return {androidUrl:'',iosUrl:'https://apps.example/iphone?id=1&lang=ko'};}});
+  b.run('gate()');await new Promise(setImmediate);
+  const html=b.element('#app').innerHTML;
+  assert.ok(html.indexOf('id="existing"')<html.indexOf('id="download-android"'));
+  assert.deepEqual(requests,['/api/download-links']);assert.equal(b.element('#download-android').disabled,false);
+  await b.element('#download-android').handlers.click({});assert.equal(b.element('#download-status').textContent,'아직 개발 진행중이에요.');assert.deepEqual(opened,[]);
+  await b.element('#download-ios').handlers.click({});assert.deepEqual(opened,[['https://apps.example/iphone?id=1&lang=ko','_blank','noopener,noreferrer']]);
+});
+
+test('휴대폰·태블릿과 설치 앱은 PC 다운로드 화면과 주소 조회를 모두 생략한다',async()=>{
+  for(const input of [
+    {userAgent:'Mozilla/5.0 Android Mobile Chrome'},
+    {userAgent:'Mozilla/5.0 iPhone Mobile Safari'},
+    {userAgent:'Mozilla/5.0 iPad Safari'},
+    {userAgent:'Mozilla/5.0 Macintosh Safari',navigatorProps:{platform:'MacIntel',maxTouchPoints:5}},
+    {userAgent:'Mozilla/5.0 Linux Chrome',navigatorProps:{userAgentData:{mobile:true}}},
+    {userAgent:'Mozilla/5.0 Windows PaperChatAndroid/3'},
+    {userAgent:'Mozilla/5.0 Macintosh PaperChatIOS/4'},
+    {userAgent:'Mozilla/5.0 Macintosh Safari',windowProps:{paperChatNativeForeground:true}},
+    {userAgent:'Mozilla/5.0 Macintosh Safari',windowProps:{webkit:{messageHandlers:{paperChatPush:{}}}}}
+  ]){
+    const requests=[];const b=browser({...input,fetchReply:url=>{requests.push(url);return {};}});
+    b.run('gate()');await new Promise(setImmediate);
+    assert.doesNotMatch(b.element('#app').innerHTML,/download-android|download-ios/);assert.deepEqual(requests,[]);
+  }
+});
+
+test('다운로드 조회 실패는 개발중과 구분하고 늦은 응답은 이동한 화면을 변경하지 않는다',async()=>{
+  let failed=true;const b=browser({userAgent:'Mozilla/5.0 Windows Chrome',fetchReply:()=>failed?{$status:503,$body:{error:'실패'}}:{androidUrl:'',iosUrl:''}});
+  b.run('gate()');await new Promise(setImmediate);assert.equal(b.element('#download-retry').hidden,false);assert.match(b.element('#download-status').textContent,/불러오지 못/);assert.doesNotMatch(b.element('#download-status').textContent,/개발 진행중/);
+  b.element('#code').value='작성 중';failed=false;await b.element('#download-retry').handlers.click({});assert.equal(b.element('#download-retry').hidden,true);assert.equal(b.element('#code').value,'작성 중');assert.equal(b.element('#download-android').disabled,false);
+  let release;const late=browser({userAgent:'Mozilla/5.0 Windows Chrome',fetchReply:()=>new Promise(r=>release=r)});
+  late.run('gate();loginPage()');const html=late.element('#app').innerHTML;release({androidUrl:'https://download.example/app',iosUrl:''});await new Promise(setImmediate);assert.equal(late.element('#app').innerHTML,html);assert.match(html,/다시 로그인/);
+});
+
+test('관리자는 다운로드 주소 두 개를 각각 비워 저장할 수 있고 위험한 URL은 전송하지 않는다',async()=>{
+  const writes=[];const b=browser({pathname:'/codenotekyh',fetchReply:(url,options)=>{
+    assert.equal(url,'/api/admin/download-links');
+    if(options.method==='GET')return {androidUrl:'https://download.example/android',iosUrl:'https://download.example/ios'};
+    const body=JSON.parse(options.body);writes.push(body);return body;
+  }});
+  await b.run('adminDownloadLinks()');const html=b.element('#app').innerHTML;assert.match(html,/id="androidUrl"/);assert.match(html,/id="iosUrl"/);assert.doesNotMatch(html,/<input[^>]*required/);
+  const form=b.element('form');form.values={androidUrl:'',iosUrl:'https://download.example/ios'};
+  await form.handlers.submit({preventDefault(){},currentTarget:form});assert.deepEqual(writes,[{androidUrl:'',iosUrl:'https://download.example/ios'}]);
+  form.values={androidUrl:'javascript:alert(1)',iosUrl:''};await form.handlers.submit({preventDefault(){},currentTarget:form});assert.equal(writes.length,1);assert.match(b.element('#error').textContent,/https:/);
+  for(const value of ['https://user:secret@download.example/app','https://download.example/\napp'])assert.throws(()=>b.run(`downloadURL(${JSON.stringify(value)})`));
 });
