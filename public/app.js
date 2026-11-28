@@ -192,7 +192,7 @@ function paint(title,mark,body,{sub='',back,wide=false,nav='',headerAction=''}={
   clearInterval(activeTimer);epoch++;roomEventHandler=null;main.className=wide?'wide':'';
   currentBack=back||(nav&&!nav.includes('id="tab-people" class="active"')?people:null);
   back=currentBack;
-  main.innerHTML=`<header class="bar"><span class="brand">${icon('mail')}종이편지</span>${back?act('back','이전','textBtn'):headerAction}</header><section class="hero"><h1>${icon(mark)}${esc(title)}</h1>${sub?`<p>${esc(sub)}</p>`:''}</section>${nav}<div id="sections" class="screen-stack">${body}</div>${body.includes(notice)?'':notice}`;
+  main.innerHTML=`<header class="bar"><span class="brand">${icon('mail')}종이편지</span>${back?act('back','이전','textBtn'):headerAction}</header>${nav?`<h1 class="sr-only">${esc(title)}</h1>`:`<section class="hero"><h1>${icon(mark)}${esc(title)}</h1>${sub?`<p>${esc(sub)}</p>`:''}</section>`}${nav}<div id="sections" class="screen-stack">${body}</div>${body.includes(notice)?'':notice}`;
   if(back)on('#back','click',()=>window.paperChatBack());
   on('#privacy','click',privacyPage);
   document.title=title+' · 종이편지';
@@ -620,7 +620,7 @@ function presenceBadge(p){return `<span class="presence-badge ${p.online?'online
 function people(){
   return scopedDirectory('people','people','프로필 목록','book',
     p=>`<button type="button" class="row profile-row" data-id="${esc(p.id)}"><span><strong>${esc(p.nick)}</strong>${presenceBadge(p)}<small>${esc(p.area+' · '+p.year+'년생 · '+p.gender)}</small><span class="profile-memo-label">소개글</span><span class="profile-memo">${esc(p.memo||'아직 작성된 소개글이 없어요.')}</span></span>${icon('arrow')}</button>`,profile,
-    regional=>regional?'이 지역에 다른 회원이 아직 없어요.':'아직 표시할 다른 회원이 없어요.',{live:true,sub:'최근 접속한 회원부터 표시돼요.'});
+    regional=>regional?'이 지역에 다른 회원이 아직 없어요.':'아직 표시할 다른 회원이 없어요.',{live:true});
 }
 function profile(p){
   paint(p.nick,'book',`<article class="paper">${presenceBadge(p)}<p class="sub">${esc(p.year)}년생 · ${esc(p.gender)} · ${esc(p.area)}</p><div class="rule"></div><h2>소개글</h2><p class="memo">${esc(p.memo)}</p>${actions(act('start','대화하기','primary'))}</article>`,{back:people});
