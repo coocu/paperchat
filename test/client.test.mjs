@@ -9,7 +9,7 @@ import { privacyEffectiveDate,privacyIntro,privacySections } from '../public/pri
 // The real native shells use the same controller.
 const script=readFileSync(new URL('../public/app.js',import.meta.url),'utf8')
   .replace(/^import [^\n]+\n/gm,'').replace('start().catch(', 'Promise.resolve().catch(');
-function browser({version,search='',userAgent='',pathname='/app',EventSource,instantSplash=false,navigatorProps={},windowProps={},urgentReply,clockNow,fetchReply}){
+function browser({version,search='',userAgent='',pathname='/app',EventSource,instantSplash=false,navigatorProps={},windowProps={},urgentReply,roomReply,clockNow,fetchReply}){
   const nodes=new Map(),local=new Map(),session=new Map(),intervals=new Map(),events=new Map(),timeouts=new Map();let timerId=0,dialogId=0;
   if(version)local.set('paperchat.reset',version);
   function element(k){
@@ -37,7 +37,13 @@ function browser({version,search='',userAgent='',pathname='/app',EventSource,ins
     policyVersion,reasons,rules,privacyEffectiveDate,privacyIntro,privacySections,sessionStorage:storage(session),localStorage:storage(local),
     Option:class { constructor(text,value){this.text=text;this.value=value;} },
     FormData:class { constructor(form){this.form=form;}get(key){return this.form.values?.[key]??'';} },
-    URL,URLSearchParams,atob,fetch:async(url,options)=>{const r=await (url==='/api/urgent-announcement'?(typeof urgentReply==='function'?urgentReply(url,options):urgentReply??{enabled:false,title:'긴급공지',body:'',revision:null,publishedAt:null}):fetchReply(url,options)),status=r?.$status||200;return {ok:status>=200&&status<300,status,headers:{get:k=>k==='X-Service-Version'?r?.version:k==='X-Room-Version'?r?.$roomVersion:null},json:async()=>r?.$body??r};}});
+    URL,URLSearchParams,atob,fetch:async(url,options)=>{
+      const r=await (url==='/api/urgent-announcement'?(typeof urgentReply==='function'?urgentReply(url,options):urgentReply??{enabled:false,title:'긴급공지',body:'',revision:null,publishedAt:null}):
+        /^\/api\/admin\/rooms\/[^/?]+$/.test(url)?(typeof roomReply==='function'?roomReply(url,options):roomReply??{id:url.split('/').at(-1),participants:[
+          {id:'a',nick:'첫 회원',year:1995,gender:'여성',area:'서울 동부',memo:'첫 소개글',lastSeen:1,online:false},
+          {id:'peer',nick:'상대',year:1994,gender:'남성',area:'경기 북부',memo:'상대 소개글',lastSeen:2,online:false}
+        ]}):fetchReply(url,options));
+      const status=r?.$status||200;return {ok:status>=200&&status<300,status,headers:{get:k=>k==='X-Service-Version'?r?.version:k==='X-Room-Version'?r?.$roomVersion:null},json:async()=>r?.$body??r};}});
   runInContext(script,ctx);
   return {run:code=>runInContext(code,ctx),element,local,location,history,session,intervals,events,timeouts};
 }
@@ -266,7 +272,7 @@ test('정책을 읽는 중 계정이 폐기되면 닫고 이전 설정 대신 �
 test('관리자 모니터링은 전체 프로필과 대화방 수를 표시하고 삭제 회원도 구분한다',async()=>{
   const paths=[];
   const b=browser({pathname:'/codenotekyh',fetchReply:url=>{paths.push(url);return [{id:'p',nick:'가을',year:1995,gender:'여성',area:'서울 동부',memo:'편안한 대화',deletedAt:100,roomCount:3,matchedRoomCount:3,recent:123}];}});
-  await b.run('monitor()');
+  await b.run('monitorConversations()');
   assert.deepEqual(paths,['/api/admin/monitor/profiles']);
   assert.match(b.element('#app').innerHTML,/aria-pressed="true">전체/);
   assert.match(b.element('#list').innerHTML,/가을/);assert.match(b.element('#list').innerHTML,/대화방 3개/);assert.match(b.element('#list').innerHTML,/삭제된 회원/);
@@ -276,7 +282,7 @@ test('관리자 모니터링은 전체 프로필과 대화방 수를 표시하�
 test('관리자 검색어는 지역 필터 및 프로필 대화 목록에 보존되고 특수문자는 URL 인코딩된다',async()=>{
  const requests=[],p={id:'self',nick:'봄',year:1995,gender:'여성',area:'서울 동부',memo:'소개'};
  const b=browser({pathname:'/codenotekyh',fetchReply:url=>{requests.push(url);if(url==='/api/regions')return {'서울':['동부','서부']};return [];}});
- b.run("scopes.monitor={query:'100%_ & 봄',regional:true,area:'서울 동부'}");await b.run('monitor()');
+ b.run("scopes.monitor={query:'100%_ & 봄',regional:true,area:'서울 동부'}");await b.run('monitorConversations()');
  const first=new URL(requests.at(-1),'https://example.com');assert.equal(first.pathname,'/api/admin/monitor/profiles');assert.equal(first.searchParams.get('q'),'100%_ & 봄');assert.equal(first.searchParams.get('area'),'서울 동부');
  await b.run('monitorRooms('+JSON.stringify(p)+')');const rooms=new URL(requests.at(-1),'https://example.com');assert.equal(rooms.pathname,'/api/admin/rooms');assert.equal(rooms.searchParams.get('member'),'self');assert.equal(rooms.searchParams.get('q'),'100%_ & 봄');assert.equal(rooms.searchParams.has('area'),false);
  assert.match(b.element('#list').innerHTML,/검색 결과가 없어요/);
@@ -1349,7 +1355,7 @@ test('관리자 메인 다섯 메뉴는 지정한 순서이며 일반·긴급공
  const b=browser({pathname:'/codenotekyh',fetchReply:url=>url.includes('urgent')?{enabled:false,title:'긴급공지',body:''}:url.includes('announcement')?{enabled:false,title:'공지',body:'',androidEnabled:false,iosEnabled:false,androidUrl:'',iosUrl:''}: {}});
  await b.run('adminHome()');const html=b.element('#app').innerHTML;
  assert.deepEqual([...html.matchAll(/<button id="([^"]+)" class="menu /g)].map(m=>m[1]),['members','monitor','announcements','linkSettings','reset']);
- assert.match(html,/가입자 현황/);assert.match(html,/대화 모니터링/);assert.match(html,/공지설정/);assert.match(html,/링크관리/);assert.match(html,/서버초기화/);
+ assert.match(html,/가입자 현황/);assert.match(html,/모니터링/);assert.doesNotMatch(html,/대화 모니터링/);assert.match(html,/공지설정/);assert.match(html,/링크관리/);assert.match(html,/서버초기화/);
  await b.element('#announcements').handlers.click({});assert.match(b.element('#app').innerHTML,/id="announcement"/);assert.match(b.element('#app').innerHTML,/id="urgentAnnouncement"/);
  await b.element('#urgentAnnouncement').handlers.click({});assert.match(b.element('#app').innerHTML,/긴급공지 설정/);await b.element('#back').handlers.click({});assert.match(b.element('#app').innerHTML,/id="announcement"/);
  await b.element('#announcement').handlers.click({});await b.element('#back').handlers.click({});assert.match(b.element('#app').innerHTML,/id="urgentAnnouncement"/);
@@ -1445,4 +1451,154 @@ test('과거 페이지 재검증이 지연돼도 표시 중인 글·사진은 �
  releaseHistory();await refreshing;
  assert.doesNotMatch(log.innerHTML,/첫 시점에 사라질 원문|두 번째 시점에 사라질 원문|data-message="(?:2|62)"/);preserved();
  assert.equal([...log.innerHTML.matchAll(/data-message="/g)].length,61);
+});
+
+const monitoringParticipants=[
+ {id:'left-member',nick:'같은 이름',year:1991,gender:'여성',area:'서울 동부',memo:'왼쪽 소개 <script>본문</script>',lastSeen:10,online:false},
+ {id:'right-member',nick:'같은 이름',year:1996,gender:'남성',area:'부산 전체',memo:'오른쪽의 다른 소개글',lastSeen:20,online:true}
+];
+
+test('관리자 대화 좌우는 동명이인의 ID로 고정되어 검색·이전 기록·빈 결과에서도 뒤집히지 않는다',async()=>{
+ const metadata=[],requests=[],end=Date.now()+86400000;
+ const page=(start,author)=>Array.from({length:60},(_,index)=>({id:start+index,author,nick:'같은 이름',body:'검색할 편지 '+(start+index),sent:Date.now(),expiresAt:end,visibility:'visible'}));
+ const b=browser({pathname:'/codenotekyh',roomReply:url=>{metadata.push(url);return {id:'room',participants:monitoringParticipants};},fetchReply:url=>{
+  requests.push(url);const params=new URL(url,'https://example.com').searchParams;
+  if(params.get('q')==='없는 내용')return [];
+  return params.has('before')?page(1,'left-member'):page(61,'right-member');
+ }});
+ await b.run("conversation('room','검색에서 들어온 대화',true,monitor,null,'',null,'검색할')");
+ const cards=()=>{
+  const html=b.element('#app').innerHTML;
+  assert.match(html,/id="adminParticipant0" class="monitor-participant participant-left"/);
+  assert.match(html,/id="adminParticipant1" class="monitor-participant participant-right"/);
+  assert.match(html,/1991년생 · 여성 · 서울 동부/);assert.match(html,/1996년생 · 남성 · 부산 전체/);
+ };
+ cards();assert.equal(b.element('#app').className,'chat-screen admin-chat-screen');
+ assert.match(b.element('#log').innerHTML,/<article class="[^"]*admin-right" data-message="61"/);
+ assert.doesNotMatch(b.element('#log').innerHTML,/admin-left/);
+ await b.element('#older').handlers.click({});
+ assert.match(b.element('#log').innerHTML,/<article class="[^"]*admin-left" data-message="1"/);
+ assert.match(b.element('#log').innerHTML,/<article class="[^"]*admin-right" data-message="61"/);
+ assert.match(b.element('#log').innerHTML,/왼쪽 · 같은 이름/);assert.match(b.element('#log').innerHTML,/오른쪽 · 같은 이름/);
+ const older=new URL(requests.at(-1),'https://example.com');assert.equal(older.searchParams.get('before'),'61');assert.equal(older.searchParams.get('q'),'검색할');
+ await submitForm(b,{query:'편지'});cards();assert.match(b.element('#log').innerHTML,/<article class="[^"]*admin-right" data-message="61"/);
+ await b.element('#clearSearch').handlers.click({});cards();assert.equal(requests.at(-1),'/api/admin/rooms/room/messages');
+ await submitForm(b,{query:'없는 내용'});cards();assert.match(b.element('#log').innerHTML,/검색한 내용이 없어요/);
+ assert.deepEqual(metadata,Array(4).fill('/api/admin/rooms/room'));
+});
+
+test('신고에서 직접 연 관리자 대화도 두 참여자 프로필을 구분하며 카드 클릭은 해당 소개글을 안전하게 표시한다',async()=>{
+ const paths=[],b=browser({pathname:'/codenotekyh',roomReply:url=>{paths.push(url);return {id:'reported-room',participants:monitoringParticipants};},fetchReply:url=>{paths.push(url);return [];}});
+ b.run('reviewItem('+JSON.stringify({id:5,nick:'같은 이름',sender:'right-member',reporter:'left-member',area:'부산 전체',conversationRoom:'reported-room',photoCount:0,photos:[],reason:'신고 사유'})+',false)');
+ await b.element('#showConversation').handlers.click({});
+ assert.deepEqual(paths,['/api/admin/rooms/reported-room','/api/admin/rooms/reported-room/messages']);
+ await b.element('#adminParticipant0').handlers.click({});
+ let html=b.element('dialog1').innerHTML;
+ assert.match(html,/1991년생 · 여성 · 서울 동부/);assert.match(html,/왼쪽 소개 &lt;script&gt;본문&lt;\/script&gt;/);assert.doesNotMatch(html,/<script>|오른쪽의 다른 소개글/);
+ b.element('#chat-profile-close').onclick();await b.element('#adminParticipant1').handlers.click({});
+ html=b.element('dialog2').innerHTML;
+ assert.match(html,/1996년생 · 남성 · 부산 전체/);assert.match(html,/오른쪽의 다른 소개글/);assert.match(html,/접속 중/);assert.doesNotMatch(html,/왼쪽 소개/);
+ assert.equal(paths.length,2);
+});
+
+test('관리자 참여자 조회의 늦은 응답·삭제·인증 만료는 과거 대화나 프로필을 표시하지 않는다',async()=>{
+ let release;const requests=[];
+ const delayed=browser({pathname:'/codenotekyh',roomReply:()=>new Promise(resolve=>{release=resolve;}),fetchReply:url=>{requests.push(url);return [];}});
+ const opening=delayed.run("conversation('room','늦게 올 대화',true,monitor)");
+ delayed.run("paint('다른 화면','book','새 화면 내용')");release({id:'room',participants:monitoringParticipants});await opening;
+ assert.match(delayed.element('#app').innerHTML,/새 화면 내용/);assert.doesNotMatch(delayed.element('#app').innerHTML,/adminParticipant|같은 이름/);assert.deepEqual(requests,[]);
+ for(const status of [404,401]){
+  const paths=[],b=browser({pathname:'/codenotekyh',roomReply:{$status:status,$body:{error:'이 대화를 열 수 없어요.'}},fetchReply:url=>{paths.push(url);return [];}});
+  await b.run("conversation('gone','남으면 안 되는 대화',true,()=>paint('대화 목록','chat','안전한 목록'))");
+  assert.deepEqual(paths,[]);assert.doesNotMatch(b.element('#app').innerHTML,/adminParticipant|남으면 안 되는 대화/);
+  assert.match(b.element('#app').innerHTML,status===404?/안전한 목록/:/관리자 로그인/);
+ }
+});
+
+test('회원 대화는 관리자 참여자 API와 색상 구분을 사용하지 않고 내 메시지 정렬을 유지한다',async()=>{
+ const b=browser({pathname:'/',roomReply:()=>{throw Error('회원 대화에 관리자 메타 요청');},fetchReply:url=>url.includes('/messages')?
+  [{id:1,author:'me',nick:'본인',body:'내 편지',sent:Date.now(),expiresAt:Date.now()+86400000,visibility:'visible'}]:{total:0}});
+ b.run("stage='member';me={id:'me'}");await b.run("conversation('room','상대',false,rooms,'peer')");
+ assert.equal(b.element('#app').className,'chat-screen');assert.doesNotMatch(b.element('#app').innerHTML,/adminParticipant|monitor-participants/);
+ assert.match(b.element('#log').innerHTML,/<article class="msg mine"/);assert.doesNotMatch(b.element('#log').innerHTML,/admin-msg|admin-left|admin-right/);
+});
+
+test('관리자 프로필 목록은 서버의 최근접속순과 온라인 표시를 유지하고 주기 갱신한다',async()=>{
+ const first={id:'a',nick:'최근 접속 회원',year:1991,gender:'여성',area:'서울 동부',memo:'소개',roomCount:1,matchedRoomCount:1,lastSeen:200,online:true,recent:10};
+ const second={...first,id:'b',nick:'대화만 최근 회원',lastSeen:100,online:false,recent:300};
+ let rows=[first,second];const b=browser({pathname:'/codenotekyh',fetchReply:()=>rows});
+ await b.run('monitorConversations()');
+ let html=b.element('#list').innerHTML;
+ assert.ok(html.indexOf('최근 접속 회원')<html.indexOf('대화만 최근 회원'));assert.match(html,/presence-badge online">접속 중/);assert.match(b.element('#app').innerHTML,/최근 접속순/);
+ rows=[{...second,lastSeen:400,online:true},{...first,online:false}];
+ b.intervals.get(b.run('activeTimer')).fn();await settle();html=b.element('#list').innerHTML;
+ assert.ok(html.indexOf('대화만 최근 회원')<html.indexOf('최근 접속 회원'));assert.match(html,/최근 접속 ·/);
+});
+
+test('전체·지역 프로필 목록의 설정은 헤더에 있고 설정에서 돌아와도 선택한 지역 범위를 유지한다',async()=>{
+ const requests=[],b=browser({pathname:'/',fetchReply:url=>{
+  requests.push(url);return url==='/api/regions'?{'서울':['동부','서부'],'경기':['남부','북부']}:[];
+ }});
+ b.run("stage='member';me={id:'self',nick:'내 이름',year:1995,gender:'여성',area:'서울 동부',memo:'내 소개'}");
+ await b.run('people()');
+ for(const regional of [false,true]){
+  if(regional){
+   await b.element('#scope-area').handlers.click({});b.element('#district').value='서부';b.element('#district').onchange();await settle();
+  }
+  const scope=b.run('JSON.stringify(scopes.people)'),expected='/api/people'+(regional?'?area='+encodeURIComponent('서울 서부'):'');
+  const html=b.element('#app').innerHTML,header=html.match(/<header class="bar">[\s\S]*?<\/header>/)[0];
+  assert.match(header,/id="openSettings" class="settings-button"/);assert.equal((html.match(/id="openSettings"/g)||[]).length,1);
+  assert.deepEqual([...html.matchAll(/id="tab-([^"]+)"/g)].map(match=>match[1]),['people','rooms','news']);
+  await b.element('#openSettings').handlers.click({});
+  const settings=b.element('#app').innerHTML;
+  assert.match(settings,/내 설정/);assert.match(settings,/id="back"/);assert.doesNotMatch(settings,/id="openSettings"|id="tab-/);
+  await b.element('#back').handlers.click({});await settle();
+  assert.equal(requests.at(-1),expected);assert.equal(b.run('JSON.stringify(scopes.people)'),scope);
+  assert.match(b.element('#app').innerHTML,/id="openSettings"/);assert.match(b.element('#app').innerHTML,regional?/id="scope-area" aria-pressed="true"/:/id="scope-all" aria-pressed="true"/);
+ }
+});
+
+test('설정 탭 이동 후에도 세 메뉴·대화 미독 배지·네이티브 뒤로가기와 지역 선택이 유지된다',async()=>{
+ for(const userAgent of ['Mobile PaperChatAndroid/3','Mobile PaperChatIOS/3']){
+  const requests=[],b=browser({userAgent,fetchReply:url=>{
+   requests.push(url);
+   if(url==='/api/regions')return {'서울':['동부','서부'],'경기':['남부','북부']};
+   if(url==='/api/unread')return {total:9};
+   if(url==='/api/rooms')return [{id:'r',peer:'peer',nick:'상대 회원',area:'부산 전체',unread:4}];
+   return [];
+  }});
+  b.run("stage='member';me={id:'self',nick:'본인',area:'경기 북부'};unreadTotal=7;scopes.people={regional:true,area:'서울 서부'}");
+  await b.run('people()');await b.element('#tab-rooms').handlers.click({});
+  const html=b.element('#app').innerHTML;
+  assert.deepEqual([...html.matchAll(/id="tab-([^"]+)"/g)].map(match=>match[1]),['people','rooms','news']);
+  assert.match(html,/id="tab-rooms" class="active"/);assert.doesNotMatch(html,/id="openSettings"|id="tab-settings"/);
+  assert.match(html,/aria-label="안 읽은 메시지 7개"/);assert.match(b.element('#list').innerHTML,/aria-label="안 읽은 메시지 4개"/);
+  await b.run('syncUnread()');assert.equal(b.element('#unread-total').textContent,'9');assert.equal(b.element('#unread-total').hidden,false);
+  await b.element('#tab-people').handlers.click({});assert.equal(requests.at(-1),'/api/people?area='+encodeURIComponent('서울 서부'));
+  await b.element('#openSettings').handlers.click({});assert.equal(b.run('window.paperChatBack()'),true);await settle();
+  assert.equal(requests.at(-1),'/api/people?area='+encodeURIComponent('서울 서부'));assert.equal(b.run('scopes.people.area'),'서울 서부');assert.equal(b.run('scopes.people.regional'),true);
+  assert.match(b.element('#app').innerHTML,/id="openSettings"/);assert.equal(b.run('window.paperChatBack()'),false);
+ }
+});
+
+
+test('관리자 모니터링은 대화와 소식으로 나뉘고 대화 목록에서 상위 메뉴로 돌아온다',async()=>{
+ const paths=[],b=browser({pathname:'/codenotekyh',fetchReply:url=>{paths.push(url);return [];}});
+ await b.run('monitor()');
+ assert.match(b.element('#app').innerHTML,/id="monitorChats"/);assert.match(b.element('#app').innerHTML,/id="monitorNews"/);assert.deepEqual(paths,[]);
+ await b.element('#monitorChats').handlers.click({});assert.equal(paths.at(-1),'/api/admin/monitor/profiles');
+ await b.element('#back').handlers.click({});assert.match(b.element('#app').innerHTML,/id="monitorChats"/);assert.match(b.element('#app').innerHTML,/id="monitorNews"/);
+});
+
+test('웹과 앱의 소식 알림 진입은 유효한 사진 ID만 상세로 보내고 주소를 정리한다',async()=>{
+ for(const pathname of ['/','/app'])for(const target of ['7','0','-1','01','9007199254740992','https://evil.example/']){
+  const requests=[],b=browser({pathname,search:'?news='+encodeURIComponent(target),fetchReply:url=>{
+   requests.push(url);if(url==='/api/people')return [];if(url==='/api/unread')return {total:0};return {stage:'member',profile:{id:'self',nick:'회원'}};
+  }});
+  b.run("let newsTargets=[];newsUI={dispose(){},handleEvent(){},openPost:async id=>{newsTargets.push(id);paint('소식','photo','사진 상세')}}");
+  await b.run('boot()');assert.equal(b.history.replaced,pathname);
+  if(target==='7'){assert.equal(b.run('newsTargets[0]'),7);assert.equal(requests.includes('/api/people'),false);assert.match(b.element('#app').innerHTML,/사진 상세/);}
+  else{assert.equal(b.run('newsTargets.length'),0);assert.ok(requests.includes('/api/people'));}
+  assert.equal(requests.some(path=>path.startsWith('/api/admin/')),false);
+ }
 });

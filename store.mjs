@@ -9,7 +9,7 @@ export const messageTTL = 24*hour;
 export function messageLiveSQL(alias='m') {
   return `MIN(COALESCE(${alias}.expires,${alias}.sent+${messageTTL}),${alias}.sent+${messageTTL})>?`;
 }
-export const tables = ['signup_gates','used_invites','account_devices','account_keys','push_jobs','push_devices','session_presence','member_activity','admin_session_proofs','departures','pending_contacts','contacts','report_messages','reports','penalty_contents','penalty_events','reviews','room_reads','room_changes','blocks','acceptances','restrictions','messages','rooms','sessions','members','cooldowns','settings','attempts'];
+export const tables = ['signup_gates','used_invites','account_devices','account_keys','news_push_jobs','news_push_targets','news_push_events','push_jobs','push_devices','session_presence','member_activity','admin_session_proofs','departures','pending_contacts','contacts','news_reports','news_likes','news_comments','news_posts','report_messages','reports','penalty_contents','penalty_events','reviews','room_reads','room_changes','blocks','acceptances','restrictions','messages','rooms','sessions','members','cooldowns','settings','attempts'];
 // Only pass a source-controlled SQL column expression, never request input.
 export function openMessageReportSQL(message) {
   return `(EXISTS(SELECT 1 FROM reports f WHERE f.message=${message} AND f.status='open')
@@ -75,6 +75,36 @@ export function openStore(dir) {
     CREATE INDEX IF NOT EXISTS penalties_by_identity ON penalty_events(identity);
     CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY,reporter TEXT NOT NULL REFERENCES members ON DELETE CASCADE,target TEXT NOT NULL REFERENCES members ON DELETE CASCADE,message INTEGER REFERENCES messages ON DELETE CASCADE,reason TEXT NOT NULL,created INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'open');
     CREATE INDEX IF NOT EXISTS reports_by_message ON reports(message,status);
+    CREATE TABLE IF NOT EXISTS news_posts(id INTEGER PRIMARY KEY AUTOINCREMENT,
+      author TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,created INTEGER NOT NULL,photo BLOB,
+      retired_at INTEGER,retired_reason TEXT,state TEXT NOT NULL DEFAULT 'approved');
+    CREATE UNIQUE INDEX IF NOT EXISTS news_current_author ON news_posts(author) WHERE retired_at IS NULL;
+    CREATE INDEX IF NOT EXISTS news_created ON news_posts(created,id);
+    CREATE TABLE IF NOT EXISTS news_comments(id INTEGER PRIMARY KEY AUTOINCREMENT,
+      post INTEGER NOT NULL REFERENCES news_posts(id) ON DELETE CASCADE,
+      author TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,created INTEGER NOT NULL,body TEXT,
+      deleted_at INTEGER,state TEXT NOT NULL DEFAULT 'approved');
+    CREATE INDEX IF NOT EXISTS news_comments_post ON news_comments(post,id);
+    CREATE TABLE IF NOT EXISTS news_likes(post INTEGER NOT NULL REFERENCES news_posts(id) ON DELETE CASCADE,
+      member TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,created INTEGER NOT NULL,PRIMARY KEY(post,member));
+    CREATE TABLE IF NOT EXISTS news_reports(id INTEGER PRIMARY KEY AUTOINCREMENT,
+      reporter TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+      target TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+      post INTEGER NOT NULL REFERENCES news_posts(id) ON DELETE CASCADE,
+      comment INTEGER REFERENCES news_comments(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK(kind IN ('post','comment')),reason TEXT NOT NULL,created INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open',content TEXT NOT NULL,UNIQUE(reporter,content));
+    CREATE INDEX IF NOT EXISTS news_reports_post ON news_reports(post,status) WHERE comment IS NULL;
+    CREATE INDEX IF NOT EXISTS news_reports_comment ON news_reports(comment,status);
+    CREATE TABLE IF NOT EXISTS news_push_events(id TEXT PRIMARY KEY,
+      post INTEGER NOT NULL REFERENCES news_posts(id) ON DELETE CASCADE,
+      actor TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK(kind IN ('like','comment')),
+      comment INTEGER REFERENCES news_comments(id) ON DELETE CASCADE,
+      created INTEGER NOT NULL,expires INTEGER NOT NULL,cancelled INTEGER NOT NULL DEFAULT 0 CHECK(cancelled IN (0,1)));
+    CREATE UNIQUE INDEX IF NOT EXISTS news_push_like_once ON news_push_events(post,actor) WHERE kind='like';
+    CREATE UNIQUE INDEX IF NOT EXISTS news_push_comment_once ON news_push_events(comment) WHERE kind='comment';
+    CREATE INDEX IF NOT EXISTS news_push_expiry ON news_push_events(expires);
     INSERT OR IGNORE INTO reviews SELECT id,'approved' FROM messages WHERE photo IS NOT NULL;
   `));
   transaction(db,()=>{
@@ -227,6 +257,8 @@ export function clean(db, now=Date.now()) {
 }
 // Caller owns the transaction, so snapshot copies and FK cleanup commit together.
 function expireMessages(db,now) {
+  db.prepare('DELETE FROM news_push_events WHERE expires<=?').run(now);
+  db.prepare('DELETE FROM news_posts WHERE created<=?').run(now-messageTTL);
   const rooms=db.prepare(`SELECT DISTINCT m.room,COALESCE(c.version,0) AS previousVersion FROM messages m
     LEFT JOIN room_changes c ON c.room=m.room WHERE m.sent<=?`).all(now-messageTTL);
   db.prepare(`UPDATE reports SET conversation_excerpt=NULL WHERE room IS NOT NULL AND

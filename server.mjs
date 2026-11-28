@@ -12,6 +12,7 @@ import { pushProvider } from './push-provider.mjs';
 import { pushQueue } from './push-queue.mjs';
 import { webPushProvider } from './web-push.mjs';
 import { moderation, checkText } from './moderation.mjs';
+import { newsService } from './news.mjs';
 import { policyVersion } from './public/rules.js';
 import { renderPrivacyPage } from './privacy.mjs';
 import { regions, normalizeArea } from './regions.mjs';
@@ -25,6 +26,7 @@ function directoryArea(url) {
 }
 const profileCols='id,nick,year,gender,area,memo';
 const assets=new Map(Object.entries({'/':'index.html','/app':'index.html','/codenotekyh':'index.html','/support':'support.html','/app.js':'app.js','/theme.css':'theme.css','/icon.svg':'icon.svg','/headings.woff':'headings.woff','/rules.js':'rules.js','/privacy.js':'privacy.js'}));
+assets.set('/news.js','news.js');assets.set('/news.css','news.css');
 assets.set('/web-push-worker.js','web-push-worker.js');
 const type={html:'text/html',js:'text/javascript',css:'text/css',svg:'image/svg+xml',woff:'font/woff'};
 const token=()=>randomBytes(32).toString('hex');
@@ -68,6 +70,7 @@ export function makeServer(config, upstream=providers) {
     enabled:platform=>(platform==='web'?webDelivery:delivery).enabled(platform),
     send:(job,...args)=>(job.platform==='web'?webDelivery:delivery).send(job,...args)
   },safety);
+  const news=newsService(db,safety,pushes);
   // Both directory listings and room listings join the other member as p.
   const visiblePeer=`p.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM restrictions x WHERE x.identity=p.identity AND x.until>?)
     AND NOT EXISTS(SELECT 1 FROM blocks x WHERE (x.owner=? AND x.peer=p.id) OR (x.owner=p.id AND x.peer=?))`;
@@ -116,6 +119,13 @@ export function makeServer(config, upstream=providers) {
       if(!streamValid(stream)){endStream(stream);continue;}
       if(safety.memberStage(stream.member)!=='member')continue;
       try{stream.res.write('event: urgent-announcement\ndata: '+data+'\n\n');}catch{endStream(stream);}
+    }
+  }
+  function notifyNews() {
+    for(const stream of [...streams]) {
+      if(!streamValid(stream)){endStream(stream);continue;}
+      if(safety.memberStage(stream.member)!=='member')continue;
+      try{stream.res.write('event: news-change\ndata: {"refresh":true}\n\n');}catch{endStream(stream);}
     }
   }
   run("INSERT OR IGNORE INTO service_meta VALUES('reset',?)",token());
@@ -188,6 +198,7 @@ export function makeServer(config, upstream=providers) {
     for(const install of result.devices)signupEpochs.set(install,token());
     closeStreams(stream=>stream.member===result.id);
     for(const room of result.rooms)notifyRoom(room.id,{closed:true,reason:'withdrawn'},{...room,closed_at:result.withdrawn});
+    if(!result.alreadyWithdrawn)notifyNews();
   }
   function throttle(key,max,window) {
     const k=h('rate',key), now=Date.now();
@@ -292,13 +303,15 @@ export function makeServer(config, upstream=providers) {
   function monitorProfiles(area,query) {
     return all(`WITH matching AS (${matchingMessages})
       SELECT p.id,p.nick,p.year,p.gender,p.area,p.memo,p.deleted_at AS deletedAt,COUNT(r.id) AS roomCount,
+        (SELECT last_seen FROM member_activity WHERE member=p.id) AS lastSeen,
         SUM(CASE WHEN ? IS NULL OR paperchat_contains(p.nick,?) OR paperchat_contains(peer.nick,?) OR EXISTS(SELECT 1 FROM matching WHERE room=r.id)
           THEN 1 ELSE 0 END) AS matchedRoomCount,
         MAX((SELECT MAX(sent) FROM messages WHERE room=r.id AND sent+${messageTTL}>?)) AS recent
       FROM members p JOIN rooms r ON r.a=p.id OR r.b=p.id
       JOIN members peer ON peer.id=CASE WHEN r.a=p.id THEN r.b ELSE r.a END
       WHERE (? IS NULL OR p.area=?) GROUP BY p.id HAVING matchedRoomCount>0
-      ORDER BY recent DESC,p.nick,p.id`,query,query,Date.now(),query,query,query,Date.now(),area,area);
+      ORDER BY lastSeen DESC,p.id`,query,query,Date.now(),query,query,query,Date.now(),area,area)
+      .map(profile=>({...profile,...activity(profile.id)}));
   }
   function monitorRooms(area,member,query) {
     return all(`WITH matching AS (${matchingMessages})
@@ -493,6 +506,13 @@ export function makeServer(config, upstream=providers) {
     }
     if(!post && p==='/api/push/web/check') {
       const s=sessions(req),message=Number(u.searchParams.get('message')),device=u.searchParams.get('device')||'';
+      if(u.searchParams.get('kind')==='news') {
+        const postId=Number(u.searchParams.get('postId')),event=u.searchParams.get('event')||'';
+        if(s?.kind!=='member' || !Number.isSafeInteger(postId) || postId<1 ||
+          !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(device) || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(event))
+          return ok({notify:false});
+        return ok(pushes.mayNotifyNews(s.id,device,event,postId));
+      }
       return ok({notify:Boolean(s?.kind==='member' && Number.isSafeInteger(message) && message>0 &&
         /^[a-f0-9-]{36}$/.test(device) && pushes.mayNotify(s.id,device,message))});
     }
@@ -537,7 +557,7 @@ export function makeServer(config, upstream=providers) {
         touch(s.member,null);
         return get('SELECT '+profileCols+' FROM members WHERE id=?',s.member);
       });
-      return ok({profile});
+      notifyNews();return ok({profile});
     }
     if(post && p==='/api/key') {
       throttle('key:'+ip,20,hour/4);
@@ -643,7 +663,43 @@ export function makeServer(config, upstream=providers) {
       if(!post)return ok(all('SELECT p.id,p.nick FROM blocks x JOIN members p ON x.peer=p.id WHERE x.owner=? AND p.deleted_at IS NULL ORDER BY p.nick',s.member));
       const closed=safety.setBlock(s.member,b.peer,b.remove===true);
       if(closed)notifyRoom(closed,{closed:true,reason:'blocked'});
+      notifyNews();
       return ok();
+    }
+    if(p==='/api/news') {
+      const s=need(req,'member');
+      if(!post)return ok(news.feed(s.member,{area:directoryArea(u),before:u.searchParams.get('before')}));
+      throttle('news-upload:'+s.member,20,hour);
+      const result=news.upload(s.member,b.photo);touch(s.member,null);notifyNews();return ok(result);
+    }
+    if(p==='/api/news/mine' && !post)return ok(news.mine(need(req,'member').member));
+    if(p==='/api/news/report' && post) {
+      const s=need(req,'member');throttle('report:'+s.member,30,hour);
+      const result=news.report(s.member,b);notifyNews();return ok(result);
+    }
+    const newsCommentDelete=p.match(/^\/api\/news\/comments\/(\d+)\/delete$/);
+    if(newsCommentDelete && post) {
+      const s=need(req,'member',true),result=news.removeComment(s.member,newsCommentDelete[1],b.confirm);
+      notifyNews();return ok(result);
+    }
+    const newsItem=p.match(/^\/api\/news\/(\d+)(?:\/(photo|like|comments|delete))?$/);
+    if(newsItem) {
+      const s=need(req,'member',post && newsItem[2]==='delete'),id=newsItem[1],action=newsItem[2];
+      if(!post) {
+        if(!action)return ok(news.detail(s.member,id));
+        if(action==='photo')return finish(res,200,news.photo(s.member,id),'image/jpeg');
+        if(action==='comments')return ok(news.comments(s.member,id,{before:u.searchParams.get('before')}));
+      } else {
+        let result;
+        if(action==='delete')result=news.remove(s.member,id,b.confirm);
+        else if(action==='like') {
+          throttle('news-like:'+s.member,120,60_000);result=news.like(s.member,id,b.liked);
+        } else if(action==='comments') {
+          throttle('news-comment:'+s.member,60,10*60_000);result=news.comment(s.member,id,b.body);touch(s.member,null);
+        } else reject(405,'지원하지 않는 소식 요청이에요.');
+        notifyNews();return ok(result);
+      }
+      reject(405,'지원하지 않는 소식 요청이에요.');
     }
     if(post && p==='/api/report') {
       const s=need(req,'member');throttle('report:'+s.member,30,hour);
@@ -784,6 +840,23 @@ export function makeServer(config, upstream=providers) {
     }
     if(p.startsWith('/api/admin/')) {
       const s=need(req,'admin');
+      if(p==='/api/admin/news' && !post)return ok(news.feed(null,{area:directoryArea(u),before:u.searchParams.get('before'),admin:true}));
+      if(p==='/api/admin/news/reports') {
+        if(!post)return ok(news.reports());
+        const result=news.decision(b.id,b.action);notifyNews();return ok(result);
+      }
+      const adminNews=p.match(/^\/api\/admin\/news\/(\d+)(?:\/(photo|comments))?$/);
+      if(adminNews && !post) {
+        if(adminNews[2]==='photo')return finish(res,200,news.photo(null,adminNews[1],true),'image/jpeg');
+        if(adminNews[2]==='comments')return ok(news.comments(null,adminNews[1],{before:u.searchParams.get('before'),admin:true}));
+        return ok(news.detail(null,adminNews[1],true));
+      }
+      const roomMetadata=p.match(/^\/api\/admin\/rooms\/([a-f0-9-]+)$/);
+      if(roomMetadata && !post) {
+        const room=roomFor(req,roomMetadata[1],true);
+        const participants=[room.a,room.b].map(id=>({...get('SELECT '+profileCols+' FROM members WHERE id=?',id),...activity(id)}));
+        return ok({id:room.id,participants});
+      }
       if(p==='/api/admin/members' && !post) {
         const offset=Number(u.searchParams.get('offset')||0);
         if(!Number.isSafeInteger(offset)||offset<0)reject(400,'목록 범위를 확인해 주세요.');
@@ -802,7 +875,7 @@ export function makeServer(config, upstream=providers) {
           WHERE p.deleted_at IS NULL AND ?!='withdrawn' AND (?!='inactive' OR a.last_seen<=?) AND (? IS NULL OR p.area=?)
           UNION ALL SELECT id,nick,NULL,NULL,'withdrawn',withdrawn,expires,NULL FROM departures
           WHERE expires>? AND ? IN ('all','withdrawn') AND ? IS NULL
-        ) ORDER BY status,CASE WHEN ?='inactive' THEN lastSeen END,nick,id LIMIT 51 OFFSET ?`,filter,filter,cutoff,area,area,now,filter,area,filter,offset);
+        ) ORDER BY lastSeen DESC,id LIMIT 51 OFFSET ?`,filter,filter,cutoff,area,area,now,filter,area,offset);
         return ok({items:members.slice(0,50).map(m=>({...m,online:m.status==='active'?activity(m.id).online:false})),more:members.length>50,counts});
       }
       const deletingMember=p.match(/^\/api\/admin\/members\/([a-f0-9-]+)\/delete$/);
@@ -833,6 +906,7 @@ export function makeServer(config, upstream=providers) {
         else if(b.kind==='report') {
           const room=safety.reportDecision(b.id,b.action);
           if(room)notifyRoom(room,{refresh:true});
+          notifyNews();
         }
         else reject(400,'검토 대상을 확인해 주세요.');
         return ok();
@@ -899,7 +973,7 @@ export function makeServer(config, upstream=providers) {
         return ok(monitorRooms(directoryArea(u),member,searchQuery(u)));
       }
       if(p==='/api/admin/reset' && post) {
-        transaction(db,()=>{for(const table of tables) db.exec('DELETE FROM '+table);db.exec("DELETE FROM sqlite_sequence WHERE name='messages'");run("UPDATE service_meta SET value=? WHERE key='reset'",token());});
+        transaction(db,()=>{for(const table of tables) db.exec('DELETE FROM '+table);db.exec("DELETE FROM sqlite_sequence WHERE name IN ('messages','news_posts','news_comments','news_reports')");run("UPDATE service_meta SET value=? WHERE key='reset'",token());});
         closeStreams();
         cookie(res,'pc_admin','',0);return ok();
       }

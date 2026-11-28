@@ -67,26 +67,31 @@ export function pushProvider(env = process.env, http = fetch, apns = appleReques
     androidClient: android,
     enabled: platform => platform === 'android' ? Boolean(google) && !androidMismatch : Boolean(appleFor(platform)),
     async send(device, event, valid) {
+      const news=device.kind==='news',postId=Number(device.postId);
+      if(news && (!Number.isSafeInteger(postId)||postId<1||!['like','comment'].includes(device.newsType)))return 'skip';
+      const data=news?{kind:'news',event,postId:String(postId),newsType:device.newsType}:{kind:'chat',event};
+      const seconds=()=>news && Number.isFinite(device.expires)?Math.max(0,Math.min(120,Math.floor((device.expires-Date.now())/1000))):120;
       if (device.platform === 'android') {
         const key = await googleToken();
         if (!valid()) return 'skip';
         const url = 'https://fcm.googleapis.com/v1/projects/' + encodeURIComponent(google.project_id) + '/messages:send';
         const response = await http(url, {method:'POST', signal:AbortSignal.timeout(9000),
           headers:{Authorization:'Bearer '+key,'Content-Type':'application/json'}, body:JSON.stringify({message:{
-            token:device.token, android:{priority:'high',ttl:'120s'}, data:{kind:'chat',event}
+            token:device.token, android:{priority:'high',ttl:seconds()+'s'}, data
           }})});
         if (response.ok) return 'sent';
         if (response.status === 401) access = null;
-        const data = await response.json().catch(()=>({}));
-        if (data.error?.details?.some(d=>d.errorCode==='UNREGISTERED')) return 'invalid';
+        const responseData = await response.json().catch(()=>({}));
+        if (responseData.error?.details?.some(d=>d.errorCode==='UNREGISTERED')) return 'invalid';
         throw new Error('FCM ' + response.status);
       }
       if (!valid()) return 'skip';
       const host = device.platform === 'ios-dev' ? 'api.sandbox.push.apple.com' : 'api.push.apple.com';
       const reply = await apns(host,{':method':'POST',':path':'/3/device/'+device.token,
         authorization:'bearer '+apnsToken(appleFor(device.platform)),'apns-topic':topic,'apns-push-type':'alert','apns-priority':'10',
-        'apns-expiration':String(Math.floor(Date.now()/1000)+120),'apns-collapse-id':event},
-        {aps:{alert:{title:'종이편지',body:'새 메시지가 도착했어요.'},sound:'default'},kind:'chat'});
+        'apns-expiration':String(Math.floor(Date.now()/1000)+seconds()),'apns-collapse-id':event},
+        {aps:{alert:{title:'종이편지',body:news?(device.newsType==='like'?'회원님의 소식에 좋아요가 달렸어요.':'회원님의 소식에 새 댓글이 달렸어요.'):'새 메시지가 도착했어요.'},sound:'default'},
+          ...(news?data:{kind:'chat'})});
       if (reply.status === 200) return 'sent';
       if (reply.status === 410 && reply.reason === 'Unregistered') return 'invalid';
       throw new Error('APNs ' + reply.status + ' ' + (reply.reason || 'unknown'));

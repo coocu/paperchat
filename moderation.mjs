@@ -30,6 +30,16 @@ export function moderation(db) {
     const totalStrikes=get('SELECT COUNT(*) AS n FROM penalty_events WHERE identity=?',identity).n;
     return {strikes:totalStrikes%3,totalStrikes,restrictedUntil:restricted(identity)};
   }
+  // Call inside the surrounding content-review transaction.
+  function penalize(identity,content) {
+    if(get('SELECT 1 FROM penalty_contents WHERE content=?',content))return false;
+    const added=run('INSERT OR IGNORE INTO penalty_events VALUES(?,?,?)',content,identity,Date.now());
+    if(!added.changes)return false;
+    run('INSERT OR IGNORE INTO penalty_contents VALUES(?,?)',content,content);
+    if(penalty(identity).totalStrikes%3===0)
+      run('INSERT INTO restrictions VALUES(?,?) ON CONFLICT(identity) DO UPDATE SET until=excluded.until',identity,Math.max(Date.now(),restricted(identity))+24*hour);
+    return true;
+  }
   function profileContent(id) {
     const m=get('SELECT nick,memo FROM members WHERE id=?',id);
     return 'profile:'+id+':'+createHash('sha256').update(JSON.stringify(m)).digest('hex');
@@ -193,5 +203,5 @@ export function moderation(db) {
         })
     };
   }
-  return {restricted,penalty,memberStage,accept,pairAllowed,setBlock,report,queue,photoDecision,reportDecision,profileContent};
+  return {restricted,penalty,penalize,memberStage,accept,pairAllowed,setBlock,report,queue,photoDecision,reportDecision,profileContent};
 }

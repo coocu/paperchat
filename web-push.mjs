@@ -42,10 +42,15 @@ export function webPushProvider(db,secret,send=sendNotification) {
       let subscription;
       try{subscription=webSubscription(JSON.parse(job.token));}catch{return 'invalid';}
       if(!valid())return 'skip';
+      const news=job.kind==='news',postId=Number(job.postId);
+      if(news && (!Number.isSafeInteger(postId)||postId<1||!['like','comment'].includes(job.newsType)))return 'skip';
+      const data=news?{kind:'news',event,device:job.device,postId,newsType:job.newsType}:
+        {kind:'chat',event,device:job.device,message:Number(job.message)};
+      const ttl=news && Number.isFinite(job.expires)?Math.max(0,Math.min(120,Math.floor((job.expires-Date.now())/1000))):120;
       try {
         // No names, message text, photos, account IDs or login credentials.
-        await send(subscription,JSON.stringify({kind:'chat',event,device:job.device,message:Number(job.message)}),{
-          vapidDetails:{...keys,subject:'mailto:code_note95@naver.com'},TTL:120,urgency:'high',timeout:9000
+        await send(subscription,JSON.stringify(data),{
+          vapidDetails:{...keys,subject:'mailto:code_note95@naver.com'},TTL:ttl,urgency:'high',timeout:9000
         });
         return 'sent';
       }catch(e) {

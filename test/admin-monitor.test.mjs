@@ -69,7 +69,7 @@ test('monitor profiles group every participating room and separate profile-regio
   for(const [member,count]of [[a,3],[b,2],[c,2],[d,1]]){
     assert.equal(byId.get(member.id).roomCount,count);assert.equal(byId.get(member.id).matchedRoomCount,count);
   }
-  assert.deepEqual(Object.keys(byId.get(a.id)).sort(),['area','deletedAt','gender','id','matchedRoomCount','memo','nick','recent','roomCount','year']);
+  assert.deepEqual(Object.keys(byId.get(a.id)).sort(),['area','deletedAt','gender','id','lastSeen','matchedRoomCount','memo','nick','online','recent','roomCount','year']);
   assert.equal(byId.get(b.id).recent,f.now());assert.equal(byId.get(d.id).recent,null);
   const regional=(await admin(profiles+'?area='+query('서울 동부'))).body;
   assert.deepEqual(regional.map(profile=>profile.id).sort(),[a.id,c.id].sort());assert.equal(regional.find(profile=>profile.id===a.id).roomCount,3);
@@ -95,6 +95,54 @@ test('monitor profiles group every participating room and separate profile-regio
   assert.deepEqual((await admin(rooms)).body.map(room=>room.id).sort(),[ac,ad].sort());
   for(const deletedRoom of [ab,bc])assert.equal((await admin(rooms+'/'+deletedRoom+'/messages')).status,404);
   assert.deepEqual((await admin(profiles+'?q='+query('Beta'))).body,[]);
+});
+
+test('monitor profile order follows last access across search and region filters with stable ties and unknown activity last',async t=>{
+  const f=fixture(t),a=await f.member('가장 앞 이름'),b=await f.member('중간 이름'),c=await f.member('같은 접속','부산 전체'),unknown=await f.member('접속 미상');
+  const admin=await f.admin(),ab=await f.room(a,b),ac=await f.room(a,c),au=await f.room(a,unknown);
+  await f.send(a,ab,'최근대화 순서와 접속순서는 별개');f.advance(1000);await f.send(unknown,au,'이 방 대화가 가장 최근');
+  const updated=f.db.prepare('UPDATE member_activity SET last_seen=? WHERE member=?');
+  updated.run(f.now()-10000,a.id);updated.run(f.now()-1000,b.id);updated.run(f.now()-1000,c.id);
+  f.db.prepare('DELETE FROM member_activity WHERE member=?').run(unknown.id);
+  f.db.prepare('UPDATE session_presence SET online=0 WHERE session IN (SELECT id FROM sessions WHERE member=?)').run(c.id);
+  const expected=[...[b.id,c.id].sort(),a.id,unknown.id],activity=f.db.prepare('SELECT * FROM member_activity ORDER BY member').all();
+  const global=(await admin(profiles)).body;
+  assert.deepEqual(global.map(p=>p.id),expected);
+  assert.equal(global.find(p=>p.id===b.id).online,true);assert.equal(global.find(p=>p.id===c.id).online,false);
+  assert.equal(global.at(-1).lastSeen,null);assert.equal(global.at(-1).recent,f.now());
+  assert.equal(global.find(p=>p.id===c.id).recent,null);
+  assert.deepEqual((await admin(profiles+'?area='+query('서울 동부'))).body.map(p=>p.id),[b.id,a.id,unknown.id]);
+  assert.deepEqual((await admin(profiles+'?q='+query('이 방 대화'))).body.map(p=>p.id),[a.id,unknown.id]);
+  // Ordinary member discovery already uses the same last-access order.
+  assert.deepEqual((await unknown.call('/api/people')).body.map(p=>p.id),expected.filter(id=>id!==unknown.id));
+  assert.deepEqual(f.db.prepare('SELECT * FROM member_activity ORDER BY member').all(),activity);
+});
+
+test('room metadata exposes only the two ordered participant profiles to an approved administrator without touching activity',async t=>{
+  const f=fixture(t),a=await f.member('첫 참가자'),b=await f.member('둘째 참가자','부산 전체'),outsider=await f.member('다른 회원'),admin=await f.admin();
+  const room=await f.room(a,b),url=rooms+'/'+room;
+  assert.equal((await f.client()(url)).status,401);assert.equal((await a.call(url)).status,401);assert.equal((await outsider.call(url)).status,401);
+  assert.equal((await admin(rooms+'/'+randomUUID())).status,404);
+  f.db.prepare('UPDATE member_activity SET last_seen=? WHERE member=?').run(f.now()-90000,a.id);
+  f.db.prepare('UPDATE session_presence SET online=0 WHERE session IN (SELECT id FROM sessions WHERE member=?)').run(a.id);
+  const activity=f.db.prepare('SELECT * FROM member_activity ORDER BY member').all();
+  const response=await admin(url);assert.equal(response.status,200);assert.match(response.headers['cache-control'],/no-store/);
+  const ordered=f.db.prepare('SELECT a,b FROM rooms WHERE id=?').get(room);
+  assert.deepEqual(Object.keys(response.body).sort(),['id','participants']);assert.equal(response.body.id,room);
+  assert.deepEqual(response.body.participants.map(p=>p.id),[ordered.a,ordered.b]);
+  for(const profile of response.body.participants){
+    assert.deepEqual(Object.keys(profile).sort(),['area','gender','id','lastSeen','memo','nick','online','year']);
+    assert.equal(profile.year,1995);assert.equal(profile.gender,'여성');assert.equal(profile.memo,'관리자 프로필 검증');
+  }
+  assert.equal(response.body.participants.find(p=>p.id===a.id).online,false);
+  assert.equal(response.body.participants.find(p=>p.id===b.id).online,true);
+  assert.deepEqual(f.db.prepare('SELECT * FROM member_activity ORDER BY member').all(),activity);
+  const messages=await admin(url+'/messages');assert.ok(Array.isArray(messages.body));assert.equal(messages.headers['x-room-version'],'0');
+  await a.call('/api/rooms/'+room+'/leave',{confirm:true});
+  assert.deepEqual((await admin(url)).body.participants.map(p=>p.id),[ordered.a,ordered.b]);
+  await admin('/api/admin/members/'+a.id+'/delete',{confirm:true});assert.equal((await admin(url)).status,404);
+  const surviving=await f.room(b,outsider);f.approved(false);
+  assert.equal((await admin(rooms+'/'+surviving)).status,401);
 });
 
 test('literal Unicode text search counts rooms and produces a short snippet around the latest matching message',async t=>{

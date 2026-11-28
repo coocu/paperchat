@@ -93,9 +93,10 @@ test('region filtering precedes fifty-row pagination and administrator deletion 
   assert.equal(first.items.length,50);assert.equal(first.more,true);assert.equal(second.items.length,4);assert.equal(second.more,false);
   assert.deepEqual(first.counts,{active:54,inactive:53,withdrawn:0});assert.deepEqual(second.counts,first.counts);
   assert.deepEqual([...first.items,...second.items].map(member=>member.id).sort(),[...seoul,recent].sort());
+  assert.deepEqual([...first.items,...second.items].map(member=>member.id),[recent,...seoul.toReversed()]);
   const inactiveFirst=(await admin(url+'&filter=inactive')).body,inactiveSecond=(await admin(url+'&filter=inactive&offset=50')).body;
-  assert.deepEqual(inactiveFirst.items.map(member=>member.id),seoul.slice(0,50));
-  assert.deepEqual(inactiveSecond.items.map(member=>member.id),seoul.slice(50));assert.equal(inactiveSecond.more,false);
+  assert.deepEqual(inactiveFirst.items.map(member=>member.id),seoul.toReversed().slice(0,50));
+  assert.deepEqual(inactiveSecond.items.map(member=>member.id),seoul.toReversed().slice(50));assert.equal(inactiveSecond.more,false);
   assert.equal((await admin(path+'/'+seoul[0]+'/delete',{confirm:true})).status,200);
   const after=(await admin(url)).body;
   assert.deepEqual(after.counts,{active:53,inactive:52,withdrawn:0});assert.equal(after.items.some(member=>member.id===seoul[0]),false);
@@ -117,11 +118,29 @@ test('regional inactivity keeps the exact thirty-day boundary and current profil
   f.seed('다른 지역 경계','경기 북부',f.now()-30*day);
   const url=path+'?filter=inactive&'+region('서울 동부');
   assert.deepEqual((await admin(url)).body.items.map(member=>member.id),[boundary]);
-  f.advance(1);assert.deepEqual((await admin(url)).body.items.map(member=>member.id),[boundary,before]);
+  f.advance(1);assert.deepEqual((await admin(url)).body.items.map(member=>member.id),[before,boundary]);
   assert.equal((await member.call('/api/profile',{area:'경기 북부',memo:'지역을 변경한 소개글'})).status,200);
   assert.deepEqual((await admin(path+'?'+region('서울 동부'))).body.counts,{active:2,inactive:2,withdrawn:0});
   const moved=(await admin(path+'?'+region('경기도 고양시'))).body;
   assert.deepEqual(moved.counts,{active:2,inactive:1,withdrawn:0});assert.ok(moved.items.some(item=>item.id===member.id));
+});
+
+test('all member scopes sort by descending last access, put missing activity last and use member IDs to break ties',async t=>{
+  const f=fixture(t),admin=await f.admin();
+  const oldest=f.seed('가 이름','서울 동부',f.now()-40*day),newest=f.seed('하 이름','부산 전체',f.now()-1000);
+  const tied=[f.seed('나 이름','서울 동부',f.now()-35*day),f.seed('다 이름','서울 동부',f.now()-35*day)].sort();
+  const missing=f.seed('접속 미상','서울 동부');f.db.prepare('DELETE FROM member_activity WHERE member=?').run(missing);
+  const departed=randomUUID();f.db.prepare('INSERT INTO departures VALUES(?,?,?,?)').run(departed,'탈퇴 회원',f.now(),f.now()+day);
+  const unknown=[missing,departed].sort(),expected=[newest,...tied,oldest,...unknown];
+  const global=(await admin(path)).body;
+  assert.deepEqual(global.items.map(m=>m.id),expected);
+  assert.ok(global.items.slice(-2).every(m=>m.lastSeen===null));
+  assert.deepEqual((await admin(path+'?filter=active')).body.items.map(m=>m.id),[newest,...tied,oldest,missing]);
+  assert.deepEqual((await admin(path+'?'+region('서울 동부'))).body.items.map(m=>m.id),[...tied,oldest,missing]);
+  for(const tail of ['?filter=inactive','?filter=inactive&'+region('서울 동부')])
+    assert.deepEqual((await admin(path+tail)).body.items.map(m=>m.id),[...tied,oldest]);
+  assert.deepEqual((await admin(path+'?offset=2')).body.items.map(m=>m.id),expected.slice(2));
+  assert.deepEqual((await admin(path)).body,global);
 });
 
 test('regional member queries preserve administrator authorization, approval checks and parameter validation',async t=>{
